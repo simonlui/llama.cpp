@@ -1,0 +1,665 @@
+Subject: [PATCH] sycl: DPAS flash attention for quantized KV on Arc A-series (Xe-HPG)
+
+Local candidate. Upstream's DPAS flash-attention kernel (PR 31125: q4_0 / q8_0 KV, 1-31 query
+tokens, B580 tg128 at 16K 31.3 -> 54.2 t/s) is fixed to Xe2's 16-wide DPAS and gated to
+Battlemage / Lunar Lake / Panther Lake. This makes the DPAS width a template parameter:
+
+- sub-group 16 is upstream's kernel: same operand bytes, same tiles and dispatch;
+- sub-group 8 issues dpas (M1, 8) for Xe-HPG: 32 sub-groups per work-group, Q.K over 8-key
+  groups, P.V over 8-row tiles, 4 bytes of each A row per lane, 2 keys per lane in the f16 A;
+- the width is picked per device at run time: 16 on upstream's allowlist, 8 where the device
+  lists the 8x8x32 int8 and 8x8x16 f16 tiles at sub-group 8, else the kernel stays off;
+- JIT builds compile both widths into separate device images (the split-K combine kernel runs
+  at the same width, so DG2 never builds the (M1, 16) image); spir64_gen builds for one XMX
+  width keep that width.
+
+At sub-group 8 the 32-row kernels from head size 128 and the staged D=256 decode kernel spill
+in 128 registers on acm-g10 (IGC 2.43), so they always use the 256-register file.
+GGML_SYCL_FA_DPAS=0 turns the kernel off, as upstream.
+
+diff --git a/ggml/src/ggml-sycl/fattn-dpas.cpp b/ggml/src/ggml-sycl/fattn-dpas.cpp
+index fb0b3a81..a776f9c2 100644
+--- a/ggml/src/ggml-sycl/fattn-dpas.cpp
++++ b/ggml/src/ggml-sycl/fattn-dpas.cpp
+@@ -5,26 +5,99 @@
+ #include "fattn-common.hpp"
+ #include "fattn-dpas.hpp"
+ 
+-// GGML_SYCL_SUPPORT_XMX=OFF builds skip the DPAS below, as do spir64_gen builds for sub-group 8
+-// targets (Xe-HPG) or mixed target lists, which cannot compile it
+-#if !defined(GGML_SYCL_SUPPORT_XMX) || (defined(GGML_SYCL_XMX_AOT_SG) && GGML_SYCL_XMX_AOT_SG != 16)
+-#define GGML_SYCL_FA_DPAS_BUILD 0
++#include <algorithm>
++#include <mutex>
++#include <type_traits>
++#include <unordered_map>
++
++// The kernel is built for two DPAS widths: sub-group 16 (Xe2) and sub-group 8 (Xe-HPG, Arc A-series). They have
++// different reqd_sub_group_size, so a JIT build puts them in separate device images and a device only compiles the
++// width it runs: neither DPAS form builds for the other width. GGML_SYCL_SUPPORT_XMX=OFF builds skip both,
++// spir64_gen builds for one XMX width (GGML_SYCL_XMX_AOT_SG) keep that one, and mixed target lists neither.
++#if defined(GGML_SYCL_SUPPORT_XMX) && (!defined(GGML_SYCL_XMX_AOT_SG) || GGML_SYCL_XMX_AOT_SG == 16)
++#define GGML_SYCL_FA_DPAS_SG16 1
+ #else
+-#define GGML_SYCL_FA_DPAS_BUILD 1
++#define GGML_SYCL_FA_DPAS_SG16 0
+ #endif
++#if defined(GGML_SYCL_SUPPORT_XMX) && (!defined(GGML_SYCL_XMX_AOT_SG) || GGML_SYCL_XMX_AOT_SG == 8)
++#define GGML_SYCL_FA_DPAS_SG8 1
++#include <sycl/ext/oneapi/matrix/matrix.hpp>
++#else
++#define GGML_SYCL_FA_DPAS_SG8 0
++#endif
++#define GGML_SYCL_FA_DPAS_BUILD (GGML_SYCL_FA_DPAS_SG16 || GGML_SYCL_FA_DPAS_SG8)
+ 
+ #if GGML_SYCL_FA_DPAS_BUILD
+ static constexpr int   FA_DPAS_WG    = 256;      // work-group size
+-static constexpr int   FA_DPAS_NSG   = 16;       // sub-groups of 16 lanes
+ static constexpr int   FA_DPAS_MAX_Q = 31;       // larger batches go to the prefill kernels
+ static constexpr int   FA_DPAS_MAX_G = 32;       // query heads per KV head
+ static constexpr float FA_DPAS_MINF  = -1.0e30f; // finite start value of the running max
+ 
++#if GGML_SYCL_FA_DPAS_SG16
+ static bool fattn_dpas_support_arch(gpu_arch arch) {
+     return arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31 ||
+            arch == gpu_arch::intel_gpu_lnl_m   || arch == gpu_arch::intel_gpu_ptl_h   ||
+            arch == gpu_arch::intel_gpu_ptl_u   || arch == gpu_arch::intel_gpu_wcl;
+ }
++#endif
++
++#if GGML_SYCL_FA_DPAS_SG8
++// Xe-HPG DPAS: the device lists the 8 x 8 x 32 int8 and 8 x 8 x 16 f16 tiles at sub-group 8. The s4 x s8 form of
++// the q4_0 kernel is no joint_matrix type, but every DPAS of this width has it.
++static bool fattn_dpas_device_has_sg8(const sycl::device & dev) {
++    namespace mx        = sycl::ext::oneapi::experimental::matrix;
++    const auto sg_sizes = dev.get_info<sycl::info::device::sub_group_sizes>();
++    if (!dev.is_gpu() || std::find(sg_sizes.begin(), sg_sizes.end(), (size_t) 8) == sg_sizes.end()) {
++        return false;
++    }
++    bool s8  = false;
++    bool f16 = false;
++    for (const auto & c : dev.get_info<sycl::ext::oneapi::experimental::info::device::matrix_combinations>()) {
++        if (!(c.max_msize >= 8 || c.msize == 8) || !(c.max_nsize >= 8 || c.nsize == 8)) {
++            continue;
++        }
++        s8  = s8 || (c.atype == mx::matrix_type::sint8 && c.btype == mx::matrix_type::sint8 &&
++                     c.ctype == mx::matrix_type::sint32 && c.dtype == mx::matrix_type::sint32 &&
++                     (c.max_ksize >= 32 || c.ksize == 32));
++        f16 = f16 || (c.atype == mx::matrix_type::fp16 && c.btype == mx::matrix_type::fp16 &&
++                      c.ctype == mx::matrix_type::fp32 && c.dtype == mx::matrix_type::fp32 &&
++                      (c.max_ksize >= 16 || c.ksize == 16));
++    }
++    return s8 && f16;
++}
++#endif
++
++// DPAS width of the kernel for this device: 16 on the Xe2 parts it was tuned on, 8 where the device lists the
++// Xe-HPG tiles, 0 for none. Cached per device.
++static int fattn_dpas_device_sg(int device) {
++    static std::mutex                   mtx;
++    static std::unordered_map<int, int> known;
++    std::lock_guard<std::mutex>         lock(mtx);
++    const auto                          it = known.find(device);
++    if (it != known.end()) {
++        return it->second;
++    }
++    int sg = 0;
++#if GGML_SYCL_FA_DPAS_SG16
++    if (fattn_dpas_support_arch(ggml_sycl_info().devices[device].hw_info.arch)) {
++        sg = 16;
++    }
++#endif
++#if GGML_SYCL_FA_DPAS_SG8
++    if (sg == 0) {
++        try {
++            if (fattn_dpas_device_has_sg8(dpct::dev_mgr::instance().get_device(device))) {
++                sg = 8;
++                GGML_LOG_INFO("%s: device %d: DPAS flash attention at sub-group 8 (Xe-HPG)\n", __func__, device);
++            }
++        } catch (const sycl::exception &) {
++            sg = 0;
++        }
++    }
++#endif
++    known.emplace(device, sg);
++    return sg;
++}
+ 
+ // head sizes with a compiled kernel (multiples of the 32-dim q4_0 / q8_0 block)
+ static bool fattn_dpas_head_ok(int64_t d) {
+@@ -38,7 +111,7 @@ bool ggml_sycl_flash_attn_ext_dpas_supported(int device, const ggml_tensor * dst
+     GGML_UNUSED(dst);
+     return false;
+ #else
+-    if (!g_ggml_sycl_fa_dpas || !fattn_dpas_support_arch(ggml_sycl_info().devices[device].hw_info.arch)) {
++    if (!g_ggml_sycl_fa_dpas || fattn_dpas_device_sg(device) == 0) {
+         return false;
+     }
+ 
+@@ -103,17 +176,32 @@ typedef int   fa_dpas_int4   __attribute__((ext_vector_type(4)));
+ typedef int   fa_dpas_int8   __attribute__((ext_vector_type(8)));
+ typedef float fa_dpas_float8 __attribute__((ext_vector_type(8)));
+ 
+-// Xe2 DPAS (SIMD16, systolic depth 8, repeat count 8) as inline vISA: joint_matrix has no s4 type.
+-// d = a x b. a: 8 rows x 32 s8, 2 per lane per row. b: 32 x 16 s4, 16 bytes per lane, one column per lane.
+-static inline void fa_dpas_s8_s4(const fa_dpas_short8 & a, const fa_dpas_int4 & b, fa_dpas_int8 & d) {
++// DPAS with systolic depth 8 and repeat count 8 as inline vISA (joint_matrix has no s4), SG lanes wide: (M1, 16) on
++// Xe2, (M1, 8) on Xe-HPG. Per lane, b and the result hold column `lane`, and a holds 32 / SG bytes of each of its 8
++// rows: 2 (short8) at SG 16, 4 (int8) at SG 8.
++template <int SG> using fa_dpas_a  = std::conditional_t<SG == 16, fa_dpas_short8, fa_dpas_int8>;
++template <int SG> using fa_dpas_ae = std::conditional_t<SG == 16, short, int>;
++
++// d = a x b. a: 8 rows x 32 s8. b: 32 x SG s4, 16 bytes per lane, one column per lane.
++template <int SG> static inline void fa_dpas_s8_s4(const fa_dpas_a<SG> & a, const fa_dpas_int4 & b, fa_dpas_int8 & d) {
+ #ifdef __SYCL_DEVICE_ONLY__
+-    __asm__("{\n"
+-            ".decl DB v_type=G type=ud num_elts=64 align=GRF alias=<%1,0>\n"
+-            ".decl DA v_type=G type=ud num_elts=64 align=GRF alias=<%2,0>\n"
+-            "dpas.s4.s8.8.8 (M1, 16) %0.0 %%null.0 DB.0 DA(0,0)\n"
+-            "}\n"
+-            : "=rw"(d)
+-            : "rw"(b), "rw"(a));
++    if constexpr (SG == 16) {
++        __asm__("{\n"
++                ".decl DB v_type=G type=ud num_elts=64 align=GRF alias=<%1,0>\n"
++                ".decl DA v_type=G type=ud num_elts=64 align=GRF alias=<%2,0>\n"
++                "dpas.s4.s8.8.8 (M1, 16) %0.0 %%null.0 DB.0 DA(0,0)\n"
++                "}\n"
++                : "=rw"(d)
++                : "rw"(b), "rw"(a));
++    } else {
++        __asm__("{\n"
++                ".decl DB v_type=G type=ud num_elts=32 align=GRF alias=<%1,0>\n"
++                ".decl DA v_type=G type=ud num_elts=64 align=GRF alias=<%2,0>\n"
++                "dpas.s4.s8.8.8 (M1, 8) %0.0 %%null.0 DB.0 DA(0,0)\n"
++                "}\n"
++                : "=rw"(d)
++                : "rw"(b), "rw"(a));
++    }
+ #else
+     d = 0;
+     GGML_UNUSED(a);
+@@ -121,16 +209,26 @@ static inline void fa_dpas_s8_s4(const fa_dpas_short8 & a, const fa_dpas_int4 &
+ #endif
+ }
+ 
+-// d = a x b. a: 8 rows x 32 s8, 2 per lane per row. b: 32 x 16 s8, 32 bytes per lane, one column per lane.
+-static inline void fa_dpas_s8_s8(const fa_dpas_short8 & a, const fa_dpas_int8 & b, fa_dpas_int8 & d) {
++// d = a x b. a: 8 rows x 32 s8. b: 32 x SG s8, 32 bytes per lane, one column per lane.
++template <int SG> static inline void fa_dpas_s8_s8(const fa_dpas_a<SG> & a, const fa_dpas_int8 & b, fa_dpas_int8 & d) {
+ #ifdef __SYCL_DEVICE_ONLY__
+-    __asm__("{\n"
+-            ".decl DB v_type=G type=ud num_elts=128 align=GRF alias=<%1,0>\n"
+-            ".decl DA v_type=G type=ud num_elts=64 align=GRF alias=<%2,0>\n"
+-            "dpas.s8.s8.8.8 (M1, 16) %0.0 %%null.0 DB.0 DA(0,0)\n"
+-            "}\n"
+-            : "=rw"(d)
+-            : "rw"(b), "rw"(a));
++    if constexpr (SG == 16) {
++        __asm__("{\n"
++                ".decl DB v_type=G type=ud num_elts=128 align=GRF alias=<%1,0>\n"
++                ".decl DA v_type=G type=ud num_elts=64 align=GRF alias=<%2,0>\n"
++                "dpas.s8.s8.8.8 (M1, 16) %0.0 %%null.0 DB.0 DA(0,0)\n"
++                "}\n"
++                : "=rw"(d)
++                : "rw"(b), "rw"(a));
++    } else {
++        __asm__("{\n"
++                ".decl DB v_type=G type=ud num_elts=64 align=GRF alias=<%1,0>\n"
++                ".decl DA v_type=G type=ud num_elts=64 align=GRF alias=<%2,0>\n"
++                "dpas.s8.s8.8.8 (M1, 8) %0.0 %%null.0 DB.0 DA(0,0)\n"
++                "}\n"
++                : "=rw"(d)
++                : "rw"(b), "rw"(a));
++    }
+ #else
+     d = 0;
+     GGML_UNUSED(a);
+@@ -138,16 +236,26 @@ static inline void fa_dpas_s8_s8(const fa_dpas_short8 & a, const fa_dpas_int8 &
+ #endif
+ }
+ 
+-// acc += a x b. a: 8 rows x 16 f16, one per lane per row. b: 16 x 16 f16 as pairs, 8 dwords per lane, one column per lane.
+-static inline void fa_dpas_f16(const fa_dpas_short8 & a, const fa_dpas_int8 & b, fa_dpas_float8 & acc) {
++// acc += a x b. a: 8 rows x 16 f16. b: 16 x SG f16 as pairs, 8 dwords per lane, one column per lane.
++template <int SG> static inline void fa_dpas_f16(const fa_dpas_a<SG> & a, const fa_dpas_int8 & b, fa_dpas_float8 & acc) {
+ #ifdef __SYCL_DEVICE_ONLY__
+-    __asm__("{\n"
+-            ".decl DB v_type=G type=ud num_elts=128 align=GRF alias=<%1,0>\n"
+-            ".decl DA v_type=G type=ud num_elts=64 align=GRF alias=<%2,0>\n"
+-            "dpas.hf.hf.8.8 (M1, 16) %0.0 %0.0 DB.0 DA(0,0)\n"
+-            "}\n"
+-            : "+rw"(acc)
+-            : "rw"(b), "rw"(a));
++    if constexpr (SG == 16) {
++        __asm__("{\n"
++                ".decl DB v_type=G type=ud num_elts=128 align=GRF alias=<%1,0>\n"
++                ".decl DA v_type=G type=ud num_elts=64 align=GRF alias=<%2,0>\n"
++                "dpas.hf.hf.8.8 (M1, 16) %0.0 %0.0 DB.0 DA(0,0)\n"
++                "}\n"
++                : "+rw"(acc)
++                : "rw"(b), "rw"(a));
++    } else {
++        __asm__("{\n"
++                ".decl DB v_type=G type=ud num_elts=64 align=GRF alias=<%1,0>\n"
++                ".decl DA v_type=G type=ud num_elts=64 align=GRF alias=<%2,0>\n"
++                "dpas.hf.hf.8.8 (M1, 8) %0.0 %0.0 DB.0 DA(0,0)\n"
++                "}\n"
++                : "+rw"(acc)
++                : "rw"(b), "rw"(a));
++    }
+ #else
+     GGML_UNUSED(a);
+     GGML_UNUSED(b);
+@@ -200,29 +308,35 @@ struct fa_dpas_params {
+ 
+ // One work-group = one KV head x nq query tokens x one slice of the keys: S = Q K^T by s8 x s4 / s8 x s8 DPAS on the
+ // raw K blocks, online softmax, O^T += V^T P^T by f16 DPAS. ST: stage K/V tiles in SLM (1: 16-byte, 2: dword loads).
+-// LG: 256-register file (no spills at 32 rows, same occupancy). Q8: K/V are q8_0, else q4_0.
+-template <int D, int NR16, int KG, int TC, int ST, bool LG, bool Q8>
++// LG: 256-register file (no spills at 32 rows, same occupancy). Q8: K/V are q8_0, else q4_0. SG: DPAS width.
++template <int SG, int D, int NR16, int KG, int TC, int ST, bool LG, bool Q8>
+ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int ne03, dpct::queue_ptr stream) {
++    static_assert(SG == 16 || SG == 8, "DPAS is 16 or 8 lanes wide");
++    constexpr int NSG   = FA_DPAS_WG / SG;                  // sub-groups per work-group
+     constexpr int RMAX  = 16 * NR16;
+     constexpr int RTMAX = RMAX / 8;                         // 8-row tiles in Q.K
++    constexpr int NT    = RMAX / SG;                        // SG-row tiles of O^T in P.V
+     constexpr int TK    = 16 * KG;                          // keys per tile
++    constexpr int KGS   = TK / SG;                          // SG-key groups per tile in Q.K and the softmax
++    constexpr int KPL   = 32 / SG;                          // bytes of each Q row per lane in the s8 A operand
++    constexpr int KPV   = 16 / SG;                          // keys per lane in the f16 A operand of P.V
+     static_assert(QK4_0 == QK8_0, "q4_0 and q8_0 blocks hold the same number of dims");
+     constexpr int BB    = Q8 ? (int) sizeof(block_q8_0) : (int) sizeof(block_q4_0); // bytes per block
+     constexpr int NQ    = (BB - 2) / 4;                     // quant dwords per block
+     constexpr int NB    = D / QK4_0;                        // blocks per row
+-    constexpr int DPS   = D <= 128 ? 8 : D <= 256 ? 16 : 32; // head dims per sub-group in P.V, inside one 32-dim block
++    constexpr int DPS   = D / NSG > 8 ? D / NSG : 8;        // head dims per sub-group in P.V, inside one 32-dim block
+     constexpr int NPV   = D / DPS;                          // sub-groups doing P.V, the rest only reach its barrier
+-    constexpr bool ALLPV = NPV == FA_DPAS_NSG;              // every sub-group does P.V: no runtime check in the loops
++    constexpr bool ALLPV = NPV == NSG;                      // every sub-group does P.V: no runtime check in the loops
+     constexpr int XT    = DPS / 8;                          // 8-dim tiles per sub-group in P.V
+     constexpr int PS    = TK + 16;                          // f16 row stride of P
+     constexpr int RW    = NB * BB / 4;                      // dwords per row
+     constexpr bool ODD  = (NB * BB) % 4 != 0;               // odd block count: rows may start 2 bytes into a dword
+     constexpr int SW    = RW + 1;                           // odd SLM row stride: no bank conflicts for lane = key
+-    static_assert(D % QK4_0 == 0 && D % DPS == 0 && NPV <= FA_DPAS_NSG && QK4_0 % DPS == 0, "unsupported head size");
++    static_assert(D % QK4_0 == 0 && D % DPS == 0 && NPV <= NSG && QK4_0 % DPS == 0, "unsupported head size");
+     static_assert(ST != 1 || RW % 4 == 0, "16-byte staging needs rows of 16-byte multiples");
+ 
+     stream->submit([&](sycl::handler & cgh) {
+-        sycl::local_accessor<fa_dpas_short8, 1> sQ8(sycl::range<1>(RTMAX * NB * 16), cgh); // Q s8 [tile][block][lane]
++        sycl::local_accessor<fa_dpas_a<SG>, 1>  sQ8(sycl::range<1>(RTMAX * NB * SG), cgh); // Q s8 [tile][block][lane]
+         sycl::local_accessor<fa_dpas_float8, 1> sDQ(sycl::range<1>(RTMAX * NB), cgh);      // Q scales [tile][block]
+         sycl::local_accessor<float, 1>          sS(sycl::range<1>(RMAX * TK), cgh);        // S [row][key]
+         sycl::local_accessor<fa_dpas_int8, 1>   sP(sycl::range<1>(RMAX * PS / 16), cgh);   // P f16 [row][key]
+@@ -232,7 +346,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+         sycl::local_accessor<uint32_t, 1>       sKV(sycl::range<1>(ST ? TK * SW : 1), cgh);
+         const sycl::nd_range<3> ndr(sycl::range<3>((size_t) ne03 * p.nqc, nkvh, (size_t) p.nsplit * FA_DPAS_WG),
+                                     sycl::range<3>(1, 1, FA_DPAS_WG));
+-        auto kern = [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] {
++        auto kern = [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(SG)]] {
+                 const int tid   = it.get_local_id(2);
+                 const int split = it.get_group(2);
+                 const int kvh   = it.get_group(1);
+@@ -242,13 +356,13 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+                 const int R     = p.nq * G;
+                 const int RT    = (R + 7) / 8;
+                 auto      sg    = it.get_sub_group();
+-                const int w     = tid / 16;
+-                const int lane  = tid % 16;
+-                short *   sQs   = (short *) &sQ8[0];
++                const int w     = tid / SG;
++                const int lane  = tid % SG;
++                auto *    sQw   = (std::conditional_t<SG == 16, uint16_t, uint32_t> *) &sQ8[0];
+                 short *   sPs   = (short *) &sP[0];
+ 
+-                // Q -> s8, one scale per row and block. Lane l holds the 2 dims of K column elements 2 l, 2 l + 1:
+-                // q4_0 packs dims l and l + 16 into byte l, q8_0 stores dims in order
++                // Q -> s8, one scale per row and block. Lane l holds K column elements KPL l .. KPL l + KPL - 1: element
++                // k is dim k for q8_0, and dim k / 2 + 16 (k % 2) for q4_0, which packs dims i and i + 16 into byte i
+                 for (int e = tid; e < RT * 8 * NB; e += FA_DPAS_WG) {
+                     const int  r    = e / NB;
+                     const int  b    = e % NB;
+@@ -269,10 +383,15 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+                     const int   m  = r % 8;
+                     ((float *) &sDQ[0])[(t * NB + b) * 8 + m] = dq;
+ #pragma unroll
+-                    for (int l = 0; l < 16; ++l) {
+-                        const int lo = (int) sycl::rint(x[Q8 ? 2 * l : l] * iq);
+-                        const int hi = (int) sycl::rint(x[Q8 ? 2 * l + 1 : l + 16] * iq);
+-                        sQs[((t * NB + b) * 16 + l) * 8 + m] = (short) ((lo & 0xFF) | ((hi & 0xFF) << 8));
++                    for (int l = 0; l < SG; ++l) {
++                        uint32_t qw = 0;
++#pragma unroll
++                        for (int i = 0; i < KPL; ++i) {
++                            const int k = KPL * l + i;
++                            const int v = (int) sycl::rint(x[Q8 ? k : k / 2 + 16 * (k % 2)] * iq);
++                            qw |= (uint32_t) (v & 0xFF) << (8 * i);
++                        }
++                        sQw[((t * NB + b) * SG + l) * 8 + m] = qw;
+                     }
+                 }
+                 // rows without a query keep P = 0
+@@ -295,9 +414,9 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+                 const sycl::half * mrow = p.mask ? (const sycl::half *) (p.mask + (seq % p.ne33) * p.nb33) : nullptr;
+ 
+                 // O^T: lane = query row, element m = head dim
+-                fa_dpas_float8 o[NR16][XT];
++                fa_dpas_float8 o[NT][XT];
+ #pragma unroll
+-                for (int t = 0; t < NR16; ++t) {
++                for (int t = 0; t < NT; ++t) {
+ #pragma unroll
+                     for (int x = 0; x < XT; ++x) {
+                         o[t][x] = 0.0f;
+@@ -386,10 +505,10 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+ 
+                     // S = Q K^T, job = (key group, TC row tiles)
+                     const int nch = (RT + TC - 1) / TC;
+-                    for (int job = w; job < KG * nch; job += FA_DPAS_NSG) {
+-                        const int  kg = job % KG;
+-                        const int  ch = job / KG;
+-                        const int  j  = t0 + kg * 16 + lane;
++                    for (int job = w; job < KGS * nch; job += NSG) {
++                        const int  kg = job % KGS;
++                        const int  ch = job / KGS;
++                        const int  j  = t0 + kg * SG + lane;
+                         const bool jv = j < k_end;
+                         const char *     kb = Kh + (int64_t) (jv ? j : k_begin) * p.nb11;
+                         const int        kp = (ST || !ODD) ? 0 : (int) (((uintptr_t) kb >> 1) & 1); // row starts 2 bytes into a dword
+@@ -404,7 +523,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+                             uint32_t wv[NQ + 1];
+                             uint32_t sc;
+                             uint32_t q[NQ];
+-                            load_block(kr, kp, kg * 16 + lane, b, wv);
++                            load_block(kr, kp, kg * SG + lane, b, wv);
+                             fa_dpas_split_block<NQ>(wv, (b + kp) % 2 != 0, sc, q);
+                             const float dk = static_cast<float>(sycl::bit_cast<sycl::half>((uint16_t) sc));
+ #pragma unroll
+@@ -415,12 +534,12 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+                                     if constexpr (Q8) {
+                                         const fa_dpas_int8 bv = { (int) q[0], (int) q[1], (int) q[2], (int) q[3],
+                                                                   (int) q[4], (int) q[5], (int) q[6], (int) q[7] };
+-                                        fa_dpas_s8_s8(sQ8[(t * NB + b) * 16 + lane], bv, ia);
++                                        fa_dpas_s8_s8<SG>(sQ8[(t * NB + b) * SG + lane], bv, ia);
+                                     } else {
+                                         // u4 (n + 8) -> s4 n
+                                         const fa_dpas_int4 bv = { (int) (q[0] ^ 0x88888888u), (int) (q[1] ^ 0x88888888u),
+                                                                   (int) (q[2] ^ 0x88888888u), (int) (q[3] ^ 0x88888888u) };
+-                                        fa_dpas_s8_s4(sQ8[(t * NB + b) * 16 + lane], bv, ia);
++                                        fa_dpas_s8_s4<SG>(sQ8[(t * NB + b) * SG + lane], bv, ia);
+                                     }
+                                     const fa_dpas_float8 ds = sDQ[t * NB + b] * dk;
+                                     s[tt] += __builtin_convertvector(ia, fa_dpas_float8) * ds;
+@@ -438,7 +557,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+                                     if (r < R) {
+                                         const bool  ok = jv && c < p.ne01;
+                                         const float mv = (ok && mrow) ? static_cast<float>(mrow[((int64_t) c * p.nb31) / (int64_t) sizeof(sycl::half) + j]) : 0.0f;
+-                                        sS[r * TK + kg * 16 + lane] = ok ? s[tt][m] + mv : -INFINITY;
++                                        sS[r * TK + kg * SG + lane] = ok ? s[tt][m] + mv : -INFINITY;
+                                     }
+                                 }
+                             }
+@@ -450,12 +569,12 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+                     }
+ 
+                     // online softmax per row -> P
+-                    for (int r = w; r < R; r += FA_DPAS_NSG) {
+-                        float sv[KG];
++                    for (int r = w; r < R; r += NSG) {
++                        float sv[KGS];
+                         float mt = -INFINITY;
+ #pragma unroll
+-                        for (int i = 0; i < KG; ++i) {
+-                            sv[i] = sS[r * TK + i * 16 + lane];
++                        for (int i = 0; i < KGS; ++i) {
++                            sv[i] = sS[r * TK + i * SG + lane];
+                             mt    = sycl::fmax(mt, sv[i]);
+                         }
+                         mt = sycl::reduce_over_group(sg, mt, sycl::maximum<float>());
+@@ -463,9 +582,9 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+                         const float m_new = sycl::fmax(m_old, mt);
+                         float       lt    = 0.0f;
+ #pragma unroll
+-                        for (int i = 0; i < KG; ++i) {
++                        for (int i = 0; i < KGS; ++i) {
+                             const float pv = sycl::native::exp(sv[i] - m_new);
+-                            sPs[r * PS + i * 16 + lane] = (short) sycl::bit_cast<uint16_t>(sycl::half(pv));
++                            sPs[r * PS + i * SG + lane] = (short) sycl::bit_cast<uint16_t>(sycl::half(pv));
+                             lt += pv;
+                         }
+                         lt = sycl::reduce_over_group(sg, lt, sycl::plus<float>());
+@@ -480,10 +599,10 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+ 
+                     prefetch_rows(Kh, p.nb11, t0 + TK);
+ 
+-                    // O^T = diag(alpha) O^T + V^T P^T. A = V^T (8 dims x 16 keys, lane = key), B = P^T (16 keys x 16 rows)
++                    // O^T = diag(alpha) O^T + V^T P^T. A = V^T (8 dims x 16 keys), B = P^T (16 keys x SG rows, lane = row)
+ #pragma unroll
+-                    for (int t = 0; t < NR16; ++t) {
+-                        const float a = sA[t * 16 + lane];
++                    for (int t = 0; t < NT; ++t) {
++                        const float a = sA[t * SG + lane];
+ #pragma unroll
+                         for (int x = 0; x < XT; ++x) {
+                             o[t][x] *= a;
+@@ -491,39 +610,52 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+                     }
+ #pragma unroll 1
+                     for (int kg = 0; kg < ((ALLPV || w < NPV) ? KG : 0); ++kg) {
+-                        const int  j  = t0 + kg * 16 + lane;
+-                        const bool jv = j < k_end;
+-                        const char *     vbp = Vh + (int64_t) (jv ? j : k_begin) * p.nb21;
+-                        const int        vp  = (ST || !ODD) ? 0 : (int) (((uintptr_t) vbp >> 1) & 1);
+-                        const uint32_t * vr  = (const uint32_t *) (vbp - 2 * vp);
+-                        uint32_t wv[NQ + 1];
+-                        uint32_t sc;
+-                        uint32_t q[NQ];
+-                        load_block(vr, vp, kg * 16 + lane, vb, wv);
+-                        fa_dpas_split_block<NQ>(wv, (vb + vp) % 2 != 0, sc, q);
+-                        const float dv = jv ? static_cast<float>(sycl::bit_cast<sycl::half>((uint16_t) sc)) : 0.0f;
+-                        fa_dpas_short8 va[XT];
++                        // lane l holds keys KPV l .. KPV l + KPV - 1 of the 16, one f16 per key, lowest key in the low half
++                        uint32_t vw[XT][8] = {};
++#pragma unroll
++                        for (int h = 0; h < KPV; ++h) {
++                            const int  kk = kg * 16 + KPV * lane + h;
++                            const int  j  = t0 + kk;
++                            const bool jv = j < k_end;
++                            const char *     vbp = Vh + (int64_t) (jv ? j : k_begin) * p.nb21;
++                            const int        vp  = (ST || !ODD) ? 0 : (int) (((uintptr_t) vbp >> 1) & 1);
++                            const uint32_t * vr  = (const uint32_t *) (vbp - 2 * vp);
++                            uint32_t wv[NQ + 1];
++                            uint32_t sc;
++                            uint32_t q[NQ];
++                            load_block(vr, vp, kk, vb, wv);
++                            fa_dpas_split_block<NQ>(wv, (vb + vp) % 2 != 0, sc, q);
++                            const float dv = jv ? static_cast<float>(sycl::bit_cast<sycl::half>((uint16_t) sc)) : 0.0f;
++#pragma unroll
++                            for (int x = 0; x < XT; ++x) {
++#pragma unroll
++                                for (int m = 0; m < 8; ++m) {
++                                    const int d = vd0 + x * 8 + m;
++                                    int       v;
++                                    if constexpr (Q8) {
++                                        v = (int8_t) ((q[d / 4] >> (8 * (d % 4))) & 0xFF);
++                                    } else {
++                                        const int byte = d % 16;
++                                        v = (int) ((q[byte / 4] >> (8 * (byte % 4) + 4 * (d / 16))) & 0xF) - 8;
++                                    }
++                                    vw[x][m] |= (uint32_t) sycl::bit_cast<uint16_t>(sycl::half((float) v * dv)) << (16 * h);
++                                }
++                            }
++                        }
++                        fa_dpas_a<SG> va[XT];
+ #pragma unroll
+                         for (int x = 0; x < XT; ++x) {
+ #pragma unroll
+                             for (int m = 0; m < 8; ++m) {
+-                                const int d = vd0 + x * 8 + m;
+-                                int       v;
+-                                if constexpr (Q8) {
+-                                    v = (int8_t) ((q[d / 4] >> (8 * (d % 4))) & 0xFF);
+-                                } else {
+-                                    const int byte = d % 16;
+-                                    v = (int) ((q[byte / 4] >> (8 * (byte % 4) + 4 * (d / 16))) & 0xF) - 8;
+-                                }
+-                                va[x][m] = (short) sycl::bit_cast<uint16_t>(sycl::half((float) v * dv));
++                                va[x][m] = (fa_dpas_ae<SG>) vw[x][m];
+                             }
+                         }
+ #pragma unroll
+-                        for (int t = 0; t < NR16; ++t) {
+-                            const fa_dpas_int8 pb = sP[((t * 16 + lane) * PS + kg * 16) / 16];
++                        for (int t = 0; t < NT; ++t) {
++                            const fa_dpas_int8 pb = sP[((t * SG + lane) * PS + kg * 16) / 16];
+ #pragma unroll
+                             for (int x = 0; x < XT; ++x) {
+-                                fa_dpas_f16(va[x], pb, o[t][x]);
++                                fa_dpas_f16<SG>(va[x], pb, o[t][x]);
+                             }
+                         }
+                     }
+@@ -531,8 +663,8 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+                 }
+ 
+ #pragma unroll
+-                for (int t = 0; t < NR16; ++t) {
+-                    const int r = t * 16 + lane;
++                for (int t = 0; t < NT; ++t) {
++                    const int r = t * SG + lane;
+                     const int c = c0 + r / G;
+                     if ((ALLPV || w < NPV) && r < R && c < p.ne01) {
+                         const int64_t jdu = ((int64_t) seq * p.ne01 + c) * p.ne02 + kvh * G + r % G;
+@@ -564,7 +696,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+     });
+ }
+ 
+-template <int D, int NR16, int KG, int TC, int ST, bool Q8>
++template <int SG, int D, int NR16, int KG, int TC, int ST, bool Q8>
+ static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+     constexpr int TK = 16 * KG;
+ 
+@@ -605,10 +737,17 @@ static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
+     p.nb31 = mask ? mask->nb[1] : 0;
+     p.nb33 = mask ? mask->nb[3] : 0;
+ 
++    // the large register file pays off for 32-row launches from about 4K keys. At sub-group 8 the 32-row kernels from
++    // head size 128 and the staged decode kernel spill in 128 registers (IGC 2.43, acm-g10): those always take 256.
++    constexpr bool lg_always = SG == 8 && D >= 128 && (NR16 == 2 || ST == 1);
++    const bool     lg        = lg_always || (NR16 == 2 && ne11 >= 4096);
++
+     // split the keys so that all work-groups run in one wave
+     // SLM fits about 4 work-groups per Xe2 core with 16 rows, 2 with 32. Xe2 core = 8 EUs, nsm = EUs / 16.
+-    const int xe_cores = std::max(1, ggml_sycl_info().devices[ctx.device].nsm * 2);
+-    const int wave     = xe_cores * (NR16 == 1 ? 4 : 2);
++    // An Xe-HPG core has 16 EUs and as many SIMD8 threads per EU, so it holds as many sub-group 8 work-groups;
++    // the 256-register file halves its threads, to 2 work-groups.
++    const int xe_cores = std::max(1, ggml_sycl_info().devices[ctx.device].nsm * (SG == 16 ? 2 : 1));
++    const int wave     = xe_cores * (NR16 == 1 && !lg ? 4 : 2);
+     const int ntiles   = (ne11 + TK - 1) / TK;
+     int nsplit = std::max(1, std::min(wave / (nkvh * ne03 * p.nqc), ntiles));
+     p.chunk    = ((ntiles + nsplit - 1) / nsplit) * TK;
+@@ -625,11 +764,12 @@ static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
+     p.meta  = meta.get();
+ 
+     dpct::queue_ptr stream = ctx.stream();
+-    // the large register file pays off for 32-row launches from about 4K keys
+-    if (NR16 == 2 && ne11 >= 4096) {
+-        fattn_dpas_kernel<D, NR16, KG, TC, ST, true, Q8>(p, nkvh, ne03, stream);
++    if constexpr (lg_always) {
++        fattn_dpas_kernel<SG, D, NR16, KG, TC, ST, true, Q8>(p, nkvh, ne03, stream);
++    } else if (lg) {
++        fattn_dpas_kernel<SG, D, NR16, KG, TC, ST, true, Q8>(p, nkvh, ne03, stream);
+     } else {
+-        fattn_dpas_kernel<D, NR16, KG, TC, ST, false, Q8>(p, nkvh, ne03, stream);
++        fattn_dpas_kernel<SG, D, NR16, KG, TC, ST, false, Q8>(p, nkvh, ne03, stream);
+     }
+ 
+     if (nsplit > 1) {
+@@ -640,7 +780,8 @@ static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
+             sycl::local_accessor<uint8_t, 1> lm(sycl::range<1>(nsplit * sizeof(sycl::float2)), cgh);
+             cgh.parallel_for(
+                 sycl::nd_range<3>(sycl::range<3>(Q->ne[3], Q->ne[2], (size_t) ne01 * D), sycl::range<3>(1, 1, D)),
+-                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
++                // at the DPAS width: the sub-group 16 device image holds the (M1, 16) DPAS kernels, which Xe-HPG cannot build
++                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(SG)]] {
+                     flash_attn_combine_results<D>(parts_p, meta_p, dst_p, nsplit,
+                                                   lm.get_multi_ptr<sycl::access::decorated::no>().get());
+                 });
+@@ -648,7 +789,7 @@ static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
+     }
+ }
+ 
+-template <bool Q8> static void fattn_dpas_dispatch(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
++template <int SG, bool Q8> static void fattn_dpas_dispatch(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * Q = dst->src[0];
+     const ggml_tensor * K = dst->src[1];
+     const ggml_tensor * V = dst->src[2];
+@@ -665,7 +806,7 @@ template <bool Q8> static void fattn_dpas_dispatch(ggml_backend_sycl_context & c
+ 
+     // single token decode: staged K/V tiles are faster at long context
+     if (D == 256 && ne01 == 1 && G <= 16 && aligned16) {
+-        fattn_dpas_case<256, 1, 8, 1, 1, Q8>(ctx, dst);
++        fattn_dpas_case<SG, 256, 1, 8, 1, 1, Q8>(ctx, dst);
+         return;
+     }
+     const bool rows16 = ne01 * G <= 16;
+@@ -673,9 +814,9 @@ template <bool Q8> static void fattn_dpas_dispatch(ggml_backend_sycl_context & c
+ #define FATTN_DPAS_D(D_, KG16_)                                                                        \
+     case D_:                                                                                           \
+         if (rows16) {                                                                                  \
+-            fattn_dpas_case<D_, 1, KG16_, 1, 0, Q8>(ctx, dst);                                     \
++            fattn_dpas_case<SG, D_, 1, KG16_, 1, 0, Q8>(ctx, dst);                                     \
+         } else {                                                                                       \
+-            fattn_dpas_case<D_, 2, 8, 2, 0, Q8>(ctx, dst);                                         \
++            fattn_dpas_case<SG, D_, 2, 8, 2, 0, Q8>(ctx, dst);                                         \
+         }                                                                                              \
+         break;
+     // q8_0 at head size 128: its 136-byte rows gather poorly per lane, stage them in SLM by coalesced dword loads
+@@ -685,9 +826,9 @@ template <bool Q8> static void fattn_dpas_dispatch(ggml_backend_sycl_context & c
+     }
+     if (Q8 && D == 128 && aligned4) {
+         if (rows16) {
+-            fattn_dpas_case<128, 1, 16, 1, 2, Q8>(ctx, dst);
++            fattn_dpas_case<SG, 128, 1, 16, 1, 2, Q8>(ctx, dst);
+         } else {
+-            fattn_dpas_case<128, 2, 8, 2, 2, Q8>(ctx, dst);
++            fattn_dpas_case<SG, 128, 2, 8, 2, 2, Q8>(ctx, dst);
+         }
+         return;
+     }
+@@ -704,10 +845,28 @@ template <bool Q8> static void fattn_dpas_dispatch(ggml_backend_sycl_context & c
+ }
+ 
+ void ggml_sycl_flash_attn_ext_dpas(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+-    if (dst->src[1]->type == GGML_TYPE_Q8_0) {
+-        fattn_dpas_dispatch<true>(ctx, dst);
+-    } else {
+-        fattn_dpas_dispatch<false>(ctx, dst);
++    const bool q8 = dst->src[1]->type == GGML_TYPE_Q8_0;
++    switch (fattn_dpas_device_sg(ctx.device)) {
++#if GGML_SYCL_FA_DPAS_SG16
++        case 16:
++            if (q8) {
++                fattn_dpas_dispatch<16, true>(ctx, dst);
++            } else {
++                fattn_dpas_dispatch<16, false>(ctx, dst);
++            }
++            return;
++#endif
++#if GGML_SYCL_FA_DPAS_SG8
++        case 8:
++            if (q8) {
++                fattn_dpas_dispatch<8, true>(ctx, dst);
++            } else {
++                fattn_dpas_dispatch<8, false>(ctx, dst);
++            }
++            return;
++#endif
++        default:
++            GGML_ABORT("fattn-dpas: no DPAS kernel for this device");
+     }
+ }
+ 

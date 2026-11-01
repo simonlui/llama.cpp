@@ -120,11 +120,38 @@ oneAPI came from conda-forge into `/opt/oneapi` on a GPU-less cloud box:
   failing the whole ESIMD image with any GRF option. Testing `mask` on the host
   fixes it; all 37 kernels build. ef777 ran it on an A770 under Windows, so
   whether the original breaks depends on the driver's IGC.
+- **Candidate C60 ports upstream's DPAS flash attention (PR 31125) to DG2.**
+  Upstream's kernel (q4_0 / q8_0 KV, 1-31 query tokens; B580 tg128 at 16K
+  31.3 -> 54.2 t/s) is hand-written `(M1, 16)` vISA behind a Battlemage /
+  Lunar Lake / Panther Lake allowlist. C60 makes the DPAS width a template
+  parameter: sub-group 16 keeps upstream's operand bytes, tiles and dispatch;
+  sub-group 8 issues `(M1, 8)` with 32 sub-groups per work-group, Q.K over
+  8-key groups, P.V over 8-row tiles, 4 bytes of each Q row per lane and 2 keys
+  per lane in the f16 V operand. The width is picked per device at run time:
+  16 on upstream's allowlist, 8 where the device lists the 8x8x32 int8 and
+  8x8x16 f16 tiles at sub-group 8. Results:
+  - `acm-g10`: 42 kernels, all 782 DPAS `dpas.8x8 (8|M0)` (s4 x s8 for q4_0 K,
+    s8 x s8 for q8_0 K, f16 for P.V). At 128 GRF the 32-row kernels from head
+    size 128 and the staged D=256 decode kernel spilled 0.5-7.8 KB, so at
+    sub-group 8 they always take the 256-register file; nothing spills now.
+  - `bmg-g21`: the same 604 DPAS as upstream's file, instruction counts within
+    +-1% per kernel (+0.6% in total), no spills.
+  - JIT build: each device image holds one width; the split-K combine kernel
+    runs at the DPAS width, so the A770 never builds the `(M1, 16)` image.
+  - `sycl-patches-candidates/tools/fattn-dpas-emu/run.sh` runs the unchanged
+    kernels on the CPU OpenCL device with the three DPAS helpers emulated
+    (A = the flat register region of the per-lane operand, B and D one column
+    per lane). 112 cases pass at both widths: q8_0 / q4_0, D = 64/96/128/256,
+    GQA 1-32, 1-7 tokens, masks, sinks, split-K; NMSE vs FP64 <= 4.8e-5,
+    sub-group 8 vs 16 <= 1.6e-11. Planting either of two plausible sub-group-8
+    layout bugs (Q byte order, keys per lane in P.V) makes it fail with NMSE ~1.
+    Sub-group 16 passing ties the emulated register model to the layouts
+    upstream relies on; the DG2 hardware itself is still untested.
 - **Running the backend on the CPU OpenCL device does not work** without porting
   ggml-sycl to CPUs. A scratch hook that let `dpct::dev_mgr` pick the CPU got as
   far as the first DMMV kernel (`UR_RESULT_ERROR_UNKNOWN`); FA died with a
-  floating point exception, likely from GPU-only device properties. No numeric
-  test of the SYCL kernels was possible here.
+  floating point exception, likely from GPU-only device properties. The only
+  numeric test of SYCL kernels here is C60's standalone emulation above.
 
 ## Update (2026-11-01, upstream refresh to `dde879bc1`)
 

@@ -24,6 +24,7 @@ the main stack, re-running `apply.sh` on an applied tree is not supported.
 | C40 | ef777/a770-qwen-xe1 `da7f577`, plus a local DG2 build fix | GQA flash-decode kernel, 1-8 tokens, q8_0/f16 KV, D=64/128/256 | VEC rereads K/V per query head; this reads each KV head once for all its query heads. Author on A770: 24k n1 520 -> 410 us, 12k n4 762 -> 404 us | `GGML_SYCL_FA_GQA_DEC=0` |
 | C50 | Frostbite1536/A770 `0a31dc7`, p11c F | TILE FA flushes its FP16 V accumulator to FP32 once per KV tile | Probable long-context accuracy fix: NMSE up to 2.3 at 16k keys per block, CPU OpenCL device only | none |
 | C51 | Frostbite1536/A770, patch 0005 | 16 biased-V FA test cases with an FP32 CPU reference | Tests C50; CPU FA changes only under the test reference flag | none |
+| C60 | local port of upstream PR 31125 | Upstream's DPAS flash attention for q4_0 / q8_0 KV (1-31 query tokens), with the DPAS width as a template parameter: sub-group 16 as upstream, sub-group 8 for Xe-HPG, picked per device at run time | Upstream measured tg128 at 16K 31.3 -> 54.2 t/s on a B580 (q4_0 KV), but gates it to Xe2. On DG2 it replaces VEC for quantized-KV decode and small batches, and it is the only candidate that covers q4_0 KV. With C40 applied, C40 still takes q8_0 decode at 1-8 tokens and D 64/128/256 | `GGML_SYCL_FA_DPAS=0` |
 | C90 | local | `GGML_SYCL_DG2_BMG_TUNING` bit mask that opens five Battlemage-only kernel choices to DG2 | Each choice is between kernels already built for every device, so only speed can change | `GGML_SYCL_DG2_BMG_TUNING=0` (default) |
 
 `GGML_SYCL_DG2_BMG_TUNING` bits:
@@ -36,6 +37,9 @@ the main stack, re-running `apply.sh` on an applied tree is not supported.
 | 8 | D=256 single-query decode on FA VEC (PR 30606) | dispatcher default |
 | 16 | q4_K MMVQ row pairing up to 8 columns (needs C30) | pairing up to 4 |
 
+Bits 1 and 8 choose between TILE and VEC, which C60 and C40 run ahead of for q4_0 / q8_0 KV:
+measure them with `GGML_SYCL_FA_DPAS=0 GGML_SYCL_FA_GQA_DEC=0`.
+
 ## Hardware gates are different
 
 `sycl-patches/check_arch_gates.sh` lists every architecture gate and tags the ones in files
@@ -43,10 +47,12 @@ that use DPAS, joint_matrix, ESIMD or 2D block loads as `HW`. Do not add DG2 to 
 The A770 runs DPAS at execution size 8; Xe2 runs it at 16. On `acm-g10` the sub-group-16
 DPAS builtin compiles without an error or warning and produces no DPAS instruction
 (Frostbite1536/A770 compile probes), so a widened `HW` gate can build and then compute
-garbage. Those paths need a sub-group-8 port, as C21 is for the MoE GEMM. Measured on the
-A770 by ef777: an 8-wide port of the XMX multi-column MMVQ was slower than dp4a at 1-8
-columns and slower than dequantize + GEMM at 9-80, and an XMX flash-attention kernel was
-correct but slower. Neither is worth porting.
+garbage. Those paths need a sub-group-8 port: C21 is that port for the MoE GEMM and C60 for
+the DPAS flash attention. The remaining `HW` gate, upstream's XMX multi-column MMVQ, is not
+worth porting: ef777 measured it on the A770 slower than dequantize + GEMM at 9-80 columns,
+and their own 8-row XMX matvec slower than dp4a at 1-8. ef777 also found an XMX
+flash-attention kernel of their own correct but slower (SLM and barrier stalls). That is a
+different kernel from C60, so C60 has to win its benchmark like every other candidate.
 
 ## Test plan on the A770
 
@@ -58,16 +64,31 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build_sycl/bin/test-backend-ops -b SYCL0 -
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build_sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT_ID
 ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_DG2_BMG_TUNING=31 ./build_sycl/bin/test-backend-ops -b SYCL0 -o FLASH_ATTN_EXT
 ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_DG2_BMG_TUNING=31 ./build_sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT -p q4_K
+ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_FA_GQA_DEC=0 ./build_sycl/bin/test-backend-ops -b SYCL0 -o FLASH_ATTN_EXT
 ```
+
+With C60 the log shows `fattn_dpas_device_sg: device 0: DPAS flash attention at sub-group 8
+(Xe-HPG)` on the first quantized-KV FA call. The last command routes q8_0 decode to C60
+instead of C40.
 
 Then speed, one switch at a time against the same build (`-d` sweeps the KV depth that
 the FA candidates target; use a GQA model with q8_0 KV for C40):
 
 ```bash
-for t in 0 1 2 4 8 16; do GGML_SYCL_DG2_BMG_TUNING=$t ./build_sycl/bin/llama-bench -m MODEL -fa 1 -ctk q8_0 -ctv q8_0 -p 0 -n 128 -d 0,4096,16384 -r 3; done
+for t in 0 1 2 4 8 16; do GGML_SYCL_FA_DPAS=0 GGML_SYCL_FA_GQA_DEC=0 GGML_SYCL_DG2_BMG_TUNING=$t ./build_sycl/bin/llama-bench -m MODEL -fa 1 -ctk q8_0 -ctv q8_0 -p 0 -n 128 -d 0,4096,16384 -r 3; done
 GGML_SYCL_FA_GQA_DEC=0 ./build_sycl/bin/llama-bench -m MODEL -fa 1 -ctk q8_0 -ctv q8_0 -p 0 -n 128 -d 0,4096,16384 -r 3
 GGML_SYCL_MMID_ESIMD=0 ./build_sycl/bin/llama-bench -m MOE_MODEL -p 512 -n 128 -r 3
 ```
+
+C60 against the kernels it replaces, for each KV type (`-p 16 -ub 16` is a 16-token batch,
+the shape of a speculative-decoding verify):
+
+```bash
+for kv in q4_0 q8_0; do for dpas in 1 0; do GGML_SYCL_FA_GQA_DEC=0 GGML_SYCL_FA_DPAS=$dpas ./build_sycl/bin/llama-bench -m MODEL -fa 1 -ctk $kv -ctv $kv -p 16 -ub 16 -n 128 -d 0,4096,16384 -r 3; done; done
+GGML_SYCL_FA_GQA_DEC=1 ./build_sycl/bin/llama-bench -m MODEL -fa 1 -ctk q8_0 -ctv q8_0 -p 0 -n 128 -d 0,4096,16384 -r 3
+```
+
+The last line is C40 on q8_0 decode, to compare with the `dpas=1 q8_0` rows.
 
 Promote a candidate when its tests pass and it wins at the depths you use. A tuning bit that
 wins can become a plain DG2 entry in that gate.
@@ -90,7 +111,15 @@ the A770 compiles at JIT time) and its DG2 assembly read from IGC dumps:
   on the host; all 37 kernels build. At the 128 GRF of an AOT build, the D=256
   SPMD and ESIMD variants spill (0.7-12 KB).
 - C50 TILE FA instance: builds.
+- C60 `fattn-dpas.cpp`: builds for `acm-g10` (42 kernels, all 782 DPAS `dpas.8x8 (8|M0)`,
+  none spill) and `bmg-g21` (the same 604 DPAS as upstream, instruction counts within 1%,
+  none spill). The sub-group-8 kernels that spilled at 128 GRF (32 rows from D=128, staged
+  D=256 decode) always use 256. In a JIT build each device image holds one DPAS width.
+  `tools/fattn-dpas-emu/run.sh` runs the kernels on the CPU OpenCL device with emulated
+  DPAS: 112 cases pass at both widths (NMSE vs FP64 <= 4.8e-5, sub-group 8 vs 16 <=
+  1.6e-11), and it fails on planted sub-group-8 layout bugs. Rerun it when C60 is
+  re-anchored.
 
-What was not checked: any number on real hardware. The CPU OpenCL device runs
-the SPMD kernels against the CPU reference (see `SYCL_DEV_LOG.md`), but not
-ESIMD, DPAS or joint_matrix.
+What was not checked: any number on real hardware. Apart from C60's emulation,
+no kernel here ran: the backend does not run on the CPU OpenCL device (see
+`SYCL_DEV_LOG.md`), and ESIMD, DPAS and joint_matrix need the GPU.
