@@ -1,0 +1,1404 @@
+From: ef777 <https://github.com/ef777/a770-qwen-xe1>
+Subject: [PATCH] sycl: GQA flash-decode kernel for 1-8 query tokens (A770)
+
+Extracted from patches/xe1-only-on-top-of-prs.patch at ef777/a770-qwen-xe1 da7f577 2026-10-11:
+fattn-gqa-dec.cpp/.hpp and the fattn.cpp hook only (3 of 31 file diffs). The README states
+the patches are MIT like llama.cpp; the repo has no LICENSE file. One work-group per KV head
+serves all query heads that share it, for q8_0/f16 KV, D=64/128/256, no sinks or softcap.
+GGML_SYCL_FA_GQA_DEC=0 turns it off. Author timings are on an A770 under Windows.
+
+diff --git a/ggml/src/ggml-sycl/fattn-gqa-dec.cpp b/ggml/src/ggml-sycl/fattn-gqa-dec.cpp
+new file mode 100644
+index 00000000..461ef343
+--- /dev/null
++++ b/ggml/src/ggml-sycl/fattn-gqa-dec.cpp
+@@ -0,0 +1,1342 @@
++// GQA-grouped flash-attention decode for small query batches (1..4 tokens, e.g. a
++// speculative-decoding verify), written for Xe-HPG (Arc A770).
++//
++// The VEC kernel runs every query head on its own, so each KV row is read gqa_ratio
++// times (6x for Qwen3.8: 24 query / 4 KV heads). Here a work-group owns one KV head
++// and one KV chunk, and runs all gqa_ratio * n_tokens query rows of that head on it:
++// one sub-group per query row, all of them reading the same K/V rows at the same time,
++// so the rows come from VRAM once and from cache for the other query rows.
++// Each work-group writes a partial (max, sum, acc) per query row, a second kernel
++// merges the chunks (flash-decoding).
++
++#include "fattn-gqa-dec.hpp"
++
++#include <cmath>
++#include <sycl/ext/intel/esimd.hpp>
++#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
++
++static constexpr int GQA_DEC_SG    = 16;  // sub-group size
++static int gqa_dec_chunk() { static const int c = ggml_sycl_get_env("GGML_SYCL_FA_GQA_CHUNK", 128); return c; }
++
++template <int D, ggml_type TKV>
++static inline void gqa_dec_load_row(const char * row, int lane, float * out) {
++    constexpr int EPL = D / GQA_DEC_SG;  // elements per lane
++    const int     e0  = lane * EPL;
++    if constexpr (TKV == GGML_TYPE_Q8_0) {
++        static_assert(EPL <= 32 && 32 % EPL == 0, "lane slice must stay inside one q8_0 block");
++        const block_q8_0 * b = (const block_q8_0 *) row + e0 / 32;
++        const float        d = (float) b->d;
++        // qs starts at an even offset inside the 34-byte block: 16-bit loads halve the load count
++        const uint16_t *   q = (const uint16_t *) (b->qs + e0 % 32);
++#pragma unroll
++        for (int i = 0; i < EPL / 2; ++i) {
++            const uint16_t w = q[i];
++            out[2 * i + 0]   = d * (float) (int8_t) (w & 0xFF);
++            out[2 * i + 1]   = d * (float) (int8_t) (w >> 8);
++        }
++    } else {
++        const sycl::half * h = (const sycl::half *) row + e0;
++#pragma unroll
++        for (int i = 0; i < EPL; ++i) {
++            out[i] = (float) h[i];
++        }
++    }
++}
++
++
++// element k of a K/V row, dequantized (used by the cooperative SLM tile load)
++template <ggml_type TKV>
++static inline float gqa_dec_elem(const char * row, int k) {
++    if constexpr (TKV == GGML_TYPE_Q8_0) {
++        const block_q8_0 * b = (const block_q8_0 *) row + (k >> 5);
++        return (float) b->d * (float) b->qs[k & 31];
++    } else {
++        return (float) ((const sycl::half *) row)[k];
++    }
++}
++
++// SLM variant: the work-group dequantizes a tile of GQA_DEC_TILE K/V rows once, with
++// consecutive work-items on consecutive bytes, into local memory; every query row
++// (one sub-group each) then reads its 16-element slice from SLM. The KV head's rows
++// are thus read from VRAM once per work-group and the per-row loads are SLM loads.
++static constexpr int GQA_DEC_TILE = 16;
++
++template <int D, ggml_type TKV>
++static void gqa_dec_partial_slm(const char * Q, const char * K, const char * V, const char * mask, float * part,
++                                float * meta, float scale, int n_tok, int n_head, int gqa, int n_kv, int n_chunks,
++                                size_t nbq1, size_t nbq2, size_t nbk1, size_t nbk2, size_t nbv1, size_t nbv2,
++                                size_t nbm1, int chunk_sz, dpct::queue_ptr stream) {
++    constexpr int EPL   = D / GQA_DEC_SG;
++    constexpr int T     = GQA_DEC_TILE;
++    const int     rows  = gqa * n_tok;
++    const int     n_kvh = n_head / gqa;
++    const int     nthr  = rows * GQA_DEC_SG;
++    const sycl::range<2> lws(1, (size_t) nthr);
++    const sycl::range<2> gws((size_t) n_kvh * n_chunks, (size_t) nthr);
++
++    stream->submit([&](sycl::handler & cgh) {
++        sycl::local_accessor<float, 1> ks(sycl::range<1>(T * D), cgh);
++        sycl::local_accessor<float, 1> vs(sycl::range<1>(T * D), cgh);
++        cgh.parallel_for(sycl::nd_range<2>(gws, lws), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(GQA_DEC_SG)]] {
++            const auto sg    = it.get_sub_group();
++            const int  lane  = sg.get_local_linear_id();
++            const int  tid   = it.get_local_id(1);
++            const int  r     = tid / GQA_DEC_SG;
++            const int  t     = r / gqa;
++            const int  g     = r % gqa;
++            const int  kvh   = it.get_group(0) / n_chunks;
++            const int  chunk = it.get_group(0) % n_chunks;
++            const int  h     = kvh * gqa + g;
++            const int  p0    = chunk * chunk_sz;
++            const int  p1    = sycl::min(p0 + chunk_sz, n_kv);
++
++            float q[EPL];
++            {
++                const float * qrow = (const float *) (Q + (size_t) t * nbq1 + (size_t) h * nbq2) + lane * EPL;
++#pragma unroll
++                for (int i = 0; i < EPL; ++i) {
++                    q[i] = qrow[i] * scale;
++                }
++            }
++            const sycl::half * mrow = mask ? (const sycl::half *) (mask + (size_t) t * nbm1) : nullptr;
++
++            float m = -INFINITY;
++            float s = 0.0f;
++            float acc[EPL];
++#pragma unroll
++            for (int i = 0; i < EPL; ++i) {
++                acc[i] = 0.0f;
++            }
++
++            const char * Kh = K + (size_t) kvh * nbk2;
++            const char * Vh = V + (size_t) kvh * nbv2;
++
++            for (int pb = p0; pb < p1; pb += T) {
++                const int nt = sycl::min(T, p1 - pb);
++                // cooperative dequant of the tile into SLM, 4 elements (same q8_0 block) per step;
++                // SLM layout [u][i][lane] (element k -> lane k/EPL, i k%EPL) so the per-lane reads
++                // below hit consecutive banks
++                for (int e4 = tid; e4 < T * D / 4; e4 += nthr) {
++                    const int u = e4 / (D / 4);
++                    const int k = (e4 % (D / 4)) * 4;
++                    float     kq[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, vq[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
++                    if (u < nt) {
++                        if constexpr (TKV == GGML_TYPE_Q8_0) {
++                            const block_q8_0 * bk = (const block_q8_0 *) (Kh + (size_t) (pb + u) * nbk1) + (k >> 5);
++                            const block_q8_0 * bv = (const block_q8_0 *) (Vh + (size_t) (pb + u) * nbv1) + (k >> 5);
++                            const uint16_t *   wk = (const uint16_t *) (bk->qs + (k & 31));
++                            const uint16_t *   wv = (const uint16_t *) (bv->qs + (k & 31));
++                            const float        dk = (float) bk->d, dv = (float) bv->d;
++                            const uint16_t     k0 = wk[0], k1 = wk[1], v0 = wv[0], v1 = wv[1];
++                            kq[0] = dk * (float) (int8_t) (k0 & 0xFF); kq[1] = dk * (float) (int8_t) (k0 >> 8);
++                            kq[2] = dk * (float) (int8_t) (k1 & 0xFF); kq[3] = dk * (float) (int8_t) (k1 >> 8);
++                            vq[0] = dv * (float) (int8_t) (v0 & 0xFF); vq[1] = dv * (float) (int8_t) (v0 >> 8);
++                            vq[2] = dv * (float) (int8_t) (v1 & 0xFF); vq[3] = dv * (float) (int8_t) (v1 >> 8);
++                        } else {
++#pragma unroll
++                            for (int j = 0; j < 4; ++j) {
++                                kq[j] = gqa_dec_elem<TKV>(Kh + (size_t) (pb + u) * nbk1, k + j);
++                                vq[j] = gqa_dec_elem<TKV>(Vh + (size_t) (pb + u) * nbv1, k + j);
++                            }
++                        }
++                    }
++#pragma unroll
++                    for (int j = 0; j < 4; ++j) {
++                        const int kk  = k + j;
++                        const int idx = u * D + (kk % EPL) * GQA_DEC_SG + kk / EPL;
++                        ks[idx]       = kq[j];
++                        vs[idx]       = vq[j];
++                    }
++                }
++                sycl::group_barrier(it.get_group());
++
++                float sc[T];
++#pragma unroll
++                for (int u = 0; u < T; ++u) {
++                    float dot = 0.0f;
++#pragma unroll
++                    for (int i = 0; i < EPL; ++i) {
++                        dot += q[i] * ks[u * D + i * GQA_DEC_SG + lane];
++                    }
++                    sc[u] = dot;
++                }
++#pragma unroll
++                for (int u = 0; u < T; ++u) {
++                    const float mv = (u < nt && mrow) ? (float) mrow[pb + u] : 0.0f;
++                    sc[u]          = u < nt ? sycl::reduce_over_group(sg, sc[u], sycl::plus<float>()) + mv : -INFINITY;
++                }
++                float mloc = sc[0];
++#pragma unroll
++                for (int u = 1; u < T; ++u) {
++                    mloc = sycl::fmax(mloc, sc[u]);
++                }
++                if (mloc != -INFINITY) {
++                    const float m_new = sycl::fmax(m, mloc);
++                    const float a     = sycl::native::exp(m - m_new);
++                    s *= a;
++#pragma unroll
++                    for (int i = 0; i < EPL; ++i) {
++                        acc[i] *= a;
++                    }
++                    m = m_new;
++#pragma unroll
++                    for (int u = 0; u < T; ++u) {
++                        const float pw = sc[u] == -INFINITY ? 0.0f : sycl::native::exp(sc[u] - m_new);
++                        s += pw;
++#pragma unroll
++                        for (int i = 0; i < EPL; ++i) {
++                            acc[i] += pw * vs[u * D + i * GQA_DEC_SG + lane];
++                        }
++                    }
++                }
++                sycl::group_barrier(it.get_group());
++            }
++
++            const size_t row_id = ((size_t) chunk * n_tok + t) * n_head + h;
++            float *      po     = part + row_id * D + lane * EPL;
++#pragma unroll
++            for (int i = 0; i < EPL; ++i) {
++                po[i] = acc[i];
++            }
++            if (lane == 0) {
++                meta[row_id * 2 + 0] = m;
++                meta[row_id * 2 + 1] = s;
++            }
++        });
++    });
++}
++
++template <int D, ggml_type TKV>
++static void gqa_dec_partial(const char * Q, const char * K, const char * V, const char * mask, float * part,
++                            float * meta, float scale, int n_tok, int n_head, int gqa, int n_kv, int n_chunks,
++                            size_t nbq1, size_t nbq2, size_t nbk1, size_t nbk2, size_t nbv1, size_t nbv2,
++                            size_t nbm1, int chunk_sz, dpct::queue_ptr stream) {
++    // SLM tiles pay off once several query tokens share them (cost independent of n_tok);
++    // GGML_SYCL_FA_GQA_SLM=0 never, 1 from 2 tokens (default), 2 always
++    static const int slm_mode = ggml_sycl_get_env("GGML_SYCL_FA_GQA_SLM", 1);
++    if (slm_mode == 2 || (slm_mode == 1 && n_tok >= 2)) {
++        gqa_dec_partial_slm<D, TKV>(Q, K, V, mask, part, meta, scale, n_tok, n_head, gqa, n_kv, n_chunks, nbq1, nbq2, nbk1,
++                                    nbk2, nbv1, nbv2, nbm1, chunk_sz, stream);
++        return;
++    }
++    constexpr int EPL   = D / GQA_DEC_SG;
++    static const int dbg_env = ggml_sycl_get_env("GGML_SYCL_FA_GQA_DBG", 0);
++    const int        dbg     = dbg_env;
++    const int     rows  = gqa * n_tok;  // query rows per KV head
++    const int     n_kvh = n_head / gqa;
++    const sycl::range<2> lws(1, (size_t) rows * GQA_DEC_SG);
++    const sycl::range<2> gws((size_t) n_kvh * n_chunks, (size_t) rows * GQA_DEC_SG);
++
++    stream->submit([&](sycl::handler & cgh) {
++    cgh.parallel_for(sycl::nd_range<2>(gws, lws),
++        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(GQA_DEC_SG)]] {
++        const auto sg    = it.get_sub_group();
++        const int  lane  = sg.get_local_linear_id();
++        const int  r     = it.get_local_id(1) / GQA_DEC_SG;  // query row inside the group
++        const int  t     = r / gqa;                           // token
++        const int  g     = r % gqa;                           // query head inside the KV group
++        const int  kvh   = it.get_group(0) / n_chunks;
++        const int  chunk = it.get_group(0) % n_chunks;
++        const int  h     = kvh * gqa + g;
++        const int  p0    = chunk * chunk_sz;
++        const int  p1    = sycl::min(p0 + chunk_sz, n_kv);
++
++        float q[EPL];
++        {
++            const float * qrow = (const float *) (Q + (size_t) t * nbq1 + (size_t) h * nbq2) + lane * EPL;
++#pragma unroll
++            for (int i = 0; i < EPL; ++i) {
++                q[i] = qrow[i] * scale;
++            }
++        }
++
++        const sycl::half * mrow = mask ? (const sycl::half *) (mask + (size_t) t * nbm1) : nullptr;
++
++        float m = -INFINITY;
++        float s = 0.0f;
++        float acc[EPL];
++#pragma unroll
++        for (int i = 0; i < EPL; ++i) {
++            acc[i] = 0.0f;
++        }
++
++        // 4 KV positions per step: 4 independent dot products and reductions in flight,
++        // one online-softmax rescale per step
++        constexpr int PU = 4;
++        for (int pb = p0; pb < p1; pb += PU) {
++            float sc[PU];
++#pragma unroll
++            for (int u = 0; u < PU; ++u) {
++                const int p = pb + u;
++                sc[u]       = -INFINITY;
++                if (p < p1) {
++                    const float mv = mrow ? (float) mrow[p] : 0.0f;
++                    if (mv != -INFINITY) {
++                        float kv[EPL];
++                        if (dbg == 2) {
++#pragma unroll
++                            for (int i = 0; i < EPL; ++i) kv[i] = (float) (p & 7) * 0.01f;
++                        } else {
++                            gqa_dec_load_row<D, TKV>(K + (size_t) p * nbk1 + (size_t) kvh * nbk2, lane, kv);
++                        }
++                        float dot = 0.0f;
++#pragma unroll
++                        for (int i = 0; i < EPL; ++i) {
++                            dot += q[i] * kv[i];
++                        }
++                        sc[u] = dot + mv;
++                    }
++                }
++            }
++#pragma unroll
++            for (int u = 0; u < PU; ++u) {
++                if (sc[u] != -INFINITY) {
++                    sc[u] = sycl::reduce_over_group(sg, sc[u] - (mrow ? (float) mrow[pb + u] : 0.0f), sycl::plus<float>()) +
++                            (mrow ? (float) mrow[pb + u] : 0.0f);
++                }
++            }
++            float mloc = sc[0];
++#pragma unroll
++            for (int u = 1; u < PU; ++u) {
++                mloc = sycl::fmax(mloc, sc[u]);
++            }
++            if (mloc == -INFINITY) {
++                continue;
++            }
++            const float m_new = sycl::fmax(m, mloc);
++            const float a     = sycl::native::exp(m - m_new);
++            s *= a;
++#pragma unroll
++            for (int i = 0; i < EPL; ++i) {
++                acc[i] *= a;
++            }
++            m = m_new;
++#pragma unroll
++            for (int u = 0; u < PU; ++u) {
++                if (sc[u] == -INFINITY) {
++                    continue;
++                }
++                const float pw = sycl::native::exp(sc[u] - m_new);
++                s += pw;
++                float vv[EPL];
++                if (dbg != 0) {
++#pragma unroll
++                    for (int i = 0; i < EPL; ++i) vv[i] = pw;
++                } else {
++                    gqa_dec_load_row<D, TKV>(V + (size_t) (pb + u) * nbv1 + (size_t) kvh * nbv2, lane, vv);
++                }
++#pragma unroll
++                for (int i = 0; i < EPL; ++i) {
++                    acc[i] += pw * vv[i];
++                }
++            }
++        }
++
++        // partial layout: [chunk][t][h][D], meta [chunk][t][h][2]
++        const size_t row_id = ((size_t) chunk * n_tok + t) * n_head + h;
++        float *      po     = part + row_id * D + lane * EPL;
++#pragma unroll
++        for (int i = 0; i < EPL; ++i) {
++            po[i] = acc[i];
++        }
++        if (lane == 0) {
++            meta[row_id * 2 + 0] = m;
++            meta[row_id * 2 + 1] = s;
++        }
++    });
++    });
++}
++
++template <int D>
++static void gqa_dec_merge(const float * part, const float * meta, float * dst, int n_tok, int n_head, int n_chunks,
++                          dpct::queue_ptr stream) {
++    const size_t n_rows = (size_t) n_tok * n_head;
++    stream->parallel_for(sycl::nd_range<1>(n_rows * D, D), [=](sycl::nd_item<1> it) {
++        const size_t row = it.get_group(0);  // t * n_head + h, the dst row order
++        const int    d   = it.get_local_id(0);
++        float        M   = -INFINITY;
++        for (int c = 0; c < n_chunks; ++c) {
++            M = sycl::fmax(M, meta[(c * n_rows + row) * 2]);
++        }
++        float S   = 0.0f;
++        float out = 0.0f;
++        if (M != -INFINITY) {
++            for (int c = 0; c < n_chunks; ++c) {
++                const float mc = meta[(c * n_rows + row) * 2];
++                if (mc == -INFINITY) {
++                    continue;
++                }
++                const float w = sycl::native::exp(mc - M);
++                S += meta[(c * n_rows + row) * 2 + 1] * w;
++                out += part[(c * n_rows + row) * D + d] * w;
++            }
++        }
++        dst[row * D + d] = S > 0.0f ? out / S : 0.0f;
++    });
++}
++
++
++// ---------------------------------------------------------------------------------------
++// ESIMD variant for q8_0 K/V with D = 256 (Qwen3.8): one thread owns a KV head, a KV chunk
++// and RT query rows. A K/V row (8 q8_0 blocks, 272 bytes) comes in with two block loads
++// (64 + 4 dwords) instead of per-lane 2-byte gathers, and is dequantized, dotted and
++// accumulated as 256-wide vectors. Large GRF: 2 query rows + 2 accumulators + K/V row.
++// ---------------------------------------------------------------------------------------
++static constexpr int GQA_ESIMD_RT = 2;  // query rows per thread
++// GGML_SYCL_FA_TPF: prefetch the K/V rows of the tile this many tiles ahead (0 = off)
++static int gqa_esimd_tile_pf() {
++    static const int v = ggml_sycl_get_env("GGML_SYCL_FA_TPF", 0);
++    return v;
++}
++
++static ESIMD_INLINE sycl::ext::intel::esimd::simd<uint32_t, 68> gqa_esimd_load_row_q8_256(const char * row) {
++    using namespace sycl::ext::intel::esimd;
++    simd<uint32_t, 68> raw;
++    raw.template select<64, 1>(0) = block_load<uint32_t, 64>((const uint32_t *) row);
++    raw.template select<4, 1>(64) = block_load<uint32_t, 4>((const uint32_t *) row + 64);
++    return raw;
++}
++
++static ESIMD_INLINE void gqa_esimd_prefetch_row_q8_256(const char * row) {
++    using namespace sycl::ext::intel::esimd;
++    constexpr auto props = sycl::ext::oneapi::experimental::properties{ cache_hint_L1<cache_hint::cached>,
++                                                                         cache_hint_L2<cache_hint::cached> };
++    prefetch<uint32_t, 64>((const uint32_t *) row, 0, props);
++    prefetch<uint32_t, 4>((const uint32_t *) row + 64, 0, props);
++}
++
++static ESIMD_INLINE void gqa_esimd_deq_raw_q8_256(sycl::ext::intel::esimd::simd<uint32_t, 68> raw,
++                                                  sycl::ext::intel::esimd::simd<float, 256> & out) {
++    using namespace sycl::ext::intel::esimd;
++    auto bytes = raw.template bit_cast_view<uint8_t>();
++#pragma unroll
++    for (int b = 0; b < 8; ++b) {
++        simd<uint8_t, 2>    dd = bytes.template select<2, 1>(34 * b);
++        simd<sycl::half, 1> dh = dd.template bit_cast_view<sycl::half>();
++        simd<float, 1>      df = convert<float>(dh);
++        const float         d  = df[0];
++        simd<uint8_t, 32>   qu = bytes.template select<32, 1>(34 * b + 2);
++        simd<int8_t, 32>    qi = qu.template bit_cast_view<int8_t>();
++        out.template select<32, 1>(32 * b) = convert<float>(qi) * d;
++    }
++}
++
++static ESIMD_INLINE void gqa_esimd_deq_row_q8_256(const char * row, sycl::ext::intel::esimd::simd<float, 256> & out) {
++    using namespace sycl::ext::intel::esimd;
++    simd<uint32_t, 68> raw;
++    raw.template select<64, 1>(0) = block_load<uint32_t, 64>((const uint32_t *) row);
++    raw.template select<4, 1>(64) = block_load<uint32_t, 4>((const uint32_t *) row + 64);
++    auto bytes = raw.template bit_cast_view<uint8_t>();
++#pragma unroll
++    for (int b = 0; b < 8; ++b) {
++        simd<uint8_t, 2>  dd = bytes.template select<2, 1>(34 * b);
++        simd<sycl::half, 1> dh = dd.template bit_cast_view<sycl::half>();
++        simd<float, 1>      df = convert<float>(dh);
++        const float         d  = df[0];
++        simd<uint8_t, 32> qu = bytes.template select<32, 1>(34 * b + 2);
++        simd<int8_t, 32>  qi = qu.template bit_cast_view<int8_t>();
++        out.template select<32, 1>(32 * b) = convert<float>(qi) * d;
++    }
++}
++
++static void gqa_dec_partial_esimd_q8_256(const char * Q, const char * K, const char * V, const char * mask,
++                                         float * part, float * meta, float scale, int n_tok, int n_head, int gqa,
++                                         int n_kv, int n_chunks, size_t nbq1, size_t nbq2, size_t nbk1, size_t nbk2,
++                                         size_t nbv1, size_t nbv2, size_t nbm1, int chunk_sz, dpct::queue_ptr stream) {
++    constexpr int D   = 256;
++    constexpr int RT  = GQA_ESIMD_RT;
++    const int     rows = gqa * n_tok;
++    const int     n_rg = rows / RT;  // row groups per KV head
++    const int     n_kvh = n_head / gqa;
++    const size_t  n_thr = (size_t) n_kvh * n_chunks * n_rg;
++    constexpr int WG    = 8;
++    const size_t  n_glb = (n_thr + WG - 1) / WG * WG;
++    static const int pf_env  = ggml_sycl_get_env("GGML_SYCL_FA_PF", 0);
++    static const int tile_env = ggml_sycl_get_env("GGML_SYCL_FA_TILE", 1);
++    const bool       tile_on  = tile_env != 0;
++    static const int edbg_env = ggml_sycl_get_env("GGML_SYCL_FA_EDBG", 0);
++    const int        edbg     = edbg_env;
++    const int        pf_dist = pf_env;
++    const int        tpf     = gqa_esimd_tile_pf();
++
++    stream->submit([&](sycl::handler & cgh) {
++        cgh.parallel_for(
++            sycl::nd_range<1>(sycl::range<1>(n_glb), sycl::range<1>(WG)),
++            sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> },
++            [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
++                using namespace sycl::ext::intel::esimd;
++                const size_t id = it.get_global_id(0);
++                if (id >= n_thr) {
++                    return;
++                }
++                // rg fastest: the threads that share a KV chunk run next to each other (cache reuse)
++                const int rg    = id % n_rg;
++                const int chunk = (id / n_rg) % n_chunks;
++                const int kvh   = id / ((size_t) n_rg * n_chunks);
++                const int p0    = chunk * chunk_sz;
++                const int p1    = p0 + chunk_sz < n_kv ? p0 + chunk_sz : n_kv;
++
++                simd<float, D> q[RT];
++                simd<float, D> acc[RT];
++                int            tt[RT], hh[RT];
++                float          m[RT], ssum[RT];
++#pragma unroll
++                for (int j = 0; j < RT; ++j) {
++                    const int r = rg * RT + j;
++                    tt[j]       = r / gqa;
++                    hh[j]       = kvh * gqa + r % gqa;
++                    q[j]   = block_load<float, D>((const float *) (Q + (size_t) tt[j] * nbq1 + (size_t) hh[j] * nbq2)) * scale;
++                    acc[j] = 0.0f;
++                    m[j]    = -INFINITY;
++                    ssum[j] = 0.0f;
++                }
++
++                const char * Kh = K + (size_t) kvh * nbk2;
++                const char * Vh = V + (size_t) kvh * nbv2;
++                simd<float, D> kf;
++                simd<float, D> vf;
++                // software pipeline: the raw rows of position p+1 are requested before p is computed
++                simd<uint32_t, 68> kr_n, vr_n;
++                int                p0_tail = p0;
++                // TILE: positions in tiles of TP. The TP scores of a tile are independent, the online
++                // softmax update runs once per tile on a vector of TP scores, so the per-position chain
++                // (dot -> reduce -> exp -> rescale) no longer serializes every KV row.
++                if (tile_on) {
++                    constexpr int TP = 8;
++                    int p = p0;
++                    for (; p + TP <= p1; p += TP) {
++                        if (tpf > 0) {
++                            const int pn = p + tpf * TP;
++#pragma unroll
++                            for (int i = 0; i < TP; ++i) {
++                                if (pn + i < p1) {
++                                    gqa_esimd_prefetch_row_q8_256(Kh + (size_t) (pn + i) * nbk1);
++                                    gqa_esimd_prefetch_row_q8_256(Vh + (size_t) (pn + i) * nbv1);
++                                }
++                            }
++                        }
++                        simd<float, TP> s_t[RT];
++                        // the mask of the TP positions in one 16-byte block load per row (a scalar
++                        // load per position and row cost a full memory latency each)
++                        simd<float, TP> mk[RT];
++#pragma unroll
++                        for (int j = 0; j < RT; ++j) {
++                            if (mask) {
++                                simd<uint32_t, TP / 2> mr = block_load<uint32_t, TP / 2>(
++                                    (const uint32_t *) (mask + (size_t) tt[j] * nbm1 + (size_t) p * sizeof(sycl::half)));
++                                mk[j] = convert<float>(mr.template bit_cast_view<sycl::half>().read());
++                            } else {
++                                mk[j] = 0.0f;
++                            }
++                        }
++                        // all TP K rows requested first: one memory latency per tile instead of one per row
++                        simd<uint32_t, 68> kraw[TP];
++#pragma unroll
++                        for (int i = 0; i < TP; ++i) {
++                            kraw[i] = gqa_esimd_load_row_q8_256(Kh + (size_t) (p + i) * nbk1);
++                        }
++#pragma unroll
++                        for (int i = 0; i < TP; ++i) {
++                            gqa_esimd_deq_raw_q8_256(kraw[i], kf);
++#pragma unroll
++                            for (int j = 0; j < RT; ++j) {
++                                s_t[j][i] = reduce<float>(q[j] * kf, std::plus<>());
++                            }
++                        }
++#pragma unroll
++                        for (int j = 0; j < RT; ++j) {
++                            s_t[j] += mk[j];
++                        }
++                        simd<float, TP> p_t[RT];
++                        float           a_s[RT];
++#pragma unroll
++                        for (int j = 0; j < RT; ++j) {
++                            const float tmax  = hmax<float>(s_t[j]);
++                            const float m_new = tmax > m[j] ? tmax : m[j];
++                            if (m_new == -INFINITY) {
++                                p_t[j] = 0.0f;
++                                a_s[j] = 1.0f;
++                                continue;
++                            }
++                            a_s[j]  = m[j] == -INFINITY ? 0.0f : sycl::exp(m[j] - m_new);
++                            p_t[j]  = exp(s_t[j] - m_new);
++                            ssum[j] = ssum[j] * a_s[j] + reduce<float>(p_t[j], std::plus<>());
++                            m[j]    = m_new;
++                            acc[j] *= a_s[j];
++                        }
++                        simd<uint32_t, 68> vraw[TP];
++#pragma unroll
++                        for (int i = 0; i < TP; ++i) {
++                            vraw[i] = gqa_esimd_load_row_q8_256(Vh + (size_t) (p + i) * nbv1);
++                        }
++#pragma unroll
++                        for (int i = 0; i < TP; ++i) {
++                            gqa_esimd_deq_raw_q8_256(vraw[i], vf);
++#pragma unroll
++                            for (int j = 0; j < RT; ++j) {
++                                const float pw = p_t[j][i];
++                                acc[j] += vf * pw;
++                            }
++                        }
++                    }
++                    p0_tail = p;
++                }
++                if (p0_tail < p1) {
++                    kr_n = gqa_esimd_load_row_q8_256(Kh + (size_t) p0_tail * nbk1);
++                    vr_n = gqa_esimd_load_row_q8_256(Vh + (size_t) p0_tail * nbv1);
++                }
++                for (int p = p0_tail; p < p1; ++p) {
++                    if (pf_dist > 0 && p + pf_dist < p1) {
++                        gqa_esimd_prefetch_row_q8_256(Kh + (size_t) (p + pf_dist) * nbk1);
++                        gqa_esimd_prefetch_row_q8_256(Vh + (size_t) (p + pf_dist) * nbv1);
++                    }
++                    simd<uint32_t, 68> kr = kr_n, vr = vr_n;
++                    if (p + 1 < p1) {
++                        kr_n = gqa_esimd_load_row_q8_256(Kh + (size_t) (p + 1) * nbk1);
++                        vr_n = gqa_esimd_load_row_q8_256(Vh + (size_t) (p + 1) * nbv1);
++                    }
++                    float sc[RT];
++                    bool  any = false;
++#pragma unroll
++                    for (int j = 0; j < RT; ++j) {
++                        const float mv = mask ? (float) ((const sycl::half *) (mask + (size_t) tt[j] * nbm1))[p] : 0.0f;
++                        sc[j]          = mv;
++                        any            = any || mv != -INFINITY;
++                    }
++                    if (!any) {
++                        continue;
++                    }
++                    if (edbg == 1) {
++                        simd<uint32_t, 64> k64 = kr.template select<64, 1>(0);
++                        simd<uint32_t, 64> v64 = vr.template select<64, 1>(0);
++                        simd<float, 64>    kf64 = convert<float>(k64);
++                        simd<float, 64>    vf64 = convert<float>(v64);
++                        kf = kf64.template replicate<4>();
++                        vf = vf64.template replicate<4>();
++                    } else {
++                        gqa_esimd_deq_raw_q8_256(kr, kf);
++                        gqa_esimd_deq_raw_q8_256(vr, vf);
++                    }
++                    if (edbg == 2) {
++                        acc[0] += kf + vf;
++                        continue;
++                    }
++#pragma unroll
++                    for (int j = 0; j < RT; ++j) {
++                        if (sc[j] == -INFINITY) {
++                            continue;
++                        }
++                        const float dot   = reduce<float>(q[j] * kf, std::plus<>()) + sc[j];
++                        const float m_new = dot > m[j] ? dot : m[j];
++                        simd<float, 2> ex;
++                        ex[0] = m[j] - m_new;
++                        ex[1] = dot - m_new;
++                        ex    = exp(ex);
++                        const float a_s = ex[0];
++                        const float p_s = ex[1];
++                        ssum[j] = ssum[j] * a_s + p_s;
++                        acc[j]  = acc[j] * a_s + vf * p_s;
++                        m[j]    = m_new;
++                    }
++                }
++
++#pragma unroll
++                for (int j = 0; j < RT; ++j) {
++                    const size_t row_id = ((size_t) chunk * n_tok + tt[j]) * n_head + hh[j];
++                    block_store<float, D>(part + row_id * D, acc[j]);
++                    simd<float, 2> mm;
++                    mm[0] = m[j];
++                    mm[1] = ssum[j];
++                    block_store<float, 2>(meta + row_id * 2, mm);
++                }
++            });
++    });
++}
++
++
++// Work-group variant of the ESIMD q8_0 D=256 decode kernel: the threads of a work-group share one
++// (KV head, chunk) and own GQA_ESIMD_RT query rows each. Every tile of TP positions is dequantized
++// once, cooperatively, into SLM (f32 K and V rows); the threads read it from there. The per-thread
++// variant above loads and dequantizes every K/V row in every thread (gqa * n_tok / RT times).
++template <int RT, int SLM_ES = 4>
++static void gqa_dec_partial_esimd_slm_q8_256(const char * Q, const char * K, const char * V, const char * mask,
++                                             float * part, float * meta, float scale, int n_tok, int n_head, int gqa,
++                                             int n_kv, int n_chunks, size_t nbq1, size_t nbq2, size_t nbk1,
++                                             size_t nbk2, size_t nbv1, size_t nbv2, size_t nbm1, int chunk_sz,
++                                             dpct::queue_ptr stream) {
++    constexpr int D    = 256;
++    constexpr int TP   = 8;
++    const int     rows = gqa * n_tok;
++    const int     n_rg = rows / RT;  // threads per work-group
++    const int     n_kvh = n_head / gqa;
++    const int     tpf   = gqa_esimd_tile_pf();
++
++    stream->submit([&](sycl::handler & cgh) {
++        cgh.parallel_for(
++            sycl::nd_range<1>(sycl::range<1>((size_t) n_kvh * n_chunks * n_rg), sycl::range<1>(n_rg)),
++            sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> },
++            [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
++                using namespace sycl::ext::intel::esimd;
++                slm_init<2 * TP * D * SLM_ES>();  // K tile then V tile (f32, or f16 with FA_SLM_F16)
++                const int rg    = it.get_local_id(0);
++                const int grp   = it.get_group(0);
++                const int chunk = grp % n_chunks;
++                const int kvh   = grp / n_chunks;
++                const int p0    = chunk * chunk_sz;
++                const int p1    = p0 + chunk_sz < n_kv ? p0 + chunk_sz : n_kv;
++
++                simd<float, D> q[RT];
++                simd<float, D> acc[RT];
++                int            tt[RT], hh[RT];
++                float          m[RT], ssum[RT];
++#pragma unroll
++                for (int j = 0; j < RT; ++j) {
++                    const int r = rg * RT + j;
++                    tt[j]       = r / gqa;
++                    hh[j]       = kvh * gqa + r % gqa;
++                    q[j]   = block_load<float, D>((const float *) (Q + (size_t) tt[j] * nbq1 + (size_t) hh[j] * nbq2)) * scale;
++                    acc[j] = 0.0f;
++                    m[j]    = -INFINITY;
++                    ssum[j] = 0.0f;
++                }
++                const char * Kh = K + (size_t) kvh * nbk2;
++                const char * Vh = V + (size_t) kvh * nbv2;
++
++                for (int p = p0; p < p1; p += TP) {
++                    const int np = p1 - p < TP ? p1 - p : TP;
++                    if (tpf > 0) {
++                        for (int i = rg; i < 2 * TP; i += n_rg) {
++                            const int pn = p + tpf * TP + i % TP;
++                            if (pn < p1) {
++                                gqa_esimd_prefetch_row_q8_256(i < TP ? Kh + (size_t) pn * nbk1 : Vh + (size_t) pn * nbv1);
++                            }
++                        }
++                    }
++                    // cooperative dequantization of the tile: rows 0..TP-1 = K, TP..2TP-1 = V
++                    barrier();
++                    for (int i = rg; i < 2 * TP; i += n_rg) {
++                        const int    pi  = p + (i % TP < np ? i % TP : np - 1);
++                        const char * row = i < TP ? Kh + (size_t) pi * nbk1 : Vh + (size_t) pi * nbv1;
++                        simd<uint32_t, 68> raw = gqa_esimd_load_row_q8_256(row);
++                        simd<float, D>     f;
++                        gqa_esimd_deq_raw_q8_256(raw, f);
++#pragma unroll
++                        for (int c = 0; c < D / 64; ++c) {
++                            if constexpr (SLM_ES == 2) {
++                                slm_block_store<sycl::half, 64>((uint32_t) ((i * D + 64 * c) * SLM_ES),
++                                                                simd<sycl::half, 64>(f.template select<64, 1>(64 * c)));
++                            } else {
++                                slm_block_store<float, 64>((uint32_t) ((i * D + 64 * c) * SLM_ES), f.template select<64, 1>(64 * c));
++                            }
++                        }
++                    }
++                    barrier();
++
++                    simd<float, TP> s_t[RT];
++#pragma unroll
++                    for (int j = 0; j < RT; ++j) {
++                        if (mask && np == TP) {
++                            simd<uint32_t, TP / 2> mr = block_load<uint32_t, TP / 2>(
++                                (const uint32_t *) (mask + (size_t) tt[j] * nbm1 + (size_t) p * sizeof(sycl::half)));
++                            s_t[j] = convert<float>(mr.template bit_cast_view<sycl::half>().read());
++                        } else {
++#pragma unroll
++                            for (int i = 0; i < TP; ++i) {
++                                s_t[j][i] = i >= np ? -INFINITY
++                                                    : (mask ? (float) ((const sycl::half *) (mask + (size_t) tt[j] * nbm1))[p + i] : 0.0f);
++                            }
++                        }
++                    }
++#pragma unroll
++                    for (int i = 0; i < TP; ++i) {
++                        simd<float, D> kf;
++#pragma unroll
++                        for (int c = 0; c < D / 64; ++c) {
++                            if constexpr (SLM_ES == 2) {
++                                kf.template select<64, 1>(64 * c) = convert<float>(slm_block_load<sycl::half, 64>((uint32_t) ((i * D + 64 * c) * SLM_ES)));
++                            } else {
++                                kf.template select<64, 1>(64 * c) = slm_block_load<float, 64>((uint32_t) ((i * D + 64 * c) * SLM_ES));
++                            }
++                        }
++#pragma unroll
++                        for (int j = 0; j < RT; ++j) {
++                            const float sv = s_t[j][i];
++                            s_t[j][i]      = sv == -INFINITY ? -INFINITY : sv + reduce<float>(q[j] * kf, std::plus<>());
++                        }
++                    }
++                    simd<float, TP> p_t[RT];
++#pragma unroll
++                    for (int j = 0; j < RT; ++j) {
++                        const float tmax  = hmax<float>(s_t[j]);
++                        const float m_new = tmax > m[j] ? tmax : m[j];
++                        if (m_new == -INFINITY) {
++                            p_t[j] = 0.0f;
++                            continue;
++                        }
++                        const float a_s = m[j] == -INFINITY ? 0.0f : sycl::exp(m[j] - m_new);
++                        p_t[j]          = exp(s_t[j] - m_new);
++                        ssum[j]         = ssum[j] * a_s + reduce<float>(p_t[j], std::plus<>());
++                        m[j]            = m_new;
++                        acc[j] *= a_s;
++                    }
++#pragma unroll
++                    for (int i = 0; i < TP; ++i) {
++                        simd<float, D> vf;
++#pragma unroll
++                        for (int c = 0; c < D / 64; ++c) {
++                            vf.template select<64, 1>(64 * c) =
++                                SLM_ES == 2 ? simd<float, 64>(convert<float>(slm_block_load<sycl::half, 64>((uint32_t) (((TP + i) * D + 64 * c) * SLM_ES))))
++                                            : slm_block_load<float, 64>((uint32_t) (((TP + i) * D + 64 * c) * SLM_ES));
++                        }
++#pragma unroll
++                        for (int j = 0; j < RT; ++j) {
++                            const float pw = p_t[j][i];
++                            acc[j] += vf * pw;
++                        }
++                    }
++                }
++#pragma unroll
++                for (int j = 0; j < RT; ++j) {
++                    const size_t row_id = ((size_t) chunk * n_tok + tt[j]) * n_head + hh[j];
++                    block_store<float, D>(part + row_id * D, acc[j]);
++                    simd<float, 2> mm;
++                    mm[0] = m[j];
++                    mm[1] = ssum[j];
++                    block_store<float, 2>(meta + row_id * 2, mm);
++                }
++            });
++    });
++}
++
++
++// ---------------------------------------------------------------------------------------------
++// XMX (dpas) variant of the q8_0 D=256 decode kernel. A work-group owns one (KV head, chunk) and
++// all the query rows of that KV head (gqa x n_tok), in groups of 8 rows. Its threads are
++// (row group, 64-dim slice). Per tile of 16 KV positions the K and V rows are dequantized once,
++// cooperatively, to f16 in SLM, laid out as dpas B operands:
++//   K: dword (k2, n) of block (g, c) = dims 16c + 2k2, +1 of position 8g + n
++//   V: dword (k2, n) of block j      = positions 2k2, 2k2 + 1 of dim 8j + n
++// Every thread computes the 8 x 16 scores of its row group with 32 dpas (the four dim slices
++// repeat it, it is cheap), runs the online softmax and accumulates P x V for its 64 dims with 8
++// dpas. Q comes pre-scaled in f16 dpas A layout (gqa_xmx_prep_q). Partials and meta use the
++// layout of the scalar kernels, so the same merge follows.
++// ---------------------------------------------------------------------------------------------
++static void gqa_xmx_prep_q(const char * Q, sycl::half * q16, float scale, int n_tok, int gqa, int n_kvh, int nrg,
++                           size_t nbq1, size_t nbq2, dpct::queue_ptr stream) {
++    constexpr int D = 256;
++    // q16[kvh][rg][c][r][16]
++    stream->parallel_for(sycl::range<1>((size_t) n_kvh * nrg * 8 * D), [=](sycl::item<1> it) {
++        const size_t id  = it.get_id(0);
++        const int    d   = id % D;
++        const int    r   = (id / D) % 8;
++        const int    rg  = (id / D / 8) % nrg;
++        const int    kvh = id / D / 8 / nrg;
++        const int    rr  = rg * 8 + r;
++        float        v   = 0.0f;
++        if (rr < gqa * n_tok) {
++            const int t = rr / gqa;
++            const int h = kvh * gqa + rr % gqa;
++            v           = ((const float *) (Q + (size_t) t * nbq1 + (size_t) h * nbq2))[d] * scale;
++        }
++        const int c = d / 16;
++        q16[((((size_t) kvh * nrg + rg) * 16 + c) * 8 + r) * 16 + d % 16] = (sycl::half) v;
++    });
++}
++
++static void gqa_dec_partial_xmx_q8_256(const sycl::half * q16, const char * K, const char * V, const char * mask,
++                                       float * part, float * meta, int n_tok, int n_head, int gqa, int n_kv,
++                                       int n_chunks, size_t nbk1, size_t nbk2, size_t nbv1, size_t nbv2, size_t nbm1,
++                                       int chunk_sz, dpct::queue_ptr stream) {
++    constexpr int D   = 256;
++    constexpr int TP  = 16;                 // positions per tile
++    constexpr int SLK = 0;                  // SLM byte offsets: K tile (16 x 256 f16), V tile
++    constexpr int SLV = TP * D * 2;
++    const int     R   = gqa * n_tok;
++    const int     nrg = (R + 7) / 8;
++    const int     nth = nrg * 4;            // threads per work-group: row groups x dim slices
++    const int     n_kvh = n_head / gqa;
++    static const int xpf_env = ggml_sycl_get_env("GGML_SYCL_FA_XMX_PF", 1);
++    const int        xpf     = xpf_env;
++    stream->submit([&](sycl::handler & cgh) {
++        cgh.parallel_for(
++            sycl::nd_range<1>(sycl::range<1>((size_t) n_kvh * n_chunks * nth), sycl::range<1>(nth)),
++            sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> },
++            [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
++                using namespace sycl::ext::intel::esimd;
++                namespace xmx = sycl::ext::intel::esimd::xmx;
++                slm_init<2 * TP * D * 2>();
++                const int tid   = it.get_local_id(0);
++                const int grp   = it.get_group(0);
++                const int chunk = grp % n_chunks;
++                const int kvh   = grp / n_chunks;
++                const int rg    = tid / 4;
++                const int sl    = tid % 4;  // 64-dim slice
++                const int p0    = chunk * chunk_sz;
++                const int p1    = p0 + chunk_sz < n_kv ? p0 + chunk_sz : n_kv;
++                const char * Kh = K + (size_t) kvh * nbk2;
++                const char * Vh = V + (size_t) kvh * nbv2;
++                const sycl::half * qa = q16 + ((size_t) kvh * nrg + rg) * 16 * 128;
++
++                // the token of each of the 8 rows (mask row), -1 for padding rows
++                int rt[8];
++#pragma unroll
++                for (int r = 0; r < 8; ++r) {
++                    const int rr = rg * 8 + r;
++                    rt[r]        = rr < R ? rr / gqa : -1;
++                }
++                simd<float, 64> acc[8];
++#pragma unroll
++                for (int j = 0; j < 8; ++j) {
++                    acc[j] = 0.0f;
++                }
++                simd<float, 8> m = -INFINITY, l = 0.0f;
++                simd<float, 64> pad64 = 0.0f;
++#pragma unroll
++                for (int r = 0; r < 8; ++r) {
++                    if (rt[r] < 0) {
++                        pad64.template select<8, 1>(8 * r) = -INFINITY;
++                    }
++                }
++
++                for (int p = p0; p < p1; p += TP) {
++                    const int np = p1 - p < TP ? p1 - p : TP;
++                    barrier();
++                    // loaders: tasks 0..15 = K rows, 16..23 = V row pairs
++                    for (int task = tid; task < TP + TP / 2; task += nth) {
++                        if (task < TP) {
++                            const int          pi  = p + (task < np ? task : np - 1);
++                            simd<uint32_t, 68> raw = gqa_esimd_load_row_q8_256(Kh + (size_t) pi * nbk1);
++                            simd<float, D>     f;
++                            gqa_esimd_deq_raw_q8_256(raw, f);
++                            simd<sycl::half, D> h  = simd<sycl::half, D>(f);
++                            simd<uint32_t, 128> hd = h.template bit_cast_view<uint32_t>();
++                            // dword d2 of position n of group g -> g * 1024 + d2 * 8 + n
++                            const int g = task / 8, n = task % 8;
++                            simd<uint32_t, 16> off(0u, 8u * 4u);
++#pragma unroll
++                            for (int q = 0; q < 8; ++q) {
++                                slm_scatter<uint32_t, 16>(off + (uint32_t) (SLK + (g * 1024 + q * 16 * 8 + n) * 4),
++                                                          hd.template select<16, 1>(16 * q));
++                            }
++                        } else {
++                            const int          k2  = task - TP;
++                            const int          pa  = p + (2 * k2 < np ? 2 * k2 : np - 1);
++                            const int          pb  = p + (2 * k2 + 1 < np ? 2 * k2 + 1 : np - 1);
++                            simd<float, D>     fa, fb;
++                            gqa_esimd_deq_raw_q8_256(gqa_esimd_load_row_q8_256(Vh + (size_t) pa * nbv1), fa);
++                            gqa_esimd_deq_raw_q8_256(gqa_esimd_load_row_q8_256(Vh + (size_t) pb * nbv1), fb);
++                            if (2 * k2 >= np) {
++                                fa = 0.0f;
++                            }
++                            if (2 * k2 + 1 >= np) {
++                                fb = 0.0f;
++                            }
++                            simd<sycl::half, 2 * D> h;
++                            h.template select<D, 2>(0) = simd<sycl::half, D>(fa);
++                            h.template select<D, 2>(1) = simd<sycl::half, D>(fb);
++                            simd<uint32_t, D> hd = h.template bit_cast_view<uint32_t>();
++                            // dword of dim d -> (d / 8) * 64 + k2 * 8 + d % 8
++#pragma unroll
++                            for (int j = 0; j < D / 8; ++j) {
++                                slm_block_store<uint32_t, 8>((uint32_t) (SLV + (j * 64 + k2 * 8) * 4),
++                                                             hd.template select<8, 1>(8 * j));
++                            }
++                        }
++                    }
++                    barrier();
++                    // the rows this thread loads for the next tile: requested now, so the loads of
++                    // the next iteration hit the caches while this tile is computed
++                    if (xpf) {
++                        for (int task = tid; task < TP + TP / 2; task += nth) {
++                            if (task < TP) {
++                                const int pn = p + TP + task;
++                                if (pn < p1) {
++                                    gqa_esimd_prefetch_row_q8_256(Kh + (size_t) pn * nbk1);
++                                }
++                            } else {
++                                const int pn = p + TP + 2 * (task - TP);
++                                if (pn < p1) {
++                                    gqa_esimd_prefetch_row_q8_256(Vh + (size_t) pn * nbv1);
++                                }
++                                if (pn + 1 < p1) {
++                                    gqa_esimd_prefetch_row_q8_256(Vh + (size_t) (pn + 1) * nbv1);
++                                }
++                            }
++                        }
++                    }
++
++                    // scores: two 8 x 8 blocks (positions 0..7, 8..15)
++                    // 8 independent accumulation chains (2 position groups x 4), summed at the end:
++                    // a single chain of 16 dependent dpas exposes the XMX latency every step
++                    simd<float, 64> sc[2];
++                    simd<float, 64> sp[2][4];
++#pragma unroll
++                    for (int g = 0; g < 2; ++g) {
++#pragma unroll
++                        for (int k = 0; k < 4; ++k) {
++                            sp[g][k] = 0.0f;
++                        }
++                    }
++#pragma unroll
++                    for (int c = 0; c < 16; ++c) {
++                        simd<sycl::half, 128> A = block_load<sycl::half, 128>(qa + c * 128);
++#pragma unroll
++                        for (int g = 0; g < 2; ++g) {
++                            simd<uint32_t, 64>    Bd = slm_block_load<uint32_t, 64>((uint32_t) (SLK + (g * 1024 + c * 64) * 4));
++                            simd<sycl::half, 128> B  = Bd.template bit_cast_view<sycl::half>();
++                            sp[g][c % 4]             = xmx::dpas<8, 8, float>(sp[g][c % 4], B, A);
++                        }
++                    }
++#pragma unroll
++                    for (int g = 0; g < 2; ++g) {
++                        sc[g] = (sp[g][0] + sp[g][1]) + (sp[g][2] + sp[g][3]);
++                    }
++                    // mask: rows of one token share it (one 32-byte load per distinct token);
++                    // padding rows and tail positions get -inf
++                    sc[0] += pad64;
++                    sc[1] += pad64;
++                    if (mask) {
++                        int                  tprev = -2;
++                        simd<float, 16>      mv;
++#pragma unroll
++                        for (int r = 0; r < 8; ++r) {
++                            if (rt[r] < 0) {
++                                continue;
++                            }
++                            if (rt[r] != tprev) {
++                                tprev                  = rt[r];
++                                const sycl::half * mr  = (const sycl::half *) (mask + (size_t) rt[r] * nbm1) + p;
++                                if (np == TP) {
++                                    mv = convert<float>(block_load<sycl::half, 16>(mr));
++                                } else {
++#pragma unroll
++                                    for (int i2 = 0; i2 < TP; ++i2) {
++                                        mv[i2] = i2 < np ? (float) mr[i2] : -INFINITY;
++                                    }
++                                }
++                            }
++                            sc[0].template select<8, 1>(8 * r) += mv.template select<8, 1>(0);
++                            sc[1].template select<8, 1>(8 * r) += mv.template select<8, 1>(8);
++                        }
++                    } else if (np < TP) {
++                        simd<float, 16> tv;
++#pragma unroll
++                        for (int i2 = 0; i2 < TP; ++i2) {
++                            tv[i2] = i2 < np ? 0.0f : -INFINITY;
++                        }
++                        simd<float, 8> t0 = tv.template select<8, 1>(0), t1 = tv.template select<8, 1>(8);
++                        sc[0] += t0.template replicate<8>();
++                        sc[1] += t1.template replicate<8>();
++                    }
++                    // online softmax, all 8 rows at once ([row][8] layout: row values are 8 contiguous lanes)
++                    simd<float, 64> mx = max<float>(sc[0], sc[1]);
++                    simd<float, 32> ma = mx.template select<32, 2>(0), mb = mx.template select<32, 2>(1);
++                    simd<float, 32> m4 = max<float>(ma, mb);
++                    simd<float, 16> mc = m4.template select<16, 2>(0), md = m4.template select<16, 2>(1);
++                    simd<float, 16> m2 = max<float>(mc, md);
++                    simd<float, 8>  me = m2.template select<8, 2>(0), mf = m2.template select<8, 2>(1);
++                    simd<float, 8>  tm = max<float>(me, mf);
++                    simd<float, 8>  mn = max<float>(m, tm);
++                    // rows still without any position: keep a finite reference (their scores are -inf)
++                    simd<float, 8> mref = mn;
++                    mref.merge(0.0f, mn == -INFINITY);
++                    simd<float, 8> al8 = exp(m - mref);
++                    al8.merge(0.0f, m == -INFINITY);
++                    simd<float, 64> mref64 = mref.template replicate_vs_w_hs<8, 1, 8, 0>(0);
++                    simd<float, 64> e0     = exp(sc[0] - mref64);
++                    simd<float, 64> e1     = exp(sc[1] - mref64);
++                    simd<float, 64> es     = e0 + e1;
++                    simd<float, 32> s4     = es.template select<32, 2>(0) + es.template select<32, 2>(1);
++                    simd<float, 16> s2     = s4.template select<16, 2>(0) + s4.template select<16, 2>(1);
++                    simd<float, 8>  rs     = s2.template select<8, 2>(0) + s2.template select<8, 2>(1);
++                    l                      = l * al8 + rs;
++                    m                      = mn;
++                    simd<float, 64> al     = al8.template replicate_vs_w_hs<8, 1, 8, 0>(0);
++                    simd<sycl::half, 128> P;
++                    auto                  P2 = P.template bit_cast_view<sycl::half, 8, 16>();
++                    P2.template select<8, 1, 8, 1>(0, 0) = simd<sycl::half, 64>(e0);
++                    P2.template select<8, 1, 8, 1>(0, 8) = simd<sycl::half, 64>(e1);
++#pragma unroll
++                    for (int j = 0; j < 8; ++j) {
++                        simd<uint32_t, 64>    Bd = slm_block_load<uint32_t, 64>((uint32_t) (SLV + ((sl * 8 + j) * 64) * 4));
++                        simd<sycl::half, 128> B  = Bd.template bit_cast_view<sycl::half>();
++                        acc[j]                   = xmx::dpas<8, 8, float>(acc[j] * al, B, P);
++                    }
++                }
++#pragma unroll
++                for (int r = 0; r < 8; ++r) {
++                    if (rt[r] < 0) {
++                        continue;
++                    }
++                    const int    rr     = rg * 8 + r;
++                    const int    h      = kvh * gqa + rr % gqa;
++                    const size_t row_id = ((size_t) chunk * n_tok + rt[r]) * n_head + h;
++                    simd<float, 64> o;
++#pragma unroll
++                    for (int j = 0; j < 8; ++j) {
++                        o.template select<8, 1>(8 * j) = acc[j].template select<8, 1>(8 * r);
++                    }
++                    block_store<float, 64>(part + row_id * D + sl * 64, o);
++                    if (sl == 0) {
++                        simd<float, 2> mm;
++                        mm[0] = m[r];
++                        mm[1] = l[r];
++                        block_store<float, 2>(meta + row_id * 2, mm);
++                    }
++                }
++            });
++    });
++}
++
++// merge of the chunk partials: one work-group per (token, head) row; the chunk weights are
++// computed once per row in local memory, then every work-item sums its D column over chunks
++template <int D>
++static void gqa_dec_merge2(const float * part, const float * meta, float * dst, int n_tok, int n_head, int n_chunks,
++                           dpct::queue_ptr stream) {
++    const size_t n_rows = (size_t) n_tok * n_head;
++    stream->submit([&](sycl::handler & cgh) {
++        sycl::local_accessor<float, 1> w(sycl::range<1>(n_chunks + 1), cgh);
++        cgh.parallel_for(sycl::nd_range<1>(n_rows * D, D), [=](sycl::nd_item<1> it) {
++            const size_t row = it.get_group(0);
++            const int    d   = it.get_local_id(0);
++            // global max
++            float M = -INFINITY;
++            for (int c = d; c < n_chunks; c += D) {
++                M = sycl::fmax(M, meta[(c * n_rows + row) * 2]);
++            }
++            M = sycl::reduce_over_group(it.get_group(), M, sycl::maximum<float>());
++            float S = 0.0f;
++            for (int c = d; c < n_chunks; c += D) {
++                const float mc = meta[(c * n_rows + row) * 2];
++                const float wc = (M == -INFINITY || mc == -INFINITY) ? 0.0f : sycl::native::exp(mc - M);
++                w[c]           = wc;
++                S += meta[(c * n_rows + row) * 2 + 1] * wc;
++            }
++            S = sycl::reduce_over_group(it.get_group(), S, sycl::plus<float>());
++            sycl::group_barrier(it.get_group());
++            float out = 0.0f;
++            for (int c = 0; c < n_chunks; ++c) {
++                const float wc = w[c];
++                if (wc != 0.0f) {
++                    out += part[(c * n_rows + row) * D + d] * wc;
++                }
++            }
++            dst[row * D + d] = S > 0.0f ? out / S : 0.0f;
++        });
++    });
++}
++
++// merge with more parallelism: one work-group per (row, 64-dim slice), its 256 work-items are
++// 64 dims x 4 chunk lanes (each lane sums every 4th chunk, the lanes are added through SLM). The
++// per-row variant above runs n_tok * n_head work-groups that each walk all chunks serially.
++template <int D>
++static void gqa_dec_merge3(const float * part, const float * meta, float * dst, int n_tok, int n_head, int n_chunks,
++                           dpct::queue_ptr stream) {
++    constexpr int SL = 64, CL = 4;
++    const size_t  n_rows = (size_t) n_tok * n_head;
++    stream->submit([&](sycl::handler & cgh) {
++        sycl::local_accessor<float, 1> w(sycl::range<1>(n_chunks + 1), cgh);
++        sycl::local_accessor<float, 1> red(sycl::range<1>(SL * CL), cgh);
++        cgh.parallel_for(sycl::nd_range<1>(n_rows * (D / SL) * SL * CL, SL * CL), [=](sycl::nd_item<1> it) {
++            const size_t g   = it.get_group(0);
++            const size_t row = g / (D / SL);
++            const int    d0  = (g % (D / SL)) * SL;
++            const int    lid = it.get_local_id(0);
++            const int    dl  = lid % SL;
++            const int    cl  = lid / SL;
++            float        M   = -INFINITY;
++            for (int c = lid; c < n_chunks; c += SL * CL) {
++                M = sycl::fmax(M, meta[(c * n_rows + row) * 2]);
++            }
++            M       = sycl::reduce_over_group(it.get_group(), M, sycl::maximum<float>());
++            float S = 0.0f;
++            for (int c = lid; c < n_chunks; c += SL * CL) {
++                const float mc = meta[(c * n_rows + row) * 2];
++                const float wc = (M == -INFINITY || mc == -INFINITY) ? 0.0f : sycl::native::exp(mc - M);
++                w[c]           = wc;
++                S += meta[(c * n_rows + row) * 2 + 1] * wc;
++            }
++            S = sycl::reduce_over_group(it.get_group(), S, sycl::plus<float>());
++            sycl::group_barrier(it.get_group());
++            float out = 0.0f;
++            for (int c = cl; c < n_chunks; c += CL) {
++                out += part[(c * n_rows + row) * D + d0 + dl] * w[c];
++            }
++            red[lid] = out;
++            sycl::group_barrier(it.get_group());
++            if (cl == 0) {
++                float o = red[dl] + red[SL + dl] + red[2 * SL + dl] + red[3 * SL + dl];
++                dst[row * D + d0 + dl] = S > 0.0f ? o / S : 0.0f;
++            }
++        });
++    });
++}
++
++bool ggml_sycl_fattn_gqa_decode_supported(const ggml_tensor * dst) {
++    static const int on = ggml_sycl_get_env("GGML_SYCL_FA_GQA_DEC", 1);
++    if (!on) {
++        return false;
++    }
++    const ggml_tensor * Q     = dst->src[0];
++    const ggml_tensor * K     = dst->src[1];
++    const ggml_tensor * V     = dst->src[2];
++    const ggml_tensor * mask  = dst->src[3];
++    const ggml_tensor * sinks = dst->src[4];
++    if (sinks || Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || K->type != V->type) {
++        return false;
++    }
++    if (K->type != GGML_TYPE_Q8_0 && K->type != GGML_TYPE_F16) {
++        return false;
++    }
++    const int D = Q->ne[0];
++    if ((D != 64 && D != 128 && D != 256) || K->ne[0] != D || V->ne[0] != D) {
++        return false;
++    }
++    if (Q->ne[1] < 1 || Q->ne[1] > 8 || Q->ne[3] != 1 || K->ne[3] != 1) {
++        return false;
++    }
++    if (Q->ne[2] % K->ne[2] != 0 || K->ne[2] != V->ne[2]) {
++        return false;
++    }
++    const int gqa = Q->ne[2] / K->ne[2];
++    if (gqa < 2 || gqa * Q->ne[1] > 64) {  // work-group = query rows * 16 lanes <= 1024
++        return false;
++    }
++    if (mask && (mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1)) {
++        return false;
++    }
++    float max_bias = 0.0f, softcap = 0.0f;
++    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
++    memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(float));
++    if (max_bias != 0.0f || softcap != 0.0f) {
++        return false;
++    }
++    // dst rows are [t][h][D] contiguous
++    return ggml_is_contiguous(dst) && dst->ne[0] == D && dst->ne[1] == Q->ne[2] && dst->ne[2] == Q->ne[1];
++}
++
++#ifndef GQA_DEC_STANDALONE
++void ggml_sycl_fattn_gqa_decode(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * Q    = dst->src[0];
++    const ggml_tensor * K    = dst->src[1];
++    const ggml_tensor * V    = dst->src[2];
++    const ggml_tensor * mask = dst->src[3];
++
++    float scale = 1.0f;
++    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
++
++    const int D        = Q->ne[0];
++    const int n_tok    = Q->ne[1];
++    const int n_head   = Q->ne[2];
++    const int gqa      = n_head / K->ne[2];
++    const int n_kv     = K->ne[1];
++    const int chunk_sz = gqa_dec_chunk();
++    const int n_chunks = (n_kv + chunk_sz - 1) / chunk_sz;
++
++    dpct::queue_ptr stream = ctx.stream();
++    const size_t    n_rows = (size_t) n_tok * n_head;
++    const char * mp_e   = mask ? (const char *) mask->data : nullptr;
++    const size_t nbm1_e = mask ? mask->nb[1] : 0;
++    static const int use_esimd    = ggml_sycl_get_env("GGML_SYCL_FA_GQA_ESIMD", 1);
++    // GGML_SYCL_FA_ESIMD_CHUNK: KV positions per chunk with 2+ query tokens; GGML_SYCL_FA_CHUNK1: with one
++    // (one token has 3 threads per chunk: smaller chunks give the GPU enough threads)
++    static const int esimd_chunk_n = ggml_sycl_get_env("GGML_SYCL_FA_ESIMD_CHUNK", 128);
++    static const int esimd_chunk_1 = ggml_sycl_get_env("GGML_SYCL_FA_CHUNK1", 80);
++    const int        esimd_chunk   = n_tok == 1 ? esimd_chunk_1 : esimd_chunk_n;
++    if (use_esimd && K->type == GGML_TYPE_Q8_0 && D == 256 && (gqa * n_tok) % GQA_ESIMD_RT == 0) {
++        const int n_chunks_e = (n_kv + esimd_chunk - 1) / esimd_chunk;
++        size_t    alloc_c    = 1;
++        while (alloc_c < (size_t) n_chunks_e) {
++            alloc_c <<= 1;
++        }
++        ggml_sycl_pool_alloc<float> part_e(ctx.pool(), alloc_c * 8 * n_head * D);
++        ggml_sycl_pool_alloc<float> meta_e(ctx.pool(), alloc_c * 8 * n_head * 2);
++        // GGML_SYCL_FA_ESIMD_SLM=1: work-group variant with the K/V tiles dequantized once into SLM
++        static const int esimd_slm = ggml_sycl_get_env("GGML_SYCL_FA_ESIMD_SLM", 1);
++        // GGML_SYCL_FA_SLM_MIN: fewest query tokens that use the work-group (SLM) variant
++        static const int slm_min   = ggml_sycl_get_env("GGML_SYCL_FA_SLM_MIN", 2);
++        // GGML_SYCL_FA_XMX=N: dpas kernel from N query tokens on (0 = off)
++        static const int fa_xmx       = ggml_sycl_get_env("GGML_SYCL_FA_XMX", 0);
++        static const int fa_xmx_chunk = ggml_sycl_get_env("GGML_SYCL_FA_XMX_CHUNK", 256);
++        if (fa_xmx > 0 && n_tok >= fa_xmx) {
++            const int nrg      = (gqa * n_tok + 7) / 8;
++            const int n_kvh    = n_head / gqa;
++            const int n_chunks = (n_kv + fa_xmx_chunk - 1) / fa_xmx_chunk;
++            size_t    ac       = 1;
++            while (ac < (size_t) n_chunks) {
++                ac <<= 1;
++            }
++            ggml_sycl_pool_alloc<float>      part_x(ctx.pool(), ac * 8 * n_head * D);
++            ggml_sycl_pool_alloc<float>      meta_x(ctx.pool(), ac * 8 * n_head * 2);
++            ggml_sycl_pool_alloc<sycl::half> q16(ctx.pool(), (size_t) n_kvh * nrg * 8 * D);
++            gqa_xmx_prep_q((const char *) Q->data, q16.get(), scale, n_tok, gqa, n_kvh, nrg, Q->nb[1], Q->nb[2], stream);
++            gqa_dec_partial_xmx_q8_256(q16.get(), (const char *) K->data, (const char *) V->data, mp_e, part_x.get(),
++                                       meta_x.get(), n_tok, n_head, gqa, n_kv, n_chunks, K->nb[1], K->nb[2], V->nb[1],
++                                       V->nb[2], nbm1_e, fa_xmx_chunk, stream);
++            gqa_dec_merge3<256>(part_x.get(), meta_x.get(), (float *) dst->data, n_tok, n_head, n_chunks, stream);
++            return;
++        }
++        // GGML_SYCL_FA_SLM_RT: query rows per thread of the work-group variant (2 or 3): every row a thread
++        // owns reuses the K/V values it reads from SLM
++        static const int slm_rt = ggml_sycl_get_env("GGML_SYCL_FA_SLM_RT", 2);
++        // GGML_SYCL_FA_SLM_F16: K/V tiles kept in SLM as f16 (half the SLM traffic)
++        static const int slm_f16 = ggml_sycl_get_env("GGML_SYCL_FA_SLM_F16", 0);
++        if (esimd_slm && n_tok >= slm_min && slm_rt == 3 && (gqa * n_tok) % 3 == 0) {
++            gqa_dec_partial_esimd_slm_q8_256<3>((const char *) Q->data, (const char *) K->data, (const char *) V->data, mp_e,
++                                             part_e.get(), meta_e.get(), scale, n_tok, n_head, gqa, n_kv, n_chunks_e,
++                                             Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], nbm1_e,
++                                             esimd_chunk, stream);
++        } else if (esimd_slm && n_tok >= slm_min && slm_f16) {
++            gqa_dec_partial_esimd_slm_q8_256<GQA_ESIMD_RT, 2>((const char *) Q->data, (const char *) K->data, (const char *) V->data, mp_e,
++                                             part_e.get(), meta_e.get(), scale, n_tok, n_head, gqa, n_kv, n_chunks_e,
++                                             Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], nbm1_e,
++                                             esimd_chunk, stream);
++        } else if (esimd_slm && n_tok >= slm_min) {
++            gqa_dec_partial_esimd_slm_q8_256<GQA_ESIMD_RT>((const char *) Q->data, (const char *) K->data, (const char *) V->data, mp_e,
++                                             part_e.get(), meta_e.get(), scale, n_tok, n_head, gqa, n_kv, n_chunks_e,
++                                             Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], nbm1_e,
++                                             esimd_chunk, stream);
++        } else {
++            gqa_dec_partial_esimd_q8_256((const char *) Q->data, (const char *) K->data, (const char *) V->data, mp_e,
++                                         part_e.get(), meta_e.get(), scale, n_tok, n_head, gqa, n_kv, n_chunks_e,
++                                         Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], nbm1_e,
++                                         esimd_chunk, stream);
++        }
++        // GGML_SYCL_FA_MERGE3=1 (default): sliced merge, 0: one work-group per row
++        static const int merge3 = ggml_sycl_get_env("GGML_SYCL_FA_MERGE3", 1);
++        if (merge3) {
++            gqa_dec_merge3<256>(part_e.get(), meta_e.get(), (float *) dst->data, n_tok, n_head, n_chunks_e, stream);
++        } else {
++            gqa_dec_merge2<256>(part_e.get(), meta_e.get(), (float *) dst->data, n_tok, n_head, n_chunks_e, stream);
++        }
++        return;
++    }
++
++    // round the chunk count up to a power of two: the KV length grows every call and the
++    // legacy pool would otherwise cache a new, slightly larger buffer each time
++    size_t n_chunks_alloc = 1;
++    while (n_chunks_alloc < (size_t) n_chunks) {
++        n_chunks_alloc <<= 1;
++    }
++    ggml_sycl_pool_alloc<float> part(ctx.pool(), n_chunks_alloc * 8 * n_head * D);
++    ggml_sycl_pool_alloc<float> meta(ctx.pool(), n_chunks_alloc * 8 * n_head * 2);
++
++    const char * mp   = mask ? (const char *) mask->data : nullptr;
++    const size_t nbm1 = mask ? mask->nb[1] : 0;
++
++#define GQA_DEC_RUN(DD, TT)                                                                                           \
++    gqa_dec_partial<DD, TT>((const char *) Q->data, (const char *) K->data, (const char *) V->data, mp, part.get(),  \
++                            meta.get(), scale, n_tok, n_head, gqa, n_kv, n_chunks, Q->nb[1], Q->nb[2], K->nb[1],     \
++                            K->nb[2], V->nb[1], V->nb[2], nbm1, chunk_sz, stream);                                             \
++    gqa_dec_merge<DD>(part.get(), meta.get(), (float *) dst->data, n_tok, n_head, n_chunks, stream)
++
++    const bool q8 = K->type == GGML_TYPE_Q8_0;
++    switch (D) {
++        case 64:  if (q8) { GQA_DEC_RUN(64, GGML_TYPE_Q8_0); } else { GQA_DEC_RUN(64, GGML_TYPE_F16); } break;
++        case 128: if (q8) { GQA_DEC_RUN(128, GGML_TYPE_Q8_0); } else { GQA_DEC_RUN(128, GGML_TYPE_F16); } break;
++        case 256: if (q8) { GQA_DEC_RUN(256, GGML_TYPE_Q8_0); } else { GQA_DEC_RUN(256, GGML_TYPE_F16); } break;
++        default: GGML_ABORT("gqa decode: unsupported D=%d", D);
++    }
++#undef GQA_DEC_RUN
++}
++#endif // GQA_DEC_STANDALONE
+diff --git a/ggml/src/ggml-sycl/fattn-gqa-dec.hpp b/ggml/src/ggml-sycl/fattn-gqa-dec.hpp
+new file mode 100644
+index 00000000..59257b94
+--- /dev/null
++++ b/ggml/src/ggml-sycl/fattn-gqa-dec.hpp
+@@ -0,0 +1,7 @@
++#pragma once
++
++#include "common.hpp"
++
++// GQA-grouped flash-attention decode for 1..4 query tokens (see fattn-gqa-dec.cpp)
++bool ggml_sycl_fattn_gqa_decode_supported(const ggml_tensor * dst);
++void ggml_sycl_fattn_gqa_decode(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml-sycl/fattn.cpp b/ggml/src/ggml-sycl/fattn.cpp
+index 1f692dc4..2c719622 100644
+--- a/ggml/src/ggml-sycl/fattn.cpp
++++ b/ggml/src/ggml-sycl/fattn.cpp
+@@ -11,6 +11,7 @@
+ //
+ 
+ 
++#include "fattn-gqa-dec.hpp"
+ #include <sycl/sycl.hpp>
+ #include "dpct/helper.hpp"
+ #include "common.hpp"
+@@ -260,7 +261,8 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
+                 }
+             }
+         } else {
+-            if (Q->ne[1] <= 2) {
++            static const int force_tile = ggml_sycl_get_env("GGML_SYCL_FA_FORCE_TILE", 0);
++            if (Q->ne[1] <= 2 && !force_tile) {
+                 // TILE is faster for quantized KV decode on Xe2 (BMG); keep VEC on untested archs
+                 const gpu_arch arch = ggml_sycl_info().devices[device].hw_info.arch;
+                 if (arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31) {
+@@ -312,6 +314,11 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
+                 (long long)V_dbg->ne[1]);
+     }
+ 
++    if (ggml_sycl_fattn_gqa_decode_supported(dst)) {
++        ggml_sycl_fattn_gqa_decode(ctx, dst);
++        return;
++    }
++
+     const best_fattn_kernel fk = ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst);
+     switch (fk) {
+         case BEST_FATTN_KERNEL_NONE:

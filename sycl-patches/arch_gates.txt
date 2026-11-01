@@ -1,0 +1,24 @@
+# ggml-sycl architecture gates at dde879bc (2026-11-01)
+# regenerate: bash sycl-patches/check_arch_gates.sh --update [REF]
+   CMakeLists.txt: target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_XMX_AOT_SG=${_ggml_sycl_xmx_sg})
+   fattn-onednn.cpp: arch == gpu_arch::intel_gpu_dg2_g11 ||
+   fattn-onednn.cpp: arch == gpu_arch::intel_gpu_dg2_g12);
+   fattn-onednn.cpp: bool support_spda = !(arch == gpu_arch::intel_gpu_dg2_g10 ||
+   fattn-vec.hpp: arch == gpu_arch::intel_gpu_bmg_g31 ||
+   fattn-vec.hpp: arch == gpu_arch::intel_gpu_lnl_m) ? 256 : 128;
+   fattn-vec.hpp: return (arch == gpu_arch::intel_gpu_bmg_g21 ||
+   fattn.cpp: if (arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31) {
+   ggml-sycl.cpp: gpu_arch::intel_gpu_acm_g10 &&
+   ggml-sycl.cpp: info.devices[i].opt_feature.reorder = device.ext_oneapi_architecture_is(syclex::arch_category::intel_gpu);
+   ggml-sycl.cpp: return ggml_sycl_info().devices[device].hw_info.arch == gpu_arch::intel_gpu_bmg_g31;
+   mmvq.hpp: return arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31;
+HW common.hpp: arch == gpu_arch::intel_gpu_lnl_m;
+HW common.hpp: return arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31 ||
+HW common.hpp: return g_ggml_sycl_enable_xmx_esimd && ggml_sycl_xmx_supports_arch(ggml_sycl_info().devices[device].hw_info.arch);
+HW common.hpp: static inline bool ggml_sycl_xmx_supports_arch(gpu_arch arch) {
+HW fattn-dpas.cpp: #if !defined(GGML_SYCL_SUPPORT_XMX) || (defined(GGML_SYCL_XMX_AOT_SG) && GGML_SYCL_XMX_AOT_SG != 16)
+HW fattn-dpas.cpp: arch == gpu_arch::intel_gpu_lnl_m || arch == gpu_arch::intel_gpu_ptl_h ||
+HW fattn-dpas.cpp: arch == gpu_arch::intel_gpu_ptl_u || arch == gpu_arch::intel_gpu_wcl;
+HW fattn-dpas.cpp: return arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31 ||
+HW fused-gemm.cpp: #if defined(GGML_SYCL_XMX_AOT_SG)
+HW fused-gemm.cpp: return SG == GGML_SYCL_XMX_AOT_SG;

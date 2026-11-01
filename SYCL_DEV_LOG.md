@@ -66,6 +66,36 @@ aborts on either backend):
   test code stays pristine, and this abort is accepted as a known upstream test
   defect until upstream defines what a skipped expert's lane scale should be.
 
+## Build check (2026-11-01, oneAPI 2026.2 without an Intel GPU)
+
+oneAPI came from conda-forge into `/opt/oneapi` on a GPU-less cloud box:
+`dpcpp_linux-64` 2026.2.0, `mkl-devel-dpcpp`, `onednn-dpcpp` 3.14.1,
+`level-zero-devel`, `intel-graphics-compiler` + `intel-compute-runtime`
+(`ocloc` 24.52) and `intel-opencl-rt` (CPU OpenCL device). Results so far:
+
+- **Main stack, JIT** (README flags: `GGML_SYCL_F16=ON`, oneDNN found, no
+  `GGML_SYCL_DEVICE_ARCH`): `ggml-sycl`, `test-backend-ops` and `llama-bench`
+  build with zero errors.
+- **DG2 code generation** is checked one translation unit at a time: compile
+  and link with `-fsycl-targets=spir64_gen -device acm-g10` (the flags
+  `GGML_SYCL_DEVICE_ARCH=acm-g10` uses, and the same SPIR-V the A770 compiles at
+  JIT time), with IGC shader dumps to read the DG2 assembly.
+- **Candidate C21 (cwriter's 8x8 ESIMD MoE GEMM)** builds for `acm-g10`. All
+  2716 DPAS instructions are `dpas.8x8 (8|M0)`, the DG2 form. The 16-wide Xe2
+  kernels in the same image also compile for DG2 (split into 8-wide DPAS,
+  emulated 2D loads, spills); the device probe never picks them on DG2.
+  Register use matters:
+  - The kernel asks for `grf_size<256>`. With 256 GRF the default path
+    (`GGML_SYCL_MMID_ESIMD=1`, K split 1) does not spill. Only the bit-exact
+    mode 2 (K split 4) spills 3-4 KB.
+  - An AOT build with `-ze-opt-enable-auto-large-GRF-mode` (what C20's CMake
+    passes) gets 128 GRF for every DG2 kernel and spills 3.7-9 KB. A JIT build
+    should honor the property (per C20's notes; unverified without a GPU), so
+    measure C21 with a JIT build.
+- `__SYCL_TARGET_INTEL_GPU_ACM_G10__` is not defined under `spir64_gen
+  -device acm-g10`, only under `-fsycl-targets=intel_gpu_acm_g10`, so code keyed
+  on it (`FG_AOT_SG`) builds every width in a `GGML_SYCL_DEVICE_ARCH` build.
+
 ## Update (2026-11-01, upstream refresh to `dde879bc1`)
 
 Refreshed from `23b0202a1` (480 upstream commits). The header bullets above

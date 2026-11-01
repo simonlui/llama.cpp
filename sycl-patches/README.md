@@ -109,10 +109,14 @@ To reverse patches:
 bash sycl-patches-extracted/unapply.sh .
 ```
 
-To update against the latest `master`: run the extracted `unapply.sh`,
-fast-forward `master`, refresh the patches with `pull_base.sh` / `pull_prs.sh`,
-then run the extracted `apply.sh` again. (This is done by hand; there is no
-`rebase.sh` wrapper.)
+To update against the latest `master`: run the candidates' and then the
+extracted `unapply.sh`, fast-forward `master`, run `check_arch_gates.sh`,
+refresh the patches with `pull_base.sh` / `pull_prs.sh`, then run the extracted
+`apply.sh` again. (This is done by hand; there is no `rebase.sh` wrapper.)
+
+Opt-in patches that may help the A770 but are not proven on it live in
+`../sycl-patches-candidates/` and apply on top of the full stack; see its
+README for the test plan.
 
 ## Management Scripts
 
@@ -129,6 +133,14 @@ explicit skip.
   a pinned name is neither on the fork nor local, the script notes that the
   entry can be pruned. The script refuses to run cleanup if the fork listing
   comes back empty.
+- `check_arch_gates.sh`: Lists every Intel architecture gate in `ggml-sycl` at a
+  ref (default `upstream/master`) and diffs it against `arch_gates.txt`, the
+  snapshot from the last refresh. Gates in files that use DPAS, joint_matrix,
+  ESIMD or 2D block loads are tagged `HW`: never add DG2 to those without a
+  sub-group-8 port. Untagged gates only pick between kernels built for every
+  device; try them on the A770 through `GGML_SYCL_DG2_BMG_TUNING` (see
+  `../sycl-patches-candidates/`). Run it after fast-forwarding `master`, then
+  `--update` once the new gates are classified.
 - `pull_prs.sh`: Pulls open, `SYCL`-labeled PRs from upstream that were created
   in the last 60 days. Drafts are skipped. `SKIP_PRS` prevents known open but
   excluded PRs from being downloaded; stale files for those PRs are archived.

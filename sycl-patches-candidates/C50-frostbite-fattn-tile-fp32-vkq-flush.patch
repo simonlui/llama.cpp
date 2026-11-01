@@ -1,0 +1,185 @@
+From: Frostbite1536 <https://github.com/Frostbite1536/A770>
+Subject: [PATCH] SYCL: flush FP16 FA TILE VKQ to FP32 per KV tile
+
+Why: p11b CPU numerics at A770 geometry measured TILE NMSE about 8e-6
+at 1024 keys per accumulator and about 1.5e-4 at 2048; g-min fails
+at 4096, while g-a770 reaches 0.44 / 2.3 at 8192 / 16384 (tolerance 5e-4).
+Tested on: Intel OpenCL CPU device only
+F ported from the P100 project, patch 0004
+Applies independently on llama.cpp 79e2e74 + A770 patches 0001-0005.
+Candidate only; A770 A/B decision pending.
+
+Re-anchored for this stack on dde879bc1: PR 30606 adds a checked trailing-chunk
+iteration to both TILE branches, so all four flash_attn_tile_iter calls pass VKQ_f32.
+
+diff --git a/ggml/src/ggml-sycl/fattn-tile.hpp b/ggml/src/ggml-sycl/fattn-tile.hpp
+index efd7fdc6..d08e1cf6 100644
+--- a/ggml/src/ggml-sycl/fattn-tile.hpp
++++ b/ggml/src/ggml-sycl/fattn-tile.hpp
+@@ -426,6 +426,9 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
+                                                  float * const     KQ_max,
+                                                  float * const     KQ_sum,
+                                                  T_acc * const     VKQ,
++#ifdef SYCL_FAST_FP16
++                                                 sycl::float2 * const VKQ_f32,
++#endif // SYCL_FAST_FP16
+                                                  const int         k_VKQ_0,
+                                                  const int         k_VKQ_max,
+                                                  const int         col_Q_0,
+@@ -547,11 +550,10 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
+             KQ_sum[jc] = KQ_sum[jc]*KQ_max_scale + KQ_sum_add;
+ 
+ #ifdef SYCL_FAST_FP16
+-            const sycl::half2 KQ_max_scale_h2 = sycl::half2(KQ_max_scale, KQ_max_scale);
+ #pragma unroll
+             for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
+-                VKQ[jc*((DVp/2)/warp_size) + i0/warp_size].x() *= KQ_max_scale_h2.x();
+-                VKQ[jc*((DVp/2)/warp_size) + i0/warp_size].y() *= KQ_max_scale_h2.y();
++                VKQ_f32[jc*((DVp/2)/warp_size) + i0/warp_size].x() *= KQ_max_scale;
++                VKQ_f32[jc*((DVp/2)/warp_size) + i0/warp_size].y() *= KQ_max_scale;
+             }
+ #else
+ #pragma unroll
+@@ -652,6 +654,14 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
+ #endif // SYCL_FAST_FP16
+         item_ct1.barrier(sycl::access::fence_space::local_space);
+     }
++#ifdef SYCL_FAST_FP16
++#pragma unroll
++    for (int i = 0; i < cpw * ((DVp/2)/warp_size); ++i) {
++        const sycl::float2 tile = VKQ[i].template convert<float, sycl::rounding_mode::automatic>();
++        VKQ_f32[i] += tile;
++        VKQ[i] = make_half2(0.0f, 0.0f);
++    }
++#endif // SYCL_FAST_FP16
+ }
+ 
+ template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, int warp_size>  // D == head size
+@@ -779,6 +789,7 @@ static void flash_attn_tile(const char *  Q,
+     __dpct_align__(16) sycl::half2 VKQ[cpw * ((DVp / 2) / warp_size)] = {
+         { 0.0f, 0.0f }
+     };
++    __dpct_align__(16) sycl::float2 VKQ_f32[cpw * ((DVp / 2) / warp_size)] = {{0.0f, 0.0f}};
+ #else
+     constexpr size_t lsm_size1 = ncols * DKQ ;
+     constexpr size_t lsm_size2 = nbatch_fa * (nbatch_K + cpy_ne) + DVp-DV;
+@@ -868,7 +879,11 @@ static void flash_attn_tile(const char *  Q,
+             constexpr bool oob_check = false;
+             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap,
+                                  oob_check>(Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
++#ifdef SYCL_FAST_FP16
++                                            stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, VKQ_f32, k_VKQ_0, k_VKQ_max, col_Q_0,
++#else
+                                             stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
++#endif // SYCL_FAST_FP16
+                                             KQ_max_new_shared);
+             k_VKQ_0 += item_ct1.get_group_range(1) * nbatch_fa;
+         }
+@@ -876,7 +891,11 @@ static void flash_attn_tile(const char *  Q,
+             constexpr bool oob_check = true;
+             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap,
+                                  oob_check>(Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
++#ifdef SYCL_FAST_FP16
++                                            stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, VKQ_f32, k_VKQ_0, k_VKQ_max, col_Q_0,
++#else
+                                             stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
++#endif // SYCL_FAST_FP16
+                                             KQ_max_new_shared);
+         }
+     } else {
+@@ -888,7 +907,11 @@ static void flash_attn_tile(const char *  Q,
+             constexpr bool oob_check = false;
+             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap,
+                                  oob_check>(Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
++#ifdef SYCL_FAST_FP16
++                                            stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, VKQ_f32, k_VKQ_0, k_VKQ_max, col_Q_0,
++#else
+                                             stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
++#endif // SYCL_FAST_FP16
+                                             KQ_max_new_shared);
+             k_VKQ_0 += item_ct1.get_group_range(1) * nbatch_fa;
+         }
+@@ -896,7 +919,11 @@ static void flash_attn_tile(const char *  Q,
+             constexpr bool oob_check = true;
+             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap,
+                                  oob_check>(Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
++#ifdef SYCL_FAST_FP16
++                                            stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, VKQ_f32, k_VKQ_0, k_VKQ_max, col_Q_0,
++#else
+                                             stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
++#endif // SYCL_FAST_FP16
+                                             KQ_max_new_shared);
+         }
+     }
+@@ -911,7 +938,9 @@ static void flash_attn_tile(const char *  Q,
+         static_assert(nbatch_fa*nbatch_K >= nwarps*DVp, "KV_tmp too small");
+ 
+ #ifdef SYCL_FAST_FP16
+-        sycl::half2 * VKQ_combine = (sycl::half2 *) KV_tmp;
++        static_assert(lsm_size2 * sizeof(sycl::half2) >= nwarps * DVp * sizeof(float),
++                      "KV_tmp too small for FP32 combine");
++        float * VKQ_combine = (float *) KV_tmp;
+ #else
+         float * VKQ_combine    = (float *) KV_tmp;
+ #endif // SYCL_FAST_FP16
+@@ -921,12 +950,12 @@ static void flash_attn_tile(const char *  Q,
+         if (item_ct1.get_local_id(1) % np != 0) {
+ 
+ #ifdef SYCL_FAST_FP16
+-            constexpr int cpy_ne_D = cpy_ne < (DVp/2)/warp_size ? cpy_ne : (DVp/2)/warp_size;
++            constexpr int cpy_ne_D = cpy_ne/2 < (DVp/2)/warp_size ? cpy_ne/2 : (DVp/2)/warp_size;
+ #pragma unroll
+             for (int i0 = 0; i0 < DVp/2; i0 += warp_size*cpy_ne_D) {
+-                ggml_sycl_memcpy_1<cpy_ne_D * 4>(
+-                    &VKQ_combine[item_ct1.get_local_id(1) * (DVp / 2) + i0 + item_ct1.get_local_id(2) * cpy_ne_D],
+-                    &VKQ[i0 / warp_size]);
++                ggml_sycl_memcpy_1<cpy_ne_D * 8>(
++                    &VKQ_combine[item_ct1.get_local_id(1) * DVp + 2*i0 + item_ct1.get_local_id(2) * (2*cpy_ne_D)],
++                    &VKQ_f32[i0 / warp_size]);
+             }
+ #else
+ 
+@@ -950,15 +979,15 @@ static void flash_attn_tile(const char *  Q,
+ #pragma unroll
+         for (int ip = 1; ip < np; ++ip) {
+ #ifdef SYCL_FAST_FP16
+-            constexpr int cpy_ne_D = cpy_ne < (DVp/2)/warp_size ? cpy_ne : (DVp/2)/warp_size;
++            constexpr int cpy_ne_D = cpy_ne/2 < (DVp/2)/warp_size ? cpy_ne/2 : (DVp/2)/warp_size;
+ #pragma unroll
+             for (int i0 = 0; i0 < DVp/2; i0 += warp_size*cpy_ne_D) {
+-                __dpct_align__(16) sycl::half2 tmp[cpy_ne_D];
+-                ggml_sycl_memcpy_1<cpy_ne_D * 4>(tmp, &VKQ_combine[(item_ct1.get_local_id(1) + ip) * (DVp / 2) + i0 +
+-                                                                   item_ct1.get_local_id(2) * cpy_ne_D]);
++                __dpct_align__(16) sycl::float2 tmp[cpy_ne_D];
++                ggml_sycl_memcpy_1<cpy_ne_D * 8>(tmp, &VKQ_combine[(item_ct1.get_local_id(1) + ip) * DVp + 2*i0 +
++                                                                   item_ct1.get_local_id(2) * (2*cpy_ne_D)]);
+ #pragma unroll
+                 for (int i1 = 0; i1 < cpy_ne_D; ++i1) {
+-                    VKQ[i0/warp_size + i1] += tmp[i1];
++                    VKQ_f32[i0/warp_size + i1] += tmp[i1];
+                 }
+             }
+ #else
+@@ -993,10 +1022,10 @@ static void flash_attn_tile(const char *  Q,
+             KQ_sum[jc0] = KQ_sum[jc0]*KQ_max_scale + val;
+ 
+ #ifdef SYCL_FAST_FP16
+-            const sycl::half2 KQ_max_scale_h2 = sycl::half2(KQ_max_scale, KQ_max_scale);
+ #pragma unroll
+             for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
+-                VKQ[jc0*((DVp/2)/warp_size) + i0/warp_size] *= KQ_max_scale_h2;
++                VKQ_f32[jc0*((DVp/2)/warp_size) + i0/warp_size].x() *= KQ_max_scale;
++                VKQ_f32[jc0*((DVp/2)/warp_size) + i0/warp_size].y() *= KQ_max_scale;
+             }
+ #else
+ #pragma unroll
+@@ -1033,8 +1062,7 @@ static void flash_attn_tile(const char *  Q,
+             __dpct_align__(16) sycl::float2 tmp[cpy_ne_D];
+ #pragma unroll
+             for (int i1 = 0; i1 < cpy_ne_D; ++i1) {
+-                tmp[i1] = VKQ[jc0 * ((DVp / 2) / warp_size) + i0 / warp_size + i1]
+-                              .template convert<float, sycl::rounding_mode::automatic>();
++                tmp[i1] = VKQ_f32[jc0 * ((DVp / 2) / warp_size) + i0 / warp_size + i1];
+                 tmp[i1].x() *= scale;
+                 tmp[i1].y() *= scale;
+             }

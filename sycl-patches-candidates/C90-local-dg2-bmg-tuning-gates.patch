@@ -1,0 +1,95 @@
+Subject: [PATCH] sycl: opt-in Battlemage kernel choices on Arc A-series (DG2)
+
+Local candidate. GGML_SYCL_DG2_BMG_TUNING is a bit mask (default 0 = upstream behavior):
+1 FA quantized-KV decode on TILE, 2 FA VEC 256 threads, 4 q5_K MMVQ reuse,
+8 D=256 single-query decode on VEC (PR 30606), 16 q4_K row pairing to 8 columns (needs C30).
+Each gate only selects between kernels that are already compiled for every device.
+
+diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
+index dd599e5a..33b00248 100644
+--- a/ggml/src/ggml-sycl/common.hpp
++++ b/ggml/src/ggml-sycl/common.hpp
+@@ -830,6 +830,23 @@ inline bool ggml_sycl_dnnl_has_optimized_gemm(int device) {
+ 
+ int ggml_sycl_get_env(const char *env_name, int default_val);
+ 
++// Arc A-series (DG2) opt-in for kernel choices upstream enables on Battlemage only.
++// GGML_SYCL_DG2_BMG_TUNING is a bit mask; 0 (default) keeps upstream behavior.
++enum ggml_sycl_dg2_bmg_tuning_bit {
++    GGML_SYCL_DG2_FA_QKV_TILE   = 1,  // quantized-KV decode (1-2 tokens) on FA TILE instead of VEC
++    GGML_SYCL_DG2_FA_VEC_256    = 2,  // FA VEC with 256-thread work-groups instead of 128
++    GGML_SYCL_DG2_Q5K_REUSE     = 4,  // q5_K multi-column MMVQ weight reuse and fused gate/up
++    GGML_SYCL_DG2_FA_D256_VEC   = 8,  // D=256 single-query decode on FA VEC (PR 30606)
++    GGML_SYCL_DG2_Q4K_WIDE_PAIR = 16, // q4_K MMVQ row pairing up to 8 columns (PR 30226)
++};
++
++static inline bool ggml_sycl_dg2_bmg_tuning(gpu_arch arch, int bit) {
++    static const int mask = ggml_sycl_get_env("GGML_SYCL_DG2_BMG_TUNING", 0);
++    const bool dg2 = arch == gpu_arch::intel_gpu_acm_g10 || arch == gpu_arch::intel_gpu_acm_g11 ||
++                     arch == gpu_arch::intel_gpu_acm_g12;
++    return dg2 && (mask & bit) != 0;
++}
++
+ template <int N, class T> std::string debug_get_array_str(const std::string & prefix, const T array[N]) {
+     if (LIKELY(!g_ggml_sycl_debug)) {
+         return "";
+diff --git a/ggml/src/ggml-sycl/fattn-vec.hpp b/ggml/src/ggml-sycl/fattn-vec.hpp
+index 57dfdc63..4a65b1c9 100644
+--- a/ggml/src/ggml-sycl/fattn-vec.hpp
++++ b/ggml/src/ggml-sycl/fattn-vec.hpp
+@@ -19,7 +19,8 @@ static int ggml_sycl_fattn_vec_get_nthreads_device(gpu_arch arch) {
+     // Xe2 (Battlemage, Lunar Lake) runs the flash-attention vec kernel best with a 256-thread work group.
+     return (arch == gpu_arch::intel_gpu_bmg_g21 ||
+             arch == gpu_arch::intel_gpu_bmg_g31 ||
+-            arch == gpu_arch::intel_gpu_lnl_m) ? 256 : 128;
++            arch == gpu_arch::intel_gpu_lnl_m ||
++            ggml_sycl_dg2_bmg_tuning(arch, GGML_SYCL_DG2_FA_VEC_256)) ? 256 : 128;
+ }
+ 
+ // Currenlty llvm with the amdgcn target dose not support unrolling loops
+diff --git a/ggml/src/ggml-sycl/fattn.cpp b/ggml/src/ggml-sycl/fattn.cpp
+index 0c306b13..8b7c81b0 100644
+--- a/ggml/src/ggml-sycl/fattn.cpp
++++ b/ggml/src/ggml-sycl/fattn.cpp
+@@ -277,7 +277,8 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
+                 // keep the tile dispatcher's original preference.
+                 const gpu_arch arch = ggml_sycl_info().devices[device].hw_info.arch;
+                 const bool vec_decode = (arch == gpu_arch::intel_gpu_bmg_g21 ||
+-                                         arch == gpu_arch::intel_gpu_bmg_g31) && Q->ne[0] == 256;
++                                         arch == gpu_arch::intel_gpu_bmg_g31 ||
++                                         ggml_sycl_dg2_bmg_tuning(arch, GGML_SYCL_DG2_FA_D256_VEC)) && Q->ne[0] == 256;
+                 if (vec_decode || !gqa_opt_applies) {
+                     return BEST_FATTN_KERNEL_VEC;
+                 }
+@@ -287,7 +288,8 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
+             if (Q->ne[1] <= 2 && !force_tile) {
+                 // TILE is faster for quantized KV decode on Xe2 (BMG); keep VEC on untested archs
+                 const gpu_arch arch = ggml_sycl_info().devices[device].hw_info.arch;
+-                if (arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31) {
++                if (arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31 ||
++                    ggml_sycl_dg2_bmg_tuning(arch, GGML_SYCL_DG2_FA_QKV_TILE)) {
+                     return BEST_FATTN_KERNEL_TILE;
+                 }
+                 return BEST_FATTN_KERNEL_VEC;
+diff --git a/ggml/src/ggml-sycl/mmvq.hpp b/ggml/src/ggml-sycl/mmvq.hpp
+index ee38c13d..21106b74 100644
+--- a/ggml/src/ggml-sycl/mmvq.hpp
++++ b/ggml/src/ggml-sycl/mmvq.hpp
+@@ -19,13 +19,15 @@
+ // layout: faster on Xe2 (BMG), so untested archs keep the per-column kernel
+ inline bool ggml_sycl_q5_k_mmvq_reuse(int device) {
+     const gpu_arch arch = ggml_sycl_info().devices[device].hw_info.arch;
+-    return arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31;
++    return arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31 ||
++           ggml_sycl_dg2_bmg_tuning(arch, GGML_SYCL_DG2_Q5K_REUSE);
+ }
+ 
+ // q4_K multi-column MMVQ pairs rows up to 8 columns on Xe2 (BMG); untested archs stop at 4
+ inline bool ggml_sycl_q4_k_mmvq_wide_row_pair(int device) {
+     const gpu_arch arch = ggml_sycl_info().devices[device].hw_info.arch;
+-    return arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31;
++    return arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31 ||
++           ggml_sycl_dg2_bmg_tuning(arch, GGML_SYCL_DG2_Q4K_WIDE_PAIR);
+ }
+ 
+ void ggml_sycl_op_mul_mat_vec_q(
