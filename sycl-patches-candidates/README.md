@@ -21,7 +21,7 @@ the main stack, re-running `apply.sh` on an applied tree is not supported.
 | C20 | PR 31428 (draft, on top of carried PR 30156) | ESIMD grouped MoE GEMM that dequantizes straight into the DPAS operands | Base for C21. On its own it only replaces the sub-group-16 shape, so no change on DG2 | `GGML_SYCL_MMID_ESIMD=0` |
 | C21 | cwriter `36b5038` (not in a PR) | The C20 kernel for the Xe-HPG 8x8x16 sub-group-8 DPAS shape: 8-wide DPAS, 16 rows, 1D loads | The only MoE GEMM change written for Arc A-series. 1.6-2.6x per MoE layer for C20 on Xe2; the DG2 variant was only run with software DPAS | `GGML_SYCL_MMID_ESIMD=0` |
 | C30 | PR 30226 (closed unmerged) | q4_K MMVQ row pairing up to 8 columns | Speculative-decoding verify; Battlemage-gated, enable on DG2 with C90 bit 16 | C90 bit 16 off |
-| C40 | ef777/a770-qwen-xe1 `da7f577` | GQA flash-decode kernel, 1-8 tokens, q8_0/f16 KV, D=64/128/256 | VEC rereads K/V per query head; this reads each KV head once for all its query heads. Author on A770: 24k n1 520 -> 410 us, 12k n4 762 -> 404 us | `GGML_SYCL_FA_GQA_DEC=0` |
+| C40 | ef777/a770-qwen-xe1 `da7f577`, plus a local DG2 build fix | GQA flash-decode kernel, 1-8 tokens, q8_0/f16 KV, D=64/128/256 | VEC rereads K/V per query head; this reads each KV head once for all its query heads. Author on A770: 24k n1 520 -> 410 us, 12k n4 762 -> 404 us | `GGML_SYCL_FA_GQA_DEC=0` |
 | C50 | Frostbite1536/A770 `0a31dc7`, p11c F | TILE FA flushes its FP16 V accumulator to FP32 once per KV tile | Probable long-context accuracy fix: NMSE up to 2.3 at 16k keys per block, CPU OpenCL device only | none |
 | C51 | Frostbite1536/A770, patch 0005 | 16 biased-V FA test cases with an FP32 CPU reference | Tests C50; CPU FA changes only under the test reference flag | none |
 | C90 | local | `GGML_SYCL_DG2_BMG_TUNING` bit mask that opens five Battlemage-only kernel choices to DG2 | Each choice is between kernels already built for every device, so only speed can change | `GGML_SYCL_DG2_BMG_TUNING=0` (default) |
@@ -74,5 +74,23 @@ wins can become a plain DG2 entry in that gate.
 
 ## Build status of this group (2026-11-01)
 
-See the "Build check" section of `SYCL_DEV_LOG.md` for what was compiled for DG2 without
-a GPU, and what could only be checked statically.
+Compiled with oneAPI 2026.2 (conda-forge) on a box without an Intel GPU. Each
+risky translation unit was also built for `acm-g10` with `spir64_gen` (the SPIR-V
+the A770 compiles at JIT time) and its DG2 assembly read from IGC dumps:
+
+- C20/C21 `fused-gemm-esimd.cpp`: builds; every DPAS is `dpas.8x8 (8|M0)`. The
+  default 8-wide path is spill-free at 256 GRF, which the kernel requests. A
+  `GGML_SYCL_DEVICE_ARCH=acm-g10` build gets 128 GRF and spills 3.7-9 KB per
+  kernel, so measure with a JIT build.
+- C10/C30 `mmvq.cpp`: builds. Upstream's Xe2-only XMX MMVQ kernels in the same
+  file also compile for DG2, as 8-wide DPAS with spills; they stay gated off.
+- C40 `fattn-gqa-dec.cpp`: the original failed. The q8_0 D=256 SLM ESIMD kernel's
+  in-kernel `mask` null test made IGC 2.43 emit a 64-bit shift that DG2 cannot
+  execute, and that failed every ESIMD kernel in the file. C40 now tests `mask`
+  on the host; all 37 kernels build. At the 128 GRF of an AOT build, the D=256
+  SPMD and ESIMD variants spill (0.7-12 KB).
+- C50 TILE FA instance: builds.
+
+What was not checked: any number on real hardware. The CPU OpenCL device runs
+the SPMD kernels against the CPU reference (see `SYCL_DEV_LOG.md`), but not
+ESIMD, DPAS or joint_matrix.

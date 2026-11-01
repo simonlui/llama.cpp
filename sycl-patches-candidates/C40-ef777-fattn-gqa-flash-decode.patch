@@ -6,13 +6,16 @@ fattn-gqa-dec.cpp/.hpp and the fattn.cpp hook only (3 of 31 file diffs). The REA
 the patches are MIT like llama.cpp; the repo has no LICENSE file. One work-group per KV head
 serves all query heads that share it, for q8_0/f16 KV, D=64/128/256, no sinks or softcap.
 GGML_SYCL_FA_GQA_DEC=0 turns it off. Author timings are on an A770 under Windows.
+Local change: the q8_0 D=256 SLM ESIMD kernel tests mask on the host (has_mask). The in-kernel
+64-bit pointer compare made IGC 2.43 emit an unemulated 64-bit shift for acm-g10 ("Q destination
+data type is not supported"), which failed the whole ESIMD image for DG2.
 
 diff --git a/ggml/src/ggml-sycl/fattn-gqa-dec.cpp b/ggml/src/ggml-sycl/fattn-gqa-dec.cpp
 new file mode 100644
-index 00000000..461ef343
+index 00000000..c7a333e1
 --- /dev/null
 +++ b/ggml/src/ggml-sycl/fattn-gqa-dec.cpp
-@@ -0,0 +1,1342 @@
+@@ -0,0 +1,1344 @@
 +// GQA-grouped flash-attention decode for small query batches (1..4 tokens, e.g. a
 +// speculative-decoding verify), written for Xe-HPG (Arc A770).
 +//
@@ -685,6 +688,8 @@ index 00000000..461ef343
 +    const int     n_rg = rows / RT;  // threads per work-group
 +    const int     n_kvh = n_head / gqa;
 +    const int     tpf   = gqa_esimd_tile_pf();
++    // tested on the host: an in-kernel 64-bit pointer compare trips IGC's int64 emulation on DG2
++    const bool    has_mask = mask != nullptr;
 +
 +    stream->submit([&](sycl::handler & cgh) {
 +        cgh.parallel_for(
@@ -750,7 +755,7 @@ index 00000000..461ef343
 +                    simd<float, TP> s_t[RT];
 +#pragma unroll
 +                    for (int j = 0; j < RT; ++j) {
-+                        if (mask && np == TP) {
++                        if (has_mask && np == TP) {
 +                            simd<uint32_t, TP / 2> mr = block_load<uint32_t, TP / 2>(
 +                                (const uint32_t *) (mask + (size_t) tt[j] * nbm1 + (size_t) p * sizeof(sycl::half)));
 +                            s_t[j] = convert<float>(mr.template bit_cast_view<sycl::half>().read());
@@ -758,7 +763,7 @@ index 00000000..461ef343
 +#pragma unroll
 +                            for (int i = 0; i < TP; ++i) {
 +                                s_t[j][i] = i >= np ? -INFINITY
-+                                                    : (mask ? (float) ((const sycl::half *) (mask + (size_t) tt[j] * nbm1))[p + i] : 0.0f);
++                                                    : (has_mask ? (float) ((const sycl::half *) (mask + (size_t) tt[j] * nbm1))[p + i] : 0.0f);
 +                            }
 +                        }
 +                    }
@@ -1369,7 +1374,7 @@ index 00000000..59257b94
 +bool ggml_sycl_fattn_gqa_decode_supported(const ggml_tensor * dst);
 +void ggml_sycl_fattn_gqa_decode(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-sycl/fattn.cpp b/ggml/src/ggml-sycl/fattn.cpp
-index 1f692dc4..2c719622 100644
+index e76d97ba..0c306b13 100644
 --- a/ggml/src/ggml-sycl/fattn.cpp
 +++ b/ggml/src/ggml-sycl/fattn.cpp
 @@ -11,6 +11,7 @@
@@ -1380,7 +1385,7 @@ index 1f692dc4..2c719622 100644
  #include <sycl/sycl.hpp>
  #include "dpct/helper.hpp"
  #include "common.hpp"
-@@ -260,7 +261,8 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
+@@ -282,7 +283,8 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
                  }
              }
          } else {
@@ -1390,7 +1395,7 @@ index 1f692dc4..2c719622 100644
                  // TILE is faster for quantized KV decode on Xe2 (BMG); keep VEC on untested archs
                  const gpu_arch arch = ggml_sycl_info().devices[device].hw_info.arch;
                  if (arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31) {
-@@ -312,6 +314,11 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
+@@ -351,6 +353,11 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
                  (long long)V_dbg->ne[1]);
      }
  

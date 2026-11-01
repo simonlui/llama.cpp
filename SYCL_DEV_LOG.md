@@ -95,6 +95,33 @@ oneAPI came from conda-forge into `/opt/oneapi` on a GPU-less cloud box:
 - `__SYCL_TARGET_INTEL_GPU_ACM_G10__` is not defined under `spir64_gen
   -device acm-g10`, only under `-fsycl-targets=intel_gpu_acm_g10`, so code keyed
   on it (`FG_AOT_SG`) builds every width in a `GGML_SYCL_DEVICE_ARCH` build.
+- **Upstream XMX MMVQ (`mmvq.cpp`, Xe2-only gate)** also builds for DG2: 216
+  ESIMD kernels, all lowered to 8-wide DPAS, with spills. ESIMD `xmx::dpas`
+  is lowered correctly on DG2, just slowly. The silent-garbage risk is limited
+  to the OpenCL-style sub-group-16 builtins and hand-written `(M1, 16)` vISA
+  like `fattn-dpas.cpp`.
+- **`fused-gemm.cpp` (PR 30156) and a TILE FA instance (candidate C50)** build
+  for DG2.
+- **Extracted 0016 with `GGML_SYCL_MMQ_XMX=ON` did not build for DG2.** Its int8
+  tile was 8x16x32 at sub-group 16 (the Xe2 shape), and IGC 2.43 crashes on it
+  for `acm-g10` (floating point exception). The A/B in this log never noticed
+  because Q4_0 never reaches MMQ on the A770; the first K-quant MMQ call would
+  have crashed the JIT. 0016 now takes `GGML_SYCL_MMQ_XMX_SG` (16 default, 8 for
+  the A770): with 8, all 15 kernels compile to `dpas.8x8` for `acm-g10`, and the
+  JIT sub-group-16 build still compiles. `ggml_sycl_mmq_xmx_available()` now
+  checks the device reports the built int8 shape, so a mismatched build keeps
+  the regular MMQ path. Numerics of the 8-wide tile are unverified.
+- **Candidate C40 (ef777 GQA decode) did not build for DG2 as published.** The
+  q8_0 D=256 SLM ESIMD kernel's in-kernel `mask` null test made IGC emit a
+  64-bit shift (`shr ... 0x20:uq`, "Q destination data type is not supported"),
+  failing the whole ESIMD image with any GRF option. Testing `mask` on the host
+  fixes it; all 37 kernels build. ef777 ran it on an A770 under Windows, so
+  whether the original breaks depends on the driver's IGC.
+- **Running the backend on the CPU OpenCL device does not work** without porting
+  ggml-sycl to CPUs. A scratch hook that let `dpct::dev_mgr` pick the CPU got as
+  far as the first DMMV kernel (`UR_RESULT_ERROR_UNKNOWN`); FA died with a
+  floating point exception, likely from GPU-only device properties. No numeric
+  test of the SYCL kernels was possible here.
 
 ## Update (2026-11-01, upstream refresh to `dde879bc1`)
 
