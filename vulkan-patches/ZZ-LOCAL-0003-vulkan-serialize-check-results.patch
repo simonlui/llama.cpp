@@ -1,0 +1,26 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 576c0de14b5abb3d5e8e6fa577fe5ee997980c79..4b0fb304f62c6b007ad60eaad1d64e706e19ccf2 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -312,6 +312,10 @@ static bool vk_instance_initialized = false;
+ 
+ vk_instance_t vk_instance;
+ 
++#ifdef GGML_VULKAN_CHECK_RESULTS
++static std::mutex ggml_vk_check_results_mutex;
++#endif
++
+ static VkDeviceSize ggml_vk_get_max_buffer_range(const ggml_backend_vk_context * ctx, const vk_buffer &buf, const VkDeviceSize offset) {
+     const VkDeviceSize range = std::min(VkDeviceSize{buf->size - offset},
+                                         VkDeviceSize{ctx->device->properties.limits.maxStorageBufferRange});
+@@ -13891,6 +13895,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
+     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+ 
++#ifdef GGML_VULKAN_CHECK_RESULTS
++    std::lock_guard<std::mutex> check_results_lock(ggml_vk_check_results_mutex);
++#endif
++
+     ctx->device->diag_cgraph = nullptr;
+     ctx->device->diag_prev_start = -1;
+     ctx->device->diag_prev_end = -1;

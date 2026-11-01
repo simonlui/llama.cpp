@@ -1,0 +1,78 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-common.h b/ggml/src/ggml-vulkan/ggml-vulkan-common.h
+index a642c5516..8df1e0368 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-common.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-common.h
+@@ -246,6 +246,18 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
+ void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int tensor_idx);
+ #endif
+ 
++#ifdef GGML_VULKAN_CHECK_RESULTS
++extern size_t vk_skip_checks;
++extern size_t vk_output_tensor;
++void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int tensor_idx);
++void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int tensor_idx);
++#endif
++
++#ifdef GGML_VULKAN_RUN_TESTS
++void ggml_vk_test_matmul_f16_f32(ggml_backend_vk_context * ctx, size_t m, size_t n, size_t k, size_t batch, size_t num_it, int split_k, int shader_size);
++void ggml_vk_test_dequant_matmul(ggml_backend_vk_context * ctx, size_t m, size_t n, size_t k, size_t batch, size_t num_it, size_t split_k, size_t shader_size, ggml_type quant, bool mmq = false);
++#endif
++
+ // ggml-vulkan.cpp (residual)
+ bool ggml_vk_lightning_indexer_k_type_supported(ggml_type type);
+ void ggml_vk_print_device_fault_info(const vk_device& device);
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp b/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
+index 68ad01039..2bea28d09 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
+@@ -51,6 +51,8 @@ size_t vk_skip_checks;
+ size_t vk_output_tensor;
+ 
+ static void ggml_vk_print_tensor(const ggml_tensor * tensor, const char * name);
++void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int tensor_idx);
++void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int tensor_idx);
+ #endif
+ 
+ #ifdef GGML_VULKAN_RUN_TESTS
+@@ -295,7 +297,9 @@ void ggml_vk_test_matmul(ggml_backend_vk_context * ctx, size_t m, size_t n, size
+     free(d);
+ }
+ 
+-template void ggml_vk_test_matmul<ggml_fp16_t, float>(ggml_backend_vk_context * ctx, size_t m, size_t n, size_t k, size_t batch, size_t num_it, int split_k, int shader_size);
++void ggml_vk_test_matmul_f16_f32(ggml_backend_vk_context * ctx, size_t m, size_t n, size_t k, size_t batch, size_t num_it, int split_k, int shader_size) {
++    ggml_vk_test_matmul<ggml_fp16_t, float>(ctx, m, n, k, batch, num_it, split_k, shader_size);
++}
+ 
+ static void ggml_vk_print_tensor_area(const ggml_tensor * tensor, int i0, int i1, int i2, int i3) {
+     if (tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_F16) {
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 3bdc01440..61c585156 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -12167,17 +12167,17 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
+     abort();
+ 
+     for (size_t i = 0; i < vals.size(); i += 3) {
+-        ggml_vk_test_matmul<ggml_fp16_t, float>(ctx, vals[i], vals[i + 1], vals[i + 2], 2, num_it, 1, 0);
+-        ggml_vk_test_matmul<ggml_fp16_t, float>(ctx, vals[i], vals[i + 1], vals[i + 2], 2, num_it, 1, 1);
+-        ggml_vk_test_matmul<ggml_fp16_t, float>(ctx, vals[i], vals[i + 1], vals[i + 2], 2, num_it, 1, 2);
++        ggml_vk_test_matmul_f16_f32(ctx, vals[i], vals[i + 1], vals[i + 2], 2, num_it, 1, 0);
++        ggml_vk_test_matmul_f16_f32(ctx, vals[i], vals[i + 1], vals[i + 2], 2, num_it, 1, 1);
++        ggml_vk_test_matmul_f16_f32(ctx, vals[i], vals[i + 1], vals[i + 2], 2, num_it, 1, 2);
+         std::cerr << '\n';
+-        ggml_vk_test_matmul<ggml_fp16_t, float>(ctx, vals[i], vals[i + 1], vals[i + 2], 2, num_it, 2, 0);
+-        ggml_vk_test_matmul<ggml_fp16_t, float>(ctx, vals[i], vals[i + 1], vals[i + 2], 2, num_it, 2, 1);
+-        ggml_vk_test_matmul<ggml_fp16_t, float>(ctx, vals[i], vals[i + 1], vals[i + 2], 2, num_it, 2, 2);
++        ggml_vk_test_matmul_f16_f32(ctx, vals[i], vals[i + 1], vals[i + 2], 2, num_it, 2, 0);
++        ggml_vk_test_matmul_f16_f32(ctx, vals[i], vals[i + 1], vals[i + 2], 2, num_it, 2, 1);
++        ggml_vk_test_matmul_f16_f32(ctx, vals[i], vals[i + 1], vals[i + 2], 2, num_it, 2, 2);
+         std::cerr << '\n';
+-        ggml_vk_test_matmul<ggml_fp16_t, float>(ctx, vals[i], vals[i + 1], vals[i + 2], 2, num_it, 4, 0);
+-        ggml_vk_test_matmul<ggml_fp16_t, float>(ctx, vals[i], vals[i + 1], vals[i + 2], 2, num_it, 4, 1);
+-        ggml_vk_test_matmul<ggml_fp16_t, float>(ctx, vals[i], vals[i + 1], vals[i + 2], 2, num_it, 4, 2);
++        ggml_vk_test_matmul_f16_f32(ctx, vals[i], vals[i + 1], vals[i + 2], 2, num_it, 4, 0);
++        ggml_vk_test_matmul_f16_f32(ctx, vals[i], vals[i + 1], vals[i + 2], 2, num_it, 4, 1);
++        ggml_vk_test_matmul_f16_f32(ctx, vals[i], vals[i + 1], vals[i + 2], 2, num_it, 4, 2);
+         std::cerr << '\n' << std::endl;
+ 
+         if (vals[i + 2] % 32 == 0) {

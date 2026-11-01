@@ -1,0 +1,36 @@
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index fe856d4bb..68648e1aa 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -4774,7 +4774,7 @@ static void ggml_sycl_conv_3d(ggml_backend_sycl_context & ctx, ggml_tensor * dst
+ 
+ static void ggml_sycl_sum(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
+-    GGML_ASSERT(ggml_is_contiguous(dst->src[0]));
++    GGML_ASSERT(ggml_is_contiguous_rows(dst->src[0]));
+     ggml_sycl_op_sum(ctx, dst);
+ }
+ 
+@@ -5838,9 +5838,13 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
+         case GGML_OP_LOG:
+         case GGML_OP_NORM:
+         case GGML_OP_L2_NORM:
+-        case GGML_OP_GROUP_NORM:
+         case GGML_OP_RMS_NORM:
+             return true;
++        case GGML_OP_GROUP_NORM:
++            // Unlike NORM/L2_NORM/RMS_NORM (stride-generic since upstream #25044),
++            // the group_norm kernel still assumes a fully-packed layout
++            // (group_size computed as ne0*ne1*ne2 with no stride params).
++            return ggml_is_contiguous(op->src[0]);
+         case GGML_OP_RMS_NORM_BACK:
+             return ggml_is_contiguous(op->src[0]);
+         case GGML_OP_SCALE:
+@@ -5884,6 +5888,7 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
+                    ggml_is_contiguous(op->src[0]) &&
+                    ggml_is_contiguous(op->src[1]);
+         case GGML_OP_SUM:
++            return ggml_is_contiguous_rows(op->src[0]);
+         case GGML_OP_SUM_ROWS:
+         case GGML_OP_MEAN:
+             return ggml_is_contiguous(op->src[0]);

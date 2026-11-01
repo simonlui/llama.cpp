@@ -1,0 +1,44 @@
+diff --git a/ggml/src/ggml-sycl/mmq.cpp b/ggml/src/ggml-sycl/mmq.cpp
+index ffb272aa2..bd6b2c8b3 100644
+--- a/ggml/src/ggml-sycl/mmq.cpp
++++ b/ggml/src/ggml-sycl/mmq.cpp
+@@ -1284,7 +1284,7 @@ mul_mat_q(const void *__restrict__ vx, const void *__restrict__ vy,
+             sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
+             better performance if there is no access to global memory.
+             */
+-            item_ct1.barrier();
++            item_ct1.barrier(sycl::access::fence_space::local_space);
+ 
+ // #pragma unroll // unrolling this loop causes too much register pressure
+             for (int k = ir*WARP_SIZE/qr; k < (ir+1)*WARP_SIZE/qr; k += vdr) {
+@@ -1309,7 +1309,7 @@ mul_mat_q(const void *__restrict__ vx, const void *__restrict__ vy,
+             sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
+             better performance if there is no access to global memory.
+             */
+-            item_ct1.barrier();
++            item_ct1.barrier(sycl::access::fence_space::local_space);
+         }
+     }
+ 
+diff --git a/ggml/src/ggml-sycl/norm.cpp b/ggml/src/ggml-sycl/norm.cpp
+index 09fce1280..ee0fde1f1 100644
+--- a/ggml/src/ggml-sycl/norm.cpp
++++ b/ggml/src/ggml-sycl/norm.cpp
+@@ -94,7 +94,7 @@ static void group_norm_f32(const float* x, float* dst, const int group_size, con
+         sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
+         better performance if there is no access to global memory.
+         */
+-        item_ct1.barrier();
++        item_ct1.barrier(sycl::access::fence_space::local_space);
+         tmp = 0.f;
+         for (size_t i = 0; i < nreduce; i += 1)
+         {
+@@ -129,7 +129,7 @@ static void group_norm_f32(const float* x, float* dst, const int group_size, con
+         sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
+         better performance if there is no access to global memory.
+         */
+-        item_ct1.barrier();
++        item_ct1.barrier(sycl::access::fence_space::local_space);
+         tmp = 0.f;
+         for (size_t i = 0; i < nreduce; i += 1)
+         {

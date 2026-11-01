@@ -1,0 +1,728 @@
+diff --git a/ggml/src/ggml-sycl/binbcast.cpp b/ggml/src/ggml-sycl/binbcast.cpp
+index 306eeddc0..0c60c0cf1 100644
+--- a/ggml/src/ggml-sycl/binbcast.cpp
++++ b/ggml/src/ggml-sycl/binbcast.cpp
+@@ -220,9 +220,6 @@ struct bin_bcast_sycl {
+                 // this is the maximum number of blocks in z direction, fallback to 1D grid kernel
+                 int block_num = (ne0*ne1*ne2*ne3 + block_size - 1) / block_size;
+                 {
+-                    dpct::has_capability_or_fail(stream->get_device(),
+-                                                 {sycl::aspect::fp16});
+-
+                     stream->parallel_for(
+                         sycl::nd_range<3>(sycl::range<3>(1, 1, block_num) *
+                                               sycl::range<3>(1, 1, block_size),
+@@ -241,9 +238,6 @@ struct bin_bcast_sycl {
+                 info::device::max_work_group_size. Adjust the work-group size if
+                 needed.
+                 */
+-                dpct::has_capability_or_fail(stream->get_device(),
+-                                             {sycl::aspect::fp16});
+-
+                 stream->parallel_for(
+                     sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                     [=](sycl::nd_item<3> item_ct1) {
+diff --git a/ggml/src/ggml-sycl/convert.cpp b/ggml/src/ggml-sycl/convert.cpp
+index 9ec927695..934cc7b0b 100644
+--- a/ggml/src/ggml-sycl/convert.cpp
++++ b/ggml/src/ggml-sycl/convert.cpp
+@@ -30,10 +30,7 @@ static void dequantize_block_sycl(const void *__restrict__ vx,
+                                   dst_t *__restrict__ y, const int64_t k,
+                                   dpct::queue_ptr stream) {
+     const int64_t num_blocks = (k + 2*SYCL_DEQUANTIZE_BLOCK_SIZE - 1) / (2*SYCL_DEQUANTIZE_BLOCK_SIZE);
+-    {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-        stream->parallel_for(
++    {        stream->parallel_for(
+             sycl::nd_range<3>(
+                 sycl::range<3>(1, 1, num_blocks) *
+                     sycl::range<3>(1, 1, SYCL_DEQUANTIZE_BLOCK_SIZE),
+@@ -50,9 +47,6 @@ static void dequantize_row_q2_K_sycl(const void *vx, dst_t *y, const int64_t k,
+     const int64_t nb = k / QK_K;
+ #if QK_K == 256
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                    sycl::range<3>(1, 1, 64),
+                                                sycl::range<3>(1, 1, 64)),
+@@ -62,9 +56,6 @@ static void dequantize_row_q2_K_sycl(const void *vx, dst_t *y, const int64_t k,
+     }
+ #else
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                    sycl::range<3>(1, 1, 32),
+                                                sycl::range<3>(1, 1, 32)),
+@@ -82,9 +73,6 @@ static void dequantize_row_q3_K_sycl(const void *vx, dst_t *y, const int64_t k,
+     const int64_t nb = k / QK_K;
+ #if QK_K == 256
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                    sycl::range<3>(1, 1, 64),
+                                                sycl::range<3>(1, 1, 64)),
+@@ -94,9 +82,6 @@ static void dequantize_row_q3_K_sycl(const void *vx, dst_t *y, const int64_t k,
+     }
+ #else
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                    sycl::range<3>(1, 1, 32),
+                                                sycl::range<3>(1, 1, 32)),
+@@ -126,9 +111,6 @@ static void dequantize_row_q4_0_sycl(const void *vx, dst_t *y, const int64_t k,
+     const int64_t nb32 = k / 32;
+     const int64_t nb = (k + 255) / 256;
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                    sycl::range<3>(1, 1, 32),
+                                                sycl::range<3>(1, 1, 32)),
+@@ -141,10 +123,6 @@ static void dequantize_row_q4_0_sycl(const void *vx, dst_t *y, const int64_t k,
+ template <typename dst_t>
+ static void dequantize_row_q4_0_sycl_reorder(const void *vx, dst_t *y, const int64_t k,
+                                      dpct::queue_ptr stream) {
+-
+-    dpct::has_capability_or_fail(stream->get_device(),
+-                                    {sycl::aspect::fp16});
+-
+     int constexpr WARP_K = WARP_SIZE * QK4_0;
+     const int n_warp = (k + WARP_K - 1) / WARP_K;
+     GGML_ASSERT(k % 2 == 0);
+@@ -160,10 +138,6 @@ static void dequantize_row_q4_0_sycl_reorder(const void *vx, dst_t *y, const int
+ template <typename dst_t>
+ static void dequantize_row_q8_0_sycl_reorder(const void *vx, dst_t *y, const int64_t k,
+                                      dpct::queue_ptr stream) {
+-
+-    dpct::has_capability_or_fail(stream->get_device(),
+-                                    {sycl::aspect::fp16});
+-
+     int constexpr WARP_K = WARP_SIZE * QK8_0;
+     const int n_warp = (k + WARP_K - 1) / WARP_K;
+     GGML_ASSERT(k % QK8_0 == 0);
+@@ -182,9 +156,6 @@ static void dequantize_row_q4_1_sycl(const void *vx, dst_t *y, const int64_t k,
+     const int64_t nb32 = k / 32;
+     const int64_t nb = (k + 255) / 256;
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                    sycl::range<3>(1, 1, 32),
+                                                sycl::range<3>(1, 1, 32)),
+@@ -200,9 +171,6 @@ static void dequantize_row_q4_K_sycl(const void *vx, dst_t *y, const int64_t k,
+                                      dpct::queue_ptr stream) {
+     const int64_t nb = k / QK_K;
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->submit([&](sycl::handler &cgh) {
+             sycl::local_accessor<uint8_t, 1> scale_local_acc(sycl::range<1>(12), cgh);
+             cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+@@ -220,9 +188,6 @@ static void dequantize_row_q4_K_sycl_reorder(const void * vx, dst_t * y, const i
+     const int64_t nb = k / QK_K;
+     const size_t  local_size  = 32;
+     const size_t  global_size = nb * local_size;
+-
+-    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+-
+     stream->submit([&](sycl::handler & cgh) {
+         sycl::local_accessor<uint8_t, 1> scale_local_acc(sycl::range<1>(12), cgh);
+ 
+@@ -239,9 +204,6 @@ static void dequantize_row_q5_K_sycl(const void *vx, dst_t *y, const int64_t k,
+     const int64_t nb = k / QK_K;
+ #if QK_K == 256
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                    sycl::range<3>(1, 1, 64),
+                                                sycl::range<3>(1, 1, 64)),
+@@ -251,9 +213,6 @@ static void dequantize_row_q5_K_sycl(const void *vx, dst_t *y, const int64_t k,
+     }
+ #else
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                    sycl::range<3>(1, 1, 32),
+                                                sycl::range<3>(1, 1, 32)),
+@@ -268,9 +227,6 @@ static void dequantize_row_q5_K_sycl(const void *vx, dst_t *y, const int64_t k,
+ template <typename dst_t>
+ static void dequantize_row_q5_K_sycl_reorder(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
+     const int64_t nb = k / QK_K;
+-
+-    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+-
+     stream->submit([&](sycl::handler & cgh) {
+         sycl::local_accessor<uint8_t, 1> scale_local_acc(sycl::range<1>(K_SCALE_SIZE), cgh);
+ 
+@@ -288,9 +244,6 @@ static void dequantize_row_q6_K_sycl(const void *vx, dst_t *y, const int64_t k,
+     const int64_t nb = k / QK_K;
+ #if QK_K == 256
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                    sycl::range<3>(1, 1, 64),
+                                                sycl::range<3>(1, 1, 64)),
+@@ -300,9 +253,6 @@ static void dequantize_row_q6_K_sycl(const void *vx, dst_t *y, const int64_t k,
+     }
+ #else
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                    sycl::range<3>(1, 1, 32),
+                                                sycl::range<3>(1, 1, 32)),
+@@ -317,9 +267,6 @@ static void dequantize_row_q6_K_sycl(const void *vx, dst_t *y, const int64_t k,
+ template <typename dst_t>
+ static void dequantize_row_q6_K_sycl_reorder(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
+     const int64_t nb = k / QK_K;
+-
+-    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+-
+     stream->parallel_for(
+         sycl::nd_range<3>(sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, 64), sycl::range<3>(1, 1, 64)),
+         [=](sycl::nd_item<3> item_ct1) { dequantize_block_q6_K_reorder(vx, y, item_ct1, nb); });
+@@ -330,9 +277,6 @@ static void dequantize_row_iq1_s_sycl(const void *vx, dst_t *y, const int64_t k,
+                                         dpct::queue_ptr stream) {
+     const int64_t nb = k / QK_K;
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->submit([&](sycl::handler &cgh) {
+             cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                    sycl::range<3>(1, 1, 32),
+@@ -351,9 +295,6 @@ static void dequantize_row_iq1_m_sycl(const void *vx, dst_t *y, const int64_t k,
+                                         dpct::queue_ptr stream) {
+     const int64_t nb = k / QK_K;
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->submit([&](sycl::handler &cgh) {
+             cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                    sycl::range<3>(1, 1, 32),
+@@ -372,9 +313,6 @@ static void dequantize_row_iq2_xxs_sycl(const void *vx, dst_t *y, const int64_t
+                                         dpct::queue_ptr stream) {
+     const int64_t nb = k / QK_K;
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->submit([&](sycl::handler &cgh) {
+             cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                    sycl::range<3>(1, 1, 32),
+@@ -393,9 +331,6 @@ static void dequantize_row_iq2_xs_sycl(const void *vx, dst_t *y, const int64_t k
+                                        dpct::queue_ptr stream) {
+     const int64_t nb = k / QK_K;
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->submit([&](sycl::handler &cgh) {
+             cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                    sycl::range<3>(1, 1, 32),
+@@ -414,9 +349,6 @@ static void dequantize_row_iq2_s_sycl(const void *vx, dst_t *y, const int64_t k,
+                                       dpct::queue_ptr stream) {
+     const int64_t nb = k / QK_K;
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->submit([&](sycl::handler &cgh) {
+             cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                    sycl::range<3>(1, 1, 32),
+@@ -434,9 +366,6 @@ static void dequantize_row_iq3_xxs_sycl(const void *vx, dst_t *y, const int64_t
+                                         dpct::queue_ptr stream) {
+     const int64_t nb = k / QK_K;
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->submit([&](sycl::handler &cgh) {
+             cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                    sycl::range<3>(1, 1, 32),
+@@ -455,9 +384,6 @@ static void dequantize_row_iq3_s_sycl(const void *vx, dst_t *y, const int64_t k,
+                                         dpct::queue_ptr stream) {
+     const int64_t nb = k / QK_K;
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->submit([&](sycl::handler &cgh) {
+             cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                    sycl::range<3>(1, 1, 32),
+@@ -478,9 +404,6 @@ static void dequantize_row_iq4_xs_sycl(const void *vx, dst_t *y, const int64_t k
+     dequantize_row_iq4_nl_sycl(vx, y, k, stream);
+ #else
+       {
+-            dpct::has_capability_or_fail(stream->get_device(),
+-                                         {sycl::aspect::fp16});
+-
+             stream->submit([&](sycl::handler &cgh) {
+                   cgh.parallel_for(
+                       sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+@@ -499,9 +422,6 @@ static void dequantize_row_iq4_nl_sycl(const void *vx, dst_t *y, const int64_t k
+                                        dpct::queue_ptr stream) {
+     const int64_t nb = (k + QK_K - 1) / QK_K;
+       {
+-            dpct::has_capability_or_fail(stream->get_device(),
+-                                         {sycl::aspect::fp16});
+-
+             stream->submit([&](sycl::handler &cgh) {
+                   cgh.parallel_for(
+                       sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+@@ -620,8 +540,6 @@ template <typename src_t, typename dst_t>
+ static void convert_unary_nc_sycl(const void * __restrict__ vx, dst_t * __restrict__ y,
+                                   const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+                                   const int64_t s01, const int64_t s02, const int64_t s03, dpct::queue_ptr queue) {
+-    dpct::has_capability_or_fail(queue->get_device(), { sycl::aspect::fp16 });
+-
+     sycl::range<3> global_size(ne02 * ne03, ne01, ceil_div(ne00, SYCL_DEQUANTIZE_BLOCK_SIZE));
+ 
+     // decrease global range when it exceeds the max int
+diff --git a/ggml/src/ggml-sycl/cpy.cpp b/ggml/src/ggml-sycl/cpy.cpp
+index 55e076172..289867196 100644
+--- a/ggml/src/ggml-sycl/cpy.cpp
++++ b/ggml/src/ggml-sycl/cpy.cpp
+@@ -264,8 +264,6 @@ static void ggml_cpy_f16_f32_sycl(const char * cx, char * cdst, const int ne, co
+                                   const int nb12, const int nb13, queue_ptr stream) {
+     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
+     {
+-        dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+-
+         stream->parallel_for(
+             sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
+                               sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
+@@ -282,8 +280,6 @@ static void ggml_cpy_f32_f32_sycl(const char * cx, char * cdst, const int ne, co
+                                   const int nb12, const int nb13, queue_ptr stream) {
+     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
+     {
+-        dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+-
+         stream->parallel_for(
+             sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
+                               sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
+@@ -300,8 +296,6 @@ static void ggml_cpy_f32_f16_sycl(const char * cx, char * cdst, const int ne, co
+                                   const int nb12, const int nb13, queue_ptr stream) {
+     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
+     {
+-        dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+-
+         stream->parallel_for(
+             sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
+                               sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
+@@ -795,8 +789,6 @@ static void ggml_cpy_f16_f16_sycl(const char * cx, char * cdst, const int ne, co
+                                   const int nb12, const int nb13, queue_ptr stream) {
+     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
+     {
+-        dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+-
+         stream->parallel_for(
+             sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
+                               sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
+@@ -813,9 +805,6 @@ static void ggml_cpy_i16_i16_sycl(const char * cx, char * cdst, const int ne, co
+                                   const int nb12, const int nb13, queue_ptr stream) {
+     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
+     {
+-        // dpct::has_capability_or_fail(stream->get_device(),
+-        //                              {sycl::aspect::fp16});
+-
+         stream->parallel_for(
+             sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
+                               sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
+@@ -832,9 +821,6 @@ static void ggml_cpy_i32_i32_sycl(const char * cx, char * cdst, const int ne, co
+                                   const int nb12, const int nb13, queue_ptr stream) {
+     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
+     {
+-        // dpct::has_capability_or_fail(stream->get_device(),
+-        //                              {sycl::aspect::fp16});
+-
+         stream->parallel_for(
+             sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
+                               sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
+diff --git a/ggml/src/ggml-sycl/dmmv.cpp b/ggml/src/ggml-sycl/dmmv.cpp
+index ee7cd2d48..981b74bd3 100644
+--- a/ggml/src/ggml-sycl/dmmv.cpp
++++ b/ggml/src/ggml-sycl/dmmv.cpp
+@@ -222,9 +222,6 @@ static void convert_mul_mat_vec_f16_sycl(const void *vx, const dfloat *y,
+     const sycl::range<3> block_nums(1, 1, block_num_y);
+     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->parallel_for(
+             sycl::nd_range<3>(block_nums * block_dims, block_dims),
+             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+@@ -1492,9 +1489,6 @@ static void dequantize_mul_mat_vec_q4_0_sycl_reorder(const void *vx, const dfloa
+     const sycl::range<3> block_nums(1, 1, block_num_y);
+     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->parallel_for(
+             sycl::nd_range<3>(block_nums * block_dims, block_dims),
+             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+@@ -1515,9 +1509,6 @@ static void dequantize_mul_mat_vec_q4_0_sycl(const void *vx, const dfloat *y,
+     const sycl::range<3> block_nums(1, 1, block_num_y);
+     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->parallel_for(
+             sycl::nd_range<3>(block_nums * block_dims, block_dims),
+             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+@@ -1537,9 +1528,6 @@ static void dequantize_mul_mat_vec_q1_0_sycl_reorder(const void *vx, const dfloa
+     const sycl::range<3> block_nums(1, 1, block_num_y);
+     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->parallel_for(
+             sycl::nd_range<3>(block_nums * block_dims, block_dims),
+             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+@@ -1559,9 +1547,6 @@ static void dequantize_mul_mat_vec_q1_0_sycl(const void *vx, const dfloat *y,
+     const sycl::range<3> block_nums(1, 1, block_num_y);
+     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->parallel_for(
+             sycl::nd_range<3>(block_nums * block_dims, block_dims),
+             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+@@ -1580,9 +1565,6 @@ static void dequantize_mul_mat_vec_q4_1_sycl(const void *vx, const dfloat *y,
+     const sycl::range<3> block_nums(1, 1, block_num_y);
+     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->parallel_for(
+             sycl::nd_range<3>(block_nums * block_dims, block_dims),
+             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+@@ -1601,9 +1583,6 @@ static void dequantize_mul_mat_vec_q5_0_sycl(const void *vx, const dfloat *y,
+     const sycl::range<3> block_nums(1, 1, block_num_y);
+     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->parallel_for(
+             sycl::nd_range<3>(block_nums * block_dims, block_dims),
+             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+diff --git a/ggml/src/ggml-sycl/fattn-common.hpp b/ggml/src/ggml-sycl/fattn-common.hpp
+index c6cc13cfb..c011d53da 100644
+--- a/ggml/src/ggml-sycl/fattn-common.hpp
++++ b/ggml/src/ggml-sycl/fattn-common.hpp
+@@ -1022,8 +1022,6 @@ void launch_fattn(
+ 
+         KV_max.alloc(ne_KV_max);
+         {
+-            dpct::has_capability_or_fail(main_stream->get_device(), { sycl::aspect::fp16 });
+-
+             main_stream->submit([&](sycl::handler & cgh) {
+                 sycl::local_accessor<int, 1> buf_iw_acc_ct1(sycl::range<1>(warp_size), cgh);
+ 
+diff --git a/ggml/src/ggml-sycl/getrows.cpp b/ggml/src/ggml-sycl/getrows.cpp
+index 2113f3563..8abb9f88a 100644
+--- a/ggml/src/ggml-sycl/getrows.cpp
++++ b/ggml/src/ggml-sycl/getrows.cpp
+@@ -230,9 +230,6 @@ static void get_rows_sycl_float(ggml_backend_sycl_context & ctx, const ggml_tens
+     //const size_t s13 = nb13 / ggml_element_size(src1);
+ 
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->parallel_for(
+             sycl::nd_range<3>(block_nums * block_dims, block_dims),
+             [=](sycl::nd_item<3> item_ct1) {
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 18d58782e..dd884d3fa 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -2072,9 +2072,6 @@ static void ggml_mul_mat_p021_f16_f32_sycl(const void *vx, const float *y,
+     const sycl::range<3> block_nums(nchannels_y, nrows_x, 1);
+     const sycl::range<3> block_dims(1, 1, WARP_SIZE);
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->parallel_for(
+             sycl::nd_range<3>(block_nums * block_dims, block_dims),
+             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+@@ -2092,9 +2089,6 @@ static void ggml_mul_mat_vec_nc_f16_f32_sycl(
+     const sycl::range<3> block_nums(nchannels_y, nrows_x, 1);
+     const sycl::range<3> block_dims(1, 1, WARP_SIZE);
+     {
+-        dpct::has_capability_or_fail(stream->get_device(),
+-                                     {sycl::aspect::fp16});
+-
+         stream->parallel_for(
+             sycl::nd_range<3>(block_nums * block_dims, block_dims),
+             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+@@ -3447,9 +3441,6 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
+ 
+     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+     queue_ptr queue = ctx.stream();
+-
+-    dpct::has_capability_or_fail(queue->get_device(), { sycl::aspect::fp16 });
+-
+     const sycl::half * src0_f16 = static_cast<const sycl::half *>(src0->data);
+     float *            dst_ddf  = static_cast<float *>(dst->data);
+ 
+diff --git a/ggml/src/ggml-sycl/mmq.cpp b/ggml/src/ggml-sycl/mmq.cpp
+index ffb272aa2..27c84b640 100644
+--- a/ggml/src/ggml-sycl/mmq.cpp
++++ b/ggml/src/ggml-sycl/mmq.cpp
+@@ -1815,9 +1815,6 @@ static void ggml_mul_mat_q4_0_q8_1_sycl(const void *vx, const void *vy,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         {
+-            dpct::has_capability_or_fail(stream->get_device(),
+-                                         {sycl::aspect::fp16});
+-
+             stream->submit([&](sycl::handler &cgh) {
+                 sycl::local_accessor<int, 1> tile_x_qs_q4_0_acc_ct1(
+                     sycl::range<1>(mmq_y * (WARP_SIZE) + mmq_y), cgh);
+@@ -1850,9 +1847,6 @@ static void ggml_mul_mat_q4_0_q8_1_sycl(const void *vx, const void *vy,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         {
+-            dpct::has_capability_or_fail(stream->get_device(),
+-                                         {sycl::aspect::fp16});
+-
+             stream->submit([&](sycl::handler &cgh) {
+                 sycl::local_accessor<int, 1> tile_x_qs_q4_0_acc_ct1(
+                     sycl::range<1>(mmq_y * (WARP_SIZE) + mmq_y), cgh);
+@@ -1930,9 +1924,6 @@ static void ggml_mul_mat_q4_1_q8_1_sycl(const void *vx, const void *vy,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         {
+-            dpct::has_capability_or_fail(stream->get_device(),
+-                                         {sycl::aspect::fp16});
+-
+             stream->submit([&](sycl::handler &cgh) {
+                 sycl::local_accessor<int, 1> tile_x_qs_q4_1_acc_ct1(
+                     sycl::range<1>(mmq_y * (WARP_SIZE) + +mmq_y), cgh);
+@@ -1965,9 +1956,6 @@ static void ggml_mul_mat_q4_1_q8_1_sycl(const void *vx, const void *vy,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         {
+-            dpct::has_capability_or_fail(stream->get_device(),
+-                                         {sycl::aspect::fp16});
+-
+             stream->submit([&](sycl::handler &cgh) {
+                 sycl::local_accessor<int, 1> tile_x_qs_q4_1_acc_ct1(
+                     sycl::range<1>(mmq_y * (WARP_SIZE) + +mmq_y), cgh);
+@@ -2045,9 +2033,6 @@ static void ggml_mul_mat_q5_0_q8_1_sycl(const void *vx, const void *vy,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         {
+-            dpct::has_capability_or_fail(stream->get_device(),
+-                                         {sycl::aspect::fp16});
+-
+             stream->submit([&](sycl::handler &cgh) {
+                 sycl::local_accessor<int, 1> tile_x_ql_q5_0_acc_ct1(
+                     sycl::range<1>(mmq_y * (2 * WARP_SIZE) + mmq_y), cgh);
+@@ -2080,9 +2065,6 @@ static void ggml_mul_mat_q5_0_q8_1_sycl(const void *vx, const void *vy,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         {
+-            dpct::has_capability_or_fail(stream->get_device(),
+-                                         {sycl::aspect::fp16});
+-
+             stream->submit([&](sycl::handler &cgh) {
+                 sycl::local_accessor<int, 1> tile_x_ql_q5_0_acc_ct1(
+                     sycl::range<1>(mmq_y * (2 * WARP_SIZE) + mmq_y), cgh);
+@@ -2160,9 +2142,6 @@ static void ggml_mul_mat_q5_1_q8_1_sycl(const void *vx, const void *vy,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         {
+-            dpct::has_capability_or_fail(stream->get_device(),
+-                                         {sycl::aspect::fp16});
+-
+             stream->submit([&](sycl::handler &cgh) {
+                 sycl::local_accessor<int, 1> tile_x_ql_q5_1_acc_ct1(
+                     sycl::range<1>(mmq_y * (2 * WARP_SIZE) + mmq_y), cgh);
+@@ -2195,9 +2174,6 @@ static void ggml_mul_mat_q5_1_q8_1_sycl(const void *vx, const void *vy,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         {
+-            dpct::has_capability_or_fail(stream->get_device(),
+-                                         {sycl::aspect::fp16});
+-
+             stream->submit([&](sycl::handler &cgh) {
+                 sycl::local_accessor<int, 1> tile_x_ql_q5_1_acc_ct1(
+                     sycl::range<1>(mmq_y * (2 * WARP_SIZE) + mmq_y), cgh);
+@@ -2275,9 +2251,6 @@ static void ggml_mul_mat_q8_0_q8_1_sycl(const void *vx, const void *vy,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         {
+-            dpct::has_capability_or_fail(stream->get_device(),
+-                                         {sycl::aspect::fp16});
+-
+             stream->submit([&](sycl::handler &cgh) {
+                 sycl::local_accessor<int, 1> tile_x_qs_q8_0_acc_ct1(
+                     sycl::range<1>(mmq_y * (WARP_SIZE) + mmq_y), cgh);
+@@ -2310,9 +2283,6 @@ static void ggml_mul_mat_q8_0_q8_1_sycl(const void *vx, const void *vy,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         {
+-            dpct::has_capability_or_fail(stream->get_device(),
+-                                         {sycl::aspect::fp16});
+-
+             stream->submit([&](sycl::handler &cgh) {
+                 sycl::local_accessor<int, 1> tile_x_qs_q8_0_acc_ct1(
+                     sycl::range<1>(mmq_y * (WARP_SIZE) + mmq_y), cgh);
+@@ -2390,9 +2360,6 @@ static void ggml_mul_mat_q2_K_q8_1_sycl(const void *vx, const void *vy,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         {
+-            dpct::has_capability_or_fail(stream->get_device(),
+-                                         {sycl::aspect::fp16});
+-
+             stream->submit([&](sycl::handler &cgh) {
+                 sycl::local_accessor<int, 1> tile_x_ql_q2_K_acc_ct1(
+                     sycl::range<1>(mmq_y * (WARP_SIZE) + mmq_y), cgh);
+@@ -2428,9 +2395,6 @@ static void ggml_mul_mat_q2_K_q8_1_sycl(const void *vx, const void *vy,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         {
+-            dpct::has_capability_or_fail(stream->get_device(),
+-                                         {sycl::aspect::fp16});
+-
+             stream->submit([&](sycl::handler &cgh) {
+                 sycl::local_accessor<int, 1> tile_x_ql_q2_K_acc_ct1(
+                     sycl::range<1>(mmq_y * (WARP_SIZE) + mmq_y), cgh);
+@@ -2513,9 +2477,6 @@ static void ggml_mul_mat_q3_K_q8_1_sycl(const void *vx, const void *vy,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         {
+-            dpct::has_capability_or_fail(stream->get_device(),
+-                                         {sycl::aspect::fp16});
+-
+             stream->submit([&](sycl::handler &cgh) {
+                 sycl::local_accessor<int, 1> tile_x_ql_q3_K_acc_ct1(
+                     sycl::range<1>(mmq_y * (WARP_SIZE) + mmq_y), cgh);
+@@ -2554,9 +2515,6 @@ static void ggml_mul_mat_q3_K_q8_1_sycl(const void *vx, const void *vy,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         {
+-            dpct::has_capability_or_fail(stream->get_device(),
+-                                         {sycl::aspect::fp16});
+-
+             stream->submit([&](sycl::handler &cgh) {
+                 sycl::local_accessor<int, 1> tile_x_ql_q3_K_acc_ct1(
+                     sycl::range<1>(mmq_y * (WARP_SIZE) + mmq_y), cgh);
+@@ -2641,9 +2599,6 @@ static void ggml_mul_mat_q4_K_q8_1_sycl(const void *vx, const void *vy,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         {
+-            dpct::has_capability_or_fail(stream->get_device(),
+-                                         {sycl::aspect::fp16});
+-
+             stream->submit([&](sycl::handler &cgh) {
+                 sycl::local_accessor<int, 1> tile_x_ql_q4_K_acc_ct1(
+                     sycl::range<1>(mmq_y * (WARP_SIZE) + mmq_y), cgh);
+@@ -2679,9 +2634,6 @@ static void ggml_mul_mat_q4_K_q8_1_sycl(const void *vx, const void *vy,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         {
+-            dpct::has_capability_or_fail(stream->get_device(),
+-                                         {sycl::aspect::fp16});
+-
+             stream->submit([&](sycl::handler &cgh) {
+                 sycl::local_accessor<int, 1> tile_x_ql_q4_K_acc_ct1(
+                     sycl::range<1>(mmq_y * (WARP_SIZE) + mmq_y), cgh);
+@@ -2762,9 +2714,6 @@ static void ggml_mul_mat_q5_K_q8_1_sycl(const void *vx, const void *vy,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         {
+-            dpct::has_capability_or_fail(stream->get_device(),
+-                                         {sycl::aspect::fp16});
+-
+             stream->submit([&](sycl::handler &cgh) {
+                 sycl::local_accessor<int, 1> tile_x_ql_q5_K_acc_ct1(
+                     sycl::range<1>(mmq_y * (2 * WARP_SIZE) + mmq_y), cgh);
+@@ -2800,9 +2749,6 @@ static void ggml_mul_mat_q5_K_q8_1_sycl(const void *vx, const void *vy,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         {
+-            dpct::has_capability_or_fail(stream->get_device(),
+-                                         {sycl::aspect::fp16});
+-
+             stream->submit([&](sycl::handler &cgh) {
+                 sycl::local_accessor<int, 1> tile_x_ql_q5_K_acc_ct1(
+                     sycl::range<1>(mmq_y * (2 * WARP_SIZE) + mmq_y), cgh);
+@@ -2883,9 +2829,6 @@ static void ggml_mul_mat_q6_K_q8_1_sycl(const void *vx, const void *vy,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         {
+-            dpct::has_capability_or_fail(stream->get_device(),
+-                                         {sycl::aspect::fp16});
+-
+             stream->submit([&](sycl::handler &cgh) {
+                 sycl::local_accessor<int, 1> tile_x_ql_acc_ct1(
+                     sycl::range<1>(mmq_y * (2 * WARP_SIZE) + mmq_y), cgh);
+@@ -2921,9 +2864,6 @@ static void ggml_mul_mat_q6_K_q8_1_sycl(const void *vx, const void *vy,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         {
+-            dpct::has_capability_or_fail(stream->get_device(),
+-                                         {sycl::aspect::fp16});
+-
+             stream->submit([&](sycl::handler &cgh) {
+                 sycl::local_accessor<int, 1> tile_x_ql_acc_ct1(
+                     sycl::range<1>(mmq_y * (2 * WARP_SIZE) + mmq_y), cgh);
+diff --git a/ggml/src/ggml-sycl/quantize.hpp b/ggml/src/ggml-sycl/quantize.hpp
+index b5c7a54b7..c6fc75b93 100644
+--- a/ggml/src/ggml-sycl/quantize.hpp
++++ b/ggml/src/ggml-sycl/quantize.hpp
+@@ -124,8 +124,6 @@ void quantize_row_q8_1_sycl(const float * x, void * vy, const int kx, const int
+     auto local_range      = std::size_t(WARP_SIZE);
+     auto num_quant_blocks = ky * (kx / QK8_1);
+     auto global_range     = num_quant_blocks * local_range;
+-    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+-
+     stream->parallel_for(sycl::nd_range<1>({ global_range }, { local_range }),
+                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                              quantize_f<QK8_1 / WARP_SIZE>()(x, vy, kx, kx_padded, it);
+diff --git a/ggml/src/ggml-sycl/set_rows.cpp b/ggml/src/ggml-sycl/set_rows.cpp
+index 52a0bcb6e..b96361b0d 100644
+--- a/ggml/src/ggml-sycl/set_rows.cpp
++++ b/ggml/src/ggml-sycl/set_rows.cpp
+@@ -328,9 +328,7 @@ static void set_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor * s
+                 stream
+             );
+             break;
+-        case GGML_TYPE_F16:
+-            dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+-            set_rows_sycl<TIn, TIdx, sycl::half>(
++        case GGML_TYPE_F16:            set_rows_sycl<TIn, TIdx, sycl::half>(
+                 src0_d, src1_d, (char *)dst->data,
+                 ne00, ne01, ne02, ne03,
+                 ne11, ne12,

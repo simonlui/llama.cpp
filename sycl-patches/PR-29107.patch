@@ -1,0 +1,878 @@
+diff --git a/ggml/src/ggml-sycl/CMakeLists.txt b/ggml/src/ggml-sycl/CMakeLists.txt
+index 1697ecd95..dfdb4746d 100644
+--- a/ggml/src/ggml-sycl/CMakeLists.txt
++++ b/ggml/src/ggml-sycl/CMakeLists.txt
+@@ -131,33 +131,65 @@ endif()
+ # Link against oneDNN
+ set(GGML_SYCL_DNNL 0)
+ if(GGML_SYCL_DNN)
+-    find_package(DNNL)
+-    if(DNNL_FOUND)
+-        if (NOT DEFINED DNNL_GPU_VENDOR)
+-            # default to intel target
+-            set(DNNL_GPU_VENDOR "INTEL")
+-            if(NOT "${GGML_SYCL_TARGET}" STREQUAL "INTEL")
+-                message(WARNING "oneDNN builds bundled with oneapi release only support INTEL target")
+-            endif()
++    # oneAPI installs dnnl-config.cmake under a versioned path CMake does not
++    # search by default. When the user did not point CMake at it explicitly
++    # (DNNL_DIR), auto-detect the oneAPI-bundled GPU build via the DNNLROOT
++    # environment variable or the standard oneAPI install prefixes. A shell
++    # with setvars.sh sourced already exports CMAKE_PREFIX_PATH and finds it
++    # without any of this.
++    if(NOT DEFINED DNNL_DIR)
++        if(DEFINED ENV{DNNLROOT} AND EXISTS "$ENV{DNNLROOT}/lib/cmake/dnnl/dnnl-config.cmake")
++            set(DNNL_DIR "$ENV{DNNLROOT}/lib/cmake/dnnl")
++        elseif(EXISTS "/opt/intel/oneapi/dnnl/latest/lib/cmake/dnnl/dnnl-config.cmake")
++            set(DNNL_DIR "/opt/intel/oneapi/dnnl/latest/lib/cmake/dnnl")
++        elseif(EXISTS "/usr/intel/oneapi/dnnl/latest/lib/cmake/dnnl/dnnl-config.cmake")
++            set(DNNL_DIR "/usr/intel/oneapi/dnnl/latest/lib/cmake/dnnl")
+         endif()
+-
+-        # Verify oneDNN was compiled for the same target as llama
+-        if("${GGML_SYCL_TARGET}" STREQUAL "${DNNL_GPU_VENDOR}")
+-            target_link_libraries(ggml-sycl PRIVATE DNNL::dnnl)
+-            set(GGML_SYCL_DNNL 1)
+-            get_target_property(CONFIGS DNNL::dnnl IMPORTED_CONFIGURATIONS)
+-            foreach(CONFIG ${CONFIGS})
+-                get_target_property(DNNL_LIB DNNL::dnnl IMPORTED_LOCATION_${CONFIG})
+-                message(STATUS "Found oneDNN: ${DNNL_LIB}")
+-            endforeach()
+-        else()
+-            message(WARNING
+-                "oneDNN must be compiled for the same target as llama.cpp.
+-                 llama.cpp: ${GGML_SYCL_TARGET}, oneDNN: ${DNNL_GPU_VENDOR}.
+-                 Disabling oneDNN support.")
++        if(DEFINED DNNL_DIR)
++            message(STATUS "oneDNN: auto-detected config at ${DNNL_DIR}")
+         endif()
++    endif()
++    find_package(DNNL)
++    if(NOT DNNL_FOUND)
++        # GGML_SYCL_DNN defaults to ON, so a plain build used to continue
++        # silently without oneDNN: every flash-attention then runs the much
++        # slower MKL-FA path (20-40% prefill loss on long prompts). Fail
++        # loudly instead of producing a degraded binary.
++        message(FATAL_ERROR
++            "oneDNN (DNNL) was requested (GGML_SYCL_DNN=ON) but not found. "
++            "The SYCL backend needs the oneAPI-bundled GPU build: install "
++            "intel-oneapi-dnnl and intel-oneapi-dnnl-devel from the oneAPI "
++            "repo, source setvars.sh, or pass "
++            "-DDNNL_DIR=<dnnl-prefix>/lib/cmake/dnnl (or export DNNLROOT). "
++            "To build without oneDNN on purpose, pass -DGGML_SYCL_DNN=OFF.")
++    endif()
++    if(NOT DEFINED DNNL_GPU_VENDOR)
++        # A DNNL package that does not declare DNNL_GPU_VENDOR has no GPU/SYCL
++        # support compiled in (e.g. Debian/Ubuntu's CPU-only libdnnl-dev).
++        # The old code defaulted the vendor to INTEL here, which fake-passed
++        # the target check below and silently linked a CPU-only library into
++        # the SYCL backend.
++        message(FATAL_ERROR
++            "Found oneDNN at ${DNNL_DIR} but it does not declare "
++            "DNNL_GPU_VENDOR - it is a CPU-only build (Debian/Ubuntu "
++            "libdnnl-dev?). Install the oneAPI-bundled GPU build "
++            "(intel-oneapi-dnnl-devel) instead.")
++    endif()
++
++    # Verify oneDNN was compiled for the same target as llama
++    if("${GGML_SYCL_TARGET}" STREQUAL "${DNNL_GPU_VENDOR}")
++        target_link_libraries(ggml-sycl PRIVATE DNNL::dnnl)
++        set(GGML_SYCL_DNNL 1)
++        get_target_property(CONFIGS DNNL::dnnl IMPORTED_CONFIGURATIONS)
++        foreach(CONFIG ${CONFIGS})
++            get_target_property(DNNL_LIB DNNL::dnnl IMPORTED_LOCATION_${CONFIG})
++            message(STATUS "Found oneDNN: ${DNNL_LIB}")
++        endforeach()
+     else()
+-        message(STATUS "oneDNN not found, disabling oneDNN support")
++        message(FATAL_ERROR
++            "oneDNN must be compiled for the same target as llama.cpp: "
++            "llama.cpp: ${GGML_SYCL_TARGET}, oneDNN: ${DNNL_GPU_VENDOR}. "
++            "Pass -DGGML_SYCL_DNN=OFF to build without oneDNN.")
+     endif()
+ else()
+     message(STATUS "oneDNN support disabled by the user")
+diff --git a/ggml/src/ggml-sycl/convert.cpp b/ggml/src/ggml-sycl/convert.cpp
+index cb6925b81..823a8d832 100644
+--- a/ggml/src/ggml-sycl/convert.cpp
++++ b/ggml/src/ggml-sycl/convert.cpp
+@@ -392,6 +392,19 @@ static void dequantize_row_iq3_xxs_sycl(const void *vx, dst_t *y, const int64_t
+     }
+ }
+ 
++template <typename dst_t>
++static void dequantize_row_iq3_xxs_sycl_reorder(const void * vx, dst_t * y, const int64_t k,
++                                                dpct::queue_ptr stream) {
++    const int64_t nb = k / QK_K;
++    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
++    stream->parallel_for(
++        sycl::nd_range<3>(sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, 32), sycl::range<3>(1, 1, 32)),
++        [=](sycl::nd_item<3> item_ct1) {
++            dequantize_block_iq3_xxs_reorder(
++                vx, y, item_ct1, nb, iq3xxs_grid, ksigns_iq2xs, kmask_iq2xs);
++        });
++}
++
+ template <typename dst_t>
+ static void dequantize_row_iq3_s_sycl(const void *vx, dst_t *y, const int64_t k,
+                                         dpct::queue_ptr stream) {
+@@ -409,6 +422,18 @@ static void dequantize_row_iq3_s_sycl(const void *vx, dst_t *y, const int64_t k,
+     }
+ }
+ 
++template <typename dst_t>
++static void dequantize_row_iq3_s_sycl_reorder(const void * vx, dst_t * y, const int64_t k,
++                                              dpct::queue_ptr stream) {
++    const int64_t nb = k / QK_K;
++    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
++    stream->parallel_for(
++        sycl::nd_range<3>(sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, 32), sycl::range<3>(1, 1, 32)),
++        [=](sycl::nd_item<3> item_ct1) {
++            dequantize_block_iq3_s_reorder(vx, y, item_ct1, nb, kmask_iq2xs, iq3s_grid);
++        });
++}
++
+ template <typename dst_t>
+ static void dequantize_row_iq4_xs_sycl(const void *vx, dst_t *y, const int64_t k,
+                                        dpct::queue_ptr stream) {
+@@ -650,9 +675,19 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
+         case GGML_TYPE_IQ2_S:
+             return dequantize_row_iq2_s_sycl;
+         case GGML_TYPE_IQ3_XXS:
+-            return dequantize_row_iq3_xxs_sycl;
++            if (dst->src[0]->extra &&
++                ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
++                return dequantize_row_iq3_xxs_sycl_reorder;
++            } else {
++                return dequantize_row_iq3_xxs_sycl;
++            }
+         case GGML_TYPE_IQ3_S:
+-            return dequantize_row_iq3_s_sycl;
++            if (dst->src[0]->extra &&
++                ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
++                return dequantize_row_iq3_s_sycl_reorder;
++            } else {
++                return dequantize_row_iq3_s_sycl;
++            }
+         case GGML_TYPE_IQ4_XS:
+             return dequantize_row_iq4_xs_sycl;
+         case GGML_TYPE_IQ4_NL:
+@@ -744,9 +779,19 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
+         case GGML_TYPE_IQ2_S:
+             return dequantize_row_iq2_s_sycl;
+         case GGML_TYPE_IQ3_XXS:
+-            return dequantize_row_iq3_xxs_sycl;
++            if (dst->src[0]->extra &&
++                ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
++                return dequantize_row_iq3_xxs_sycl_reorder;
++            } else {
++                return dequantize_row_iq3_xxs_sycl;
++            }
+         case GGML_TYPE_IQ3_S:
+-            return dequantize_row_iq3_s_sycl;
++            if (dst->src[0]->extra &&
++                ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
++                return dequantize_row_iq3_s_sycl_reorder;
++            } else {
++                return dequantize_row_iq3_s_sycl;
++            }
+         case GGML_TYPE_IQ4_XS:
+             return dequantize_row_iq4_xs_sycl;
+         case GGML_TYPE_IQ4_NL:
+diff --git a/ggml/src/ggml-sycl/dequantize.hpp b/ggml/src/ggml-sycl/dequantize.hpp
+index 8a2fd1f0e..bc86d2c2a 100644
+--- a/ggml/src/ggml-sycl/dequantize.hpp
++++ b/ggml/src/ggml-sycl/dequantize.hpp
+@@ -1490,6 +1490,45 @@ static void dequantize_block_iq3_xxs(const void * __restrict__ vx, dst_t * __res
+ 
+ }
+ 
++template<typename dst_t>
++static void dequantize_block_iq3_xxs_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy,
++                                             const sycl::nd_item<3> & item_ct1, const int64_t nb,
++                                             const uint32_t * iq3xxs_grid,
++                                             const uint8_t * ksigns_iq2xs,
++                                             const uint8_t * kmask_iq2xs) {
++    const int64_t i   = item_ct1.get_group(2);
++    const int64_t tid = item_ct1.get_local_id(2);
++#if QK_K == 256
++    const int64_t il = tid / 8;
++    const int64_t ib = tid % 8;
++    const uint8_t * base = static_cast<const uint8_t *>(vx);
++    const uint8_t * qs = base + i * (3 * QK_K / 8);
++    const ggml_half * d = reinterpret_cast<const ggml_half *>(base + nb * (3 * QK_K / 8));
++    const uint8_t * q3 = qs + 8 * ib;
++    const uint16_t * gas = reinterpret_cast<const uint16_t *>(qs + QK_K / 4) + 2 * ib;
++    const uint8_t * grid1 = reinterpret_cast<const uint8_t *>(iq3xxs_grid + q3[2*il+0]);
++    const uint8_t * grid2 = reinterpret_cast<const uint8_t *>(iq3xxs_grid + q3[2*il+1]);
++    const uint32_t aux32 = gas[0] | (gas[1] << 16);
++    const float dl = (float) d[i] * (0.5f + (aux32 >> 28)) * 0.5f;
++    const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * il)) & 127];
++    dst_t * y = yy + i * QK_K + 32 * ib + 8 * il;
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        y[j+0] = dl * grid1[j] * (signs & kmask_iq2xs[j+0] ? -1.f : 1.f);
++        y[j+4] = dl * grid2[j] * (signs & kmask_iq2xs[j+4] ? -1.f : 1.f);
++    }
++#else
++    GGML_UNUSED(vx);
++    GGML_UNUSED(yy);
++    GGML_UNUSED(item_ct1);
++    GGML_UNUSED(nb);
++    GGML_UNUSED(iq3xxs_grid);
++    GGML_UNUSED(ksigns_iq2xs);
++    GGML_UNUSED(kmask_iq2xs);
++    GGML_ABORT("IQ3_XXS reorder dequantization requires QK_K == 256");
++#endif
++}
++
+ template <typename dst_t>
+ __dpct_inline__ static void
+ dequantize_block_iq3_s(const void *__restrict__ vx, dst_t *__restrict__ yy,
+@@ -1520,6 +1559,48 @@ dequantize_block_iq3_s(const void *__restrict__ vx, dst_t *__restrict__ yy,
+ 
+ }
+ 
++template <typename dst_t>
++__dpct_inline__ static void
++dequantize_block_iq3_s_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy,
++                               const sycl::nd_item<3> & item_ct1, const int64_t nb,
++                               const uint8_t * kmask_iq2xs, const uint32_t * iq3s_grid) {
++    const int64_t i   = item_ct1.get_group(2);
++    const int64_t tid = item_ct1.get_local_id(2);
++#if QK_K == 256
++    const int64_t il = tid / 8;
++    const int64_t ib = tid % 8;
++    const uint8_t * base = static_cast<const uint8_t *>(vx);
++    const uint8_t * qs = base + i * (QK_K / 4);
++    const uint8_t * qh = base + nb * (QK_K / 4) + i * (QK_K / 32);
++    const uint8_t * signs_base = base + nb * (QK_K / 4 + QK_K / 32) + i * (QK_K / 8);
++    const uint8_t * metadata = base + nb * (QK_K / 4 + QK_K / 32 + QK_K / 8) +
++                               i * (sizeof(ggml_half) + IQ3S_N_SCALE);
++    const ggml_half d = *reinterpret_cast<const ggml_half *>(metadata);
++    const uint8_t * scales = metadata + sizeof(ggml_half);
++    const uint8_t * qs_ib = qs + 8 * ib;
++    const uint8_t * grid1 = reinterpret_cast<const uint8_t *>(
++        iq3s_grid + (qs_ib[2*il+0] | ((qh[ib] << (8 - 2*il)) & 256)));
++    const uint8_t * grid2 = reinterpret_cast<const uint8_t *>(
++        iq3s_grid + (qs_ib[2*il+1] | ((qh[ib] << (7 - 2*il)) & 256)));
++    const float dl = (float) d * (1 + 2 * ((scales[ib/2] >> (4 * (ib%2))) & 0xf));
++    const uint8_t signs = signs_base[4 * ib + il];
++    dst_t * y = yy + i * QK_K + 32 * ib + 8 * il;
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        y[j+0] = dl * grid1[j] * (signs & kmask_iq2xs[j+0] ? -1.f : 1.f);
++        y[j+4] = dl * grid2[j] * (signs & kmask_iq2xs[j+4] ? -1.f : 1.f);
++    }
++#else
++    GGML_UNUSED(vx);
++    GGML_UNUSED(yy);
++    GGML_UNUSED(item_ct1);
++    GGML_UNUSED(nb);
++    GGML_UNUSED(kmask_iq2xs);
++    GGML_UNUSED(iq3s_grid);
++    GGML_ABORT("IQ3_S reorder dequantization requires QK_K == 256");
++#endif
++}
++
+ template <typename dst_t>
+ __dpct_inline__ static void
+ dequantize_block_iq1_s(const void *__restrict__ vx, dst_t *__restrict__ yy,
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 84e54d4cb..7be2ef1d6 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -790,7 +790,9 @@ ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
+             case GGML_TYPE_Q4_K:
+             case GGML_TYPE_Q5_K:
+             case GGML_TYPE_Q6_K:
+-            case GGML_TYPE_MXFP4:{
++            case GGML_TYPE_IQ3_XXS:
++            case GGML_TYPE_IQ3_S:
++            case GGML_TYPE_MXFP4: {
+                 ggml_tensor_extra_gpu * extra = new ggml_tensor_extra_gpu{};
+                 tensor->extra                 = extra;
+                 ctx->tensor_extras.push_back(extra);
+@@ -4238,6 +4240,8 @@ inline bool ggml_sycl_supports_reorder_dmmv(enum ggml_type type) {
+         case GGML_TYPE_Q4_K:
+         case GGML_TYPE_Q5_K:
+         case GGML_TYPE_Q6_K:
++        case GGML_TYPE_IQ3_XXS:
++        case GGML_TYPE_IQ3_S:
+             return true;
+         default:
+             return false;
+@@ -4910,6 +4914,89 @@ static bool reorder_qw_q6_k(uint8_t * data_device, size_t size, size_t offset, d
+     return true;
+ }
+ 
++static bool reorder_qw_iq3_s(uint8_t * data_device, size_t size, dpct::queue_ptr stream) {
++    GGML_ASSERT(size % sizeof(block_iq3_s) == 0);
++
++    const int nblocks = size / sizeof(block_iq3_s);
++    sycl_reorder_temp_buffer tmp(stream, size);
++    if (!tmp) {
++        GGML_LOG_WARN("%s: failed to allocate %zu bytes for reorder temp buffer, skipping reorder\n", __func__, size);
++        return false;
++    }
++    uint8_t * tmp_buf = static_cast<uint8_t *>(tmp.ptr);
++
++    sycl::event copy_event;
++    SYCL_CHECK(CHECK_TRY_ERROR(copy_event = stream->memcpy(tmp_buf, data_device, size)));
++    if (!g_ggml_sycl_use_async_mem_op) {
++        copy_event.wait();
++    }
++
++    auto * qs_ptr       = data_device;
++    auto * qh_ptr       = qs_ptr + (QK_K / 4) * nblocks;
++    auto * signs_ptr    = qh_ptr + (QK_K / 32) * nblocks;
++    auto * metadata_ptr = signs_ptr + (QK_K / 8) * nblocks;
++
++    auto reorder_event = stream->parallel_for(nblocks, [=](auto i) {
++        const block_iq3_s * x = (const block_iq3_s *) tmp_buf;
++        const int ib = i;
++
++        for (int j = 0; j < QK_K / 4; ++j) {
++            qs_ptr[ib * (QK_K / 4) + j] = x[ib].qs[j];
++        }
++        for (int j = 0; j < QK_K / 32; ++j) {
++            qh_ptr[ib * (QK_K / 32) + j] = x[ib].qh[j];
++        }
++        for (int j = 0; j < QK_K / 8; ++j) {
++            signs_ptr[ib * (QK_K / 8) + j] = x[ib].signs[j];
++        }
++
++        uint8_t * metadata = metadata_ptr + ib * (sizeof(ggml_half) + IQ3S_N_SCALE);
++        *reinterpret_cast<ggml_half *>(metadata) = x[ib].d;
++        for (int j = 0; j < IQ3S_N_SCALE; ++j) {
++            metadata[sizeof(ggml_half) + j] = x[ib].scales[j];
++        }
++    });
++    if (!g_ggml_sycl_use_async_mem_op) {
++        reorder_event.wait_and_throw();
++    }
++    return true;
++}
++
++static bool reorder_qw_iq3_xxs(uint8_t * data_device, size_t size, dpct::queue_ptr stream) {
++    GGML_ASSERT(size % sizeof(block_iq3_xxs) == 0);
++
++    const int nblocks = size / sizeof(block_iq3_xxs);
++    sycl_reorder_temp_buffer tmp(stream, size);
++    if (!tmp) {
++        GGML_LOG_WARN("%s: failed to allocate %zu bytes for reorder temp buffer, skipping reorder\n", __func__, size);
++        return false;
++    }
++    uint8_t * tmp_buf = static_cast<uint8_t *>(tmp.ptr);
++
++    sycl::event copy_event;
++    SYCL_CHECK(CHECK_TRY_ERROR(copy_event = stream->memcpy(tmp_buf, data_device, size)));
++    if (!g_ggml_sycl_use_async_mem_op) {
++        copy_event.wait();
++    }
++
++    auto * qs_ptr = data_device;
++    auto * d_ptr  = reinterpret_cast<ggml_half *>(qs_ptr + (3 * QK_K / 8) * nblocks);
++
++    auto reorder_event = stream->parallel_for(nblocks, [=](auto i) {
++        const block_iq3_xxs * x = (const block_iq3_xxs *) tmp_buf;
++        const int ib = i;
++
++        for (int j = 0; j < 3 * QK_K / 8; ++j) {
++            qs_ptr[ib * (3 * QK_K / 8) + j] = x[ib].qs[j];
++        }
++        d_ptr[ib] = x[ib].d;
++    });
++    if (!g_ggml_sycl_use_async_mem_op) {
++        reorder_event.wait_and_throw();
++    }
++    return true;
++}
++
+ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
+     uint8_t * data_device = (uint8_t *) src0->data;
+     size_t ncols = src0->ne[0];
+@@ -4949,6 +5036,10 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
+             return reorder_qw_q5_k(data_device, size, 0, stream);
+         case GGML_TYPE_Q6_K:
+             return reorder_qw_q6_k(data_device, size, 0, stream);
++        case GGML_TYPE_IQ3_XXS:
++            return reorder_qw_iq3_xxs(data_device, size, stream);
++        case GGML_TYPE_IQ3_S:
++            return reorder_qw_iq3_s(data_device, size, stream);
+         default:
+             return false;
+     }
+diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+index e7416dfcc..a62967f24 100644
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -18,13 +18,13 @@ static __dpct_inline__ float vec_dot_iq2_xxs_q8_1_moe(const void * __restrict__
+ static __dpct_inline__ float vec_dot_iq2_xs_q8_1_moe(const void * __restrict__ vbq,
+                                                      const block_q8_1 * __restrict__ bq8_1,
+                                                      const int & iqs) {
+-    return vec_dot_iq2_xs_q8_1(vbq, bq8_1, iqs, iq2xs_grid, ksigns64);
++    return vec_dot_iq2_xs_q8_1(vbq, bq8_1, iqs, iq2xs_grid);
+ }
+ 
+ static __dpct_inline__ float vec_dot_iq3_xxs_q8_1_moe(const void * __restrict__ vbq,
+                                                       const block_q8_1 * __restrict__ bq8_1,
+                                                       const int & iqs) {
+-    return vec_dot_iq3_xxs_q8_1(vbq, bq8_1, iqs, iq3xxs_grid, ksigns64);
++    return vec_dot_iq3_xxs_q8_1(vbq, bq8_1, iqs, iq3xxs_grid);
+ }
+ 
+ static __dpct_inline__ float vec_dot_iq3_s_q8_1_moe(const void * __restrict__ vbq,
+@@ -446,7 +446,7 @@ static void mul_mat_vec_q_iq2_xs_q8_1(const void *__restrict__ vx,
+             (item_ct1.get_local_id(2) %
+              (qi / vdr)); // x block quant index when casting the quants to int
+ 
+-        tmp += vec_dot_iq2_xs_q8_1(&x[ibx], &y[iby], iqs, iq2xs_grid, ksigns64);
++        tmp += vec_dot_iq2_xs_q8_1(&x[ibx], &y[iby], iqs, iq2xs_grid);
+     }
+ 
+     // sum up partial sums and write back result
+@@ -542,7 +542,7 @@ static void mul_mat_vec_q_iq3_xxs_q8_1(const void *__restrict__ vx,
+             (item_ct1.get_local_id(2) %
+              (qi / vdr)); // x block quant index when casting the quants to int
+ 
+-        tmp += vec_dot_iq3_xxs_q8_1(&x[ibx], &y[iby], iqs, iq3xxs_grid, ksigns64);
++        tmp += vec_dot_iq3_xxs_q8_1(&x[ibx], &y[iby], iqs, iq3xxs_grid);
+     }
+ 
+     // sum up partial sums and write back result
+@@ -557,6 +557,11 @@ static void mul_mat_vec_q_iq3_xxs_q8_1(const void *__restrict__ vx,
+     }
+ }
+ 
++static __dpct_inline__ float vec_dot_iq3_s_q8_1_adapter(
++        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
++    return vec_dot_iq3_s_q8_1(vbq, bq8_1, iqs, iq3s_grid);
++}
++
+ template <int qk, int qi, typename block_q_t, int vdr>
+ static void mul_mat_vec_q_iq3_s_q8_1(const void *__restrict__ vx,
+                                      const void *__restrict__ vy,
+@@ -2275,6 +2280,67 @@ static void mul_mat_vec_iq3_xxs_q8_1_sycl(const void *vx, const void *vy,
+     }
+ }
+ 
++template <ggml_type type>
++static void reorder_mul_mat_vec_iq3_q8_1_sycl(const void * vx, const void * vy, float * dst, const int ncols,
++                                              const int nrows, dpct::queue_ptr stream) {
++    static_assert(type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S);
++    GGML_ASSERT(ncols % QK_K == 0);
++    constexpr size_t num_subgroups = WARP_SIZE;
++    const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
++    const sycl::range<3> block_nums(1, 1, block_num_y);
++    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
++
++    stream->submit([&](sycl::handler & cgh) {
++        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
++                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                             mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<type>>(
++                                 vx, vy, dst, ncols, nrows, nd_item);
++                         });
++    });
++}
++
++template <ggml_type type, int ncols_dst>
++static void reorder_mul_mat_vec_iq3_q8_1_sycl_ncols(
++        const void * vx, const void * vy, float * dst,
++        const int ncols, const int nrows,
++        const int stride_col_y_bytes, const int stride_col_dst,
++        dpct::queue_ptr stream) {
++    static_assert(type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S);
++    GGML_ASSERT(ncols % QK_K == 0);
++    constexpr size_t num_subgroups = WARP_SIZE;
++    const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
++    const sycl::range<3> block_nums(1, 1, block_num_y);
++    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
++
++    stream->submit([&](sycl::handler & cgh) {
++        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
++                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                             mul_mat_vec_q_reorder_ncols<reorder_vec_dot_q_sycl<type>, ncols_dst>(
++                                 vx, /*vgate=*/ nullptr, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst,
++                                 /*glu_op=*/ GGML_GLU_OP_SWIGLU, nd_item);
++                         });
++    });
++}
++
++template <ggml_type type>
++static void reorder_mul_mat_vec_iq3_q8_1_sycl_switch_ncols(
++        const void * vx, const void * vy, float * dst,
++        const int ncols, const int nrows, const int ncols_dst,
++        const int stride_col_y_bytes, const int stride_col_dst,
++        dpct::queue_ptr stream) {
++    switch (ncols_dst) {
++        case 1: reorder_mul_mat_vec_iq3_q8_1_sycl<type>(vx, vy, dst, ncols, nrows, stream); break;
++        case 2: reorder_mul_mat_vec_iq3_q8_1_sycl_ncols<type, 2>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
++        case 3: reorder_mul_mat_vec_iq3_q8_1_sycl_ncols<type, 3>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
++        case 4: reorder_mul_mat_vec_iq3_q8_1_sycl_ncols<type, 4>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
++        case 5: reorder_mul_mat_vec_iq3_q8_1_sycl_ncols<type, 5>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
++        case 6: reorder_mul_mat_vec_iq3_q8_1_sycl_ncols<type, 6>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
++        case 7: reorder_mul_mat_vec_iq3_q8_1_sycl_ncols<type, 7>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
++        case 8: reorder_mul_mat_vec_iq3_q8_1_sycl_ncols<type, 8>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
++        default: GGML_ABORT("unsupported ncols_dst=%d for reordered IQ3 multi-col MMVQ", ncols_dst);
++    }
++}
++
+ static void mul_mat_vec_iq3_s_q8_1_sycl(const void *vx, const void *vy,
+                                           float *dst, const int ncols,
+                                           const int nrows,
+@@ -2792,15 +2858,49 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
+                 mul_mat_vec_iq2_s_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                 break;
+             case GGML_TYPE_IQ3_XXS:
+-                mul_mat_vec_iq3_xxs_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
++                if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
++                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
++                    if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
++                        const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
++                        const int stride_col_dst     = dst->ne[0];
++                        GGML_SYCL_DEBUG("Calling reordered IQ3_XXS multi-col MMVQ ncols=%d\n", (int) src1_ncols);
++                        reorder_mul_mat_vec_iq3_q8_1_sycl_switch_ncols<GGML_TYPE_IQ3_XXS>(
++                            src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
++                            src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
++                        return;
++                    } else {
++                        GGML_SYCL_DEBUG("Calling reordered IQ3_XXS MMVQ\n");
++                        reorder_mul_mat_vec_iq3_q8_1_sycl<GGML_TYPE_IQ3_XXS>(
++                            src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
++                    }
++                } else {
++                    mul_mat_vec_iq3_xxs_q8_1_sycl(
++                        src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
++                }
+                 break;
+             case GGML_TYPE_IQ3_S:
+-                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
++                if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
++                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
++                    if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
++                        const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
++                        const int stride_col_dst     = dst->ne[0];
++                        GGML_SYCL_DEBUG("Calling reordered IQ3_S multi-col MMVQ ncols=%d\n", (int) src1_ncols);
++                        reorder_mul_mat_vec_iq3_q8_1_sycl_switch_ncols<GGML_TYPE_IQ3_S>(
++                            src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
++                            src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
++                        return;
++                    } else {
++                        GGML_SYCL_DEBUG("Calling reordered IQ3_S MMVQ\n");
++                        reorder_mul_mat_vec_iq3_q8_1_sycl<GGML_TYPE_IQ3_S>(
++                            src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
++                    }
++                } else if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
+                     const int stride_col_y   = src1_padded_col_size / QK8_1;
+                     const int stride_col_dst = dst->ne[0];
+                     GGML_SYCL_DEBUG("Calling mul_mat_vec_iq3_s_q8_1_sycl_switch_ncols ncols=%d\n", (int) src1_ncols);
+-                    mul_mat_vec_iq3_s_q8_1_sycl_switch_ncols(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
+-                                                             src1_ncols, stride_col_y, stride_col_dst, stream);
++                    mul_mat_vec_iq3_s_q8_1_sycl_switch_ncols(
++                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
++                        src1_ncols, stride_col_y, stride_col_dst, stream);
+                     return;
+                 } else if (i == 0 || src1_ncols == 1) {
+                     mul_mat_vec_iq3_s_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+@@ -3045,7 +3145,7 @@ bool ggml_sycl_mul_mat_vec_q_id(
+                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+             return true;
+         case GGML_TYPE_IQ3_S:
+-            launch_mul_mat_vec_q_moe<QK_K, QI3_S/2, block_iq3_s, VDR_IQ3_S_Q8_1_MMVQ, vec_dot_iq3_s_q8_1_moe>(
++            launch_mul_mat_vec_q_moe<QK_K, QI3_S/2, block_iq3_s, VDR_IQ3_S_Q8_1_MMVQ, vec_dot_iq3_s_q8_1_adapter>(
+                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+             return true;
+diff --git a/ggml/src/ggml-sycl/quants.hpp b/ggml/src/ggml-sycl/quants.hpp
+index e6d7765b6..9fdcc22f2 100644
+--- a/ggml/src/ggml-sycl/quants.hpp
++++ b/ggml/src/ggml-sycl/quants.hpp
+@@ -178,6 +178,53 @@ template <> struct block_q_t<GGML_TYPE_Q6_K> {
+     static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
+ };
+ 
++template <> struct block_q_t<GGML_TYPE_IQ3_XXS> {
++    struct traits {
++        static constexpr uint32_t qk       = QK_K;
++        static constexpr uint32_t qi       = QI3_XXS / 2;
++        static constexpr uint32_t qr       = QR3_XXS;
++        static constexpr uint32_t vdr_mmvq = 1;
++    };
++
++    // Reordered layout: [96-byte qs records for all blocks][2-byte d records for all blocks].
++    static constexpr std::pair<int, int> get_block_offset(const int block_index, const int /* nblocks */) {
++        return { block_index * (3 * QK_K / 8), 0 };
++    }
++
++    static constexpr std::pair<int, int> get_d_offset(int nrows, int ncols, const int block_index) {
++        const int nblocks = nrows * (ncols / QK_K);
++        return { nblocks * (3 * QK_K / 8) + block_index * sizeof(ggml_half), 0 };
++    }
++
++    static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
++};
++
++template <> struct block_q_t<GGML_TYPE_IQ3_S> {
++    struct traits {
++        static constexpr uint32_t qk       = QK_K;
++        static constexpr uint32_t qi       = QI3_S / 2;
++        static constexpr uint32_t qr       = QR3_S;
++        static constexpr uint32_t vdr_mmvq = 1;
++    };
++
++    // Reordered layout: [qs][qh][signs][{d, scales} per block]. Keeping the small
++    // metadata together leaves the generic reordered dot interface at two offset pairs.
++    static constexpr std::pair<int, int> get_block_offset(const int block_index, const int nblocks) {
++        return { block_index * (QK_K / 4),
++                 nblocks * (QK_K / 4) + block_index * (QK_K / 32) };
++    }
++
++    static constexpr std::pair<int, int> get_d_offset(int nrows, int ncols, const int block_index) {
++        const int nblocks = nrows * (ncols / QK_K);
++        const int signs_base = nblocks * (QK_K / 4 + QK_K / 32);
++        const int metadata_base = signs_base + nblocks * (QK_K / 8);
++        return { signs_base + block_index * (QK_K / 8),
++                 metadata_base + block_index * (sizeof(ggml_half) + IQ3S_N_SCALE) };
++    }
++
++    static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
++};
++
+ template <> struct block_q_t<GGML_TYPE_Q8_0> {
+     struct traits {
+         static constexpr uint32_t qk       = QK8_0;      // 32
+diff --git a/ggml/src/ggml-sycl/vecdotq.hpp b/ggml/src/ggml-sycl/vecdotq.hpp
+index 075995662..d1b6092be 100644
+--- a/ggml/src/ggml-sycl/vecdotq.hpp
++++ b/ggml/src/ggml-sycl/vecdotq.hpp
+@@ -1514,6 +1514,20 @@ vec_dot_q6_K_q8_1(const void *__restrict__ vbq,
+ // interchangeable and must not be copied across backends.
+ #define VDR_IQ2_XXS_Q8_1_MMVQ 1
+ 
++static __dpct_inline__ uint32_t iq_sign_mask(const uint32_t signs) {
++    const uint32_t bits =
++        (signs & 0x01) | ((signs & 0x02) << 7) |
++        ((signs & 0x04) << 14) | ((signs & 0x08) << 21);
++
++    return bits * 0xff;
++}
++
++static __dpct_inline__ uint32_t iq_sign_bits(const uint32_t encoded) {
++    const uint32_t signs = encoded & 127;
++
++    return signs | ((sycl::popcount(signs) & 1) << 7);
++}
++
+ static __dpct_inline__ float
+ vec_dot_iq2_xxs_q8_1(const void *__restrict__ vbq,
+                      const block_q8_1 *__restrict__ bq8_1, const int &iqs,
+@@ -1550,7 +1564,7 @@ vec_dot_iq2_xxs_q8_1(const void *__restrict__ vbq,
+ static __dpct_inline__ float
+ vec_dot_iq2_xs_q8_1(const void *__restrict__ vbq,
+                     const block_q8_1 *__restrict__ bq8_1, const int &iqs,
+-                    const uint64_t *iq2xs_grid, const uint64_t *ksigns64) {
++                    const uint64_t *iq2xs_grid) {
+ #if DPCT_COMPATIBILITY_TEMP >=                                                 \
+     MIN_CC_DP4A // lowest compute capability for integer intrinsics
+ #if QK_K == 256
+@@ -1562,25 +1576,27 @@ vec_dot_iq2_xs_q8_1(const void *__restrict__ vbq,
+     const uint8_t ls1 = bq2->scales[ib32] & 0xf;
+     const uint8_t ls2 = bq2->scales[ib32] >>  4;
+     int sumi1 = 0;
++#pragma unroll
+     for (int l = 0; l < 2; ++l) {
+-        const uint32_t * grid = (const uint32_t *)(iq2xs_grid + (q2[l] & 511));
+-        const uint32_t * signs = (const uint32_t *)(ksigns64 + (q2[l] >> 9));
+-        const int grid_l = dpct::vectorized_binary<sycl::uchar4>(
+-            grid[0] ^ signs[0], signs[0], std::minus<>());
+-        const int grid_h = dpct::vectorized_binary<sycl::uchar4>(
+-            grid[1] ^ signs[1], signs[1], std::minus<>());
++        const uint64_t grid = iq2xs_grid[q2[l] & 511];
++        const uint32_t sign_bits = iq_sign_bits(q2[l] >> 9);
++        const uint32_t signs0 = iq_sign_mask(sign_bits);
++        const uint32_t signs1 = iq_sign_mask(sign_bits >> 4);
++        const int grid_l = ((uint32_t)grid ^ signs0) + (signs0 & 0x01010101);
++        const int grid_h = ((uint32_t)(grid >> 32) ^ signs1) + (signs1 & 0x01010101);
+         sumi1 = dpct::dp4a(grid_l, *((const int *)q8 + 0), sumi1);
+         sumi1 = dpct::dp4a(grid_h, *((const int *)q8 + 1), sumi1);
+         q8 += 8;
+     }
+     int sumi2 = 0;
++#pragma unroll
+     for (int l = 2; l < 4; ++l) {
+-        const uint32_t * grid = (const uint32_t *)(iq2xs_grid + (q2[l] & 511));
+-        const uint32_t * signs = (const uint32_t *)(ksigns64 + (q2[l] >> 9));
+-        const int grid_l = dpct::vectorized_binary<sycl::uchar4>(
+-            grid[0] ^ signs[0], signs[0], std::minus<>());
+-        const int grid_h = dpct::vectorized_binary<sycl::uchar4>(
+-            grid[1] ^ signs[1], signs[1], std::minus<>());
++        const uint64_t grid = iq2xs_grid[q2[l] & 511];
++        const uint32_t sign_bits = iq_sign_bits(q2[l] >> 9);
++        const uint32_t signs0 = iq_sign_mask(sign_bits);
++        const uint32_t signs1 = iq_sign_mask(sign_bits >> 4);
++        const int grid_l = ((uint32_t)grid ^ signs0) + (signs0 & 0x01010101);
++        const int grid_h = ((uint32_t)(grid >> 32) ^ signs1) + (signs1 & 0x01010101);
+         sumi2 = dpct::dp4a(grid_l, *((const int *)q8 + 0), sumi2);
+         sumi2 = dpct::dp4a(grid_h, *((const int *)q8 + 1), sumi2);
+         q8 += 8;
+@@ -1656,7 +1672,7 @@ vec_dot_iq2_s_q8_1(const void *__restrict__ vbq,
+ static __dpct_inline__ float
+ vec_dot_iq3_xxs_q8_1(const void *__restrict__ vbq,
+                      const block_q8_1 *__restrict__ bq8_1, const int &iqs,
+-                     const uint32_t *iq3xxs_grid, const uint64_t *ksigns64) {
++                     const uint32_t *iq3xxs_grid) {
+ #if DPCT_COMPATIBILITY_TEMP >=                                                 \
+     MIN_CC_DP4A // lowest compute capability for integer intrinsics
+ #if QK_K == 256
+@@ -1668,14 +1684,15 @@ vec_dot_iq3_xxs_q8_1(const void *__restrict__ vbq,
+     const int8_t   * q8 = bq8_1[ib32].qs;
+     uint32_t aux32 = gas[0] | (gas[1] << 16);
+     int sumi = 0;
++#pragma unroll
+     for (int l = 0; l < 4; ++l) {
+-        const uint32_t * grid1 = iq3xxs_grid + q3[2*l+0];
+-        const uint32_t * grid2 = iq3xxs_grid + q3[2*l+1];
+-        const uint32_t * signs = (const uint32_t *)(ksigns64 + (aux32 & 127));
+-        const int grid_l = dpct::vectorized_binary<sycl::uchar4>(
+-            grid1[0] ^ signs[0], signs[0], std::minus<>());
+-        const int grid_h = dpct::vectorized_binary<sycl::uchar4>(
+-            grid2[0] ^ signs[1], signs[1], std::minus<>());
++        const uint32_t grid1 = iq3xxs_grid[q3[2*l+0]];
++        const uint32_t grid2 = iq3xxs_grid[q3[2*l+1]];
++        const uint32_t sign_bits = iq_sign_bits(aux32);
++        const uint32_t signs0 = iq_sign_mask(sign_bits);
++        const uint32_t signs1 = iq_sign_mask(sign_bits >> 4);
++        const int grid_l = (grid1 ^ signs0) + (signs0 & 0x01010101);
++        const int grid_h = (grid2 ^ signs1) + (signs1 & 0x01010101);
+         sumi = dpct::dp4a(grid_l, *((const int *)q8 + 0), sumi);
+         sumi = dpct::dp4a(grid_h, *((const int *)q8 + 1), sumi);
+         q8 += 8;
+@@ -1693,6 +1710,50 @@ vec_dot_iq3_xxs_q8_1(const void *__restrict__ vbq,
+ #endif
+ }
+ 
++template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_IQ3_XXS> {
++    static constexpr ggml_type gtype = GGML_TYPE_IQ3_XXS;
++
++    __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
++                                     const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr,
++                                     const sycl::half2 * q8_1_ds, const int & iqs) {
++#if DPCT_COMPATIBILITY_TEMP >= MIN_CC_DP4A && QK_K == 256
++        const uint8_t * base = static_cast<const uint8_t *>(vbq);
++        const uint8_t * qs   = base + ibx_offset.first;
++        const uint8_t * q3   = qs + 8 * iqs;
++        const uint16_t * gas = reinterpret_cast<const uint16_t *>(qs + QK_K / 4) + 2 * iqs;
++        const int8_t * q8    = q8_1_quant_ptr + iqs * QK8_1;
++        uint32_t aux32       = gas[0] | (gas[1] << 16);
++
++        int sumi = 0;
++#pragma unroll
++        for (int l = 0; l < 4; ++l) {
++            const uint32_t grid1 = iq3xxs_grid[q3[2*l+0]];
++            const uint32_t grid2 = iq3xxs_grid[q3[2*l+1]];
++            const uint32_t sign_bits = iq_sign_bits(aux32);
++            const uint32_t signs0 = iq_sign_mask(sign_bits);
++            const uint32_t signs1 = iq_sign_mask(sign_bits >> 4);
++            const int grid_l = (grid1 ^ signs0) + (signs0 & 0x01010101);
++            const int grid_h = (grid2 ^ signs1) + (signs1 & 0x01010101);
++            sumi = dpct::dp4a(grid_l, *((const int *) q8 + 0), sumi);
++            sumi = dpct::dp4a(grid_h, *((const int *) q8 + 1), sumi);
++            q8 += 8;
++            aux32 >>= 7;
++        }
++
++        const ggml_half d = *reinterpret_cast<const ggml_half *>(base + d_offset.first);
++        return (float) d * (0.5f + aux32) * q8_1_ds[iqs][0] * 0.5f * sumi;
++#else
++        GGML_UNUSED(vbq);
++        GGML_UNUSED(ibx_offset);
++        GGML_UNUSED(d_offset);
++        GGML_UNUSED(q8_1_quant_ptr);
++        GGML_UNUSED(q8_1_ds);
++        GGML_UNUSED(iqs);
++        GGML_ABORT("IQ3_XXS reorder vec dot requires dp4a and QK_K == 256");
++#endif
++    }
++};
++
+ #define VDR_IQ3_S_Q8_1_MMVQ 1
+ 
+ static __dpct_inline__ float
+@@ -1707,18 +1768,13 @@ vec_dot_iq3_s_q8_1(const void *__restrict__ vbq,
+     const int8_t   * q8 = bq8_1[ib32].qs;
+     int sumi = 0;
+     for (int l = 0; l < 4; ++l) {
+-        const uint32_t * grid1 = iq3s_grid + (qs[2*l+0] | ((bq2->qh[ib32] << (8 - 2*l)) & 256));
+-        const uint32_t * grid2 = iq3s_grid + (qs[2*l+1] | ((bq2->qh[ib32] << (7 - 2*l)) & 256));
+-        uint32_t signs0 = dpct::vectorized_binary<sycl::uchar4>(
+-            ((bq2->signs[4 * ib32 + l] & 0xf) * 0x01010101) & 0x08040201,
+-            0x08040201, std::equal_to<>());
+-        uint32_t signs1 = dpct::vectorized_binary<sycl::uchar4>(
+-            ((bq2->signs[4 * ib32 + l] >> 4) * 0x01010101) & 0x08040201,
+-            0x08040201, std::equal_to<>());
+-        const int grid_l = dpct::vectorized_binary<sycl::uchar4>(
+-            grid1[0] ^ signs0, signs0, std::minus<>());
+-        const int grid_h = dpct::vectorized_binary<sycl::uchar4>(
+-            grid2[0] ^ signs1, signs1, std::minus<>());
++        const uint32_t grid1 = iq3s_grid[qs[2*l+0] | ((bq2->qh[ib32] << (8 - 2*l)) & 256)];
++        const uint32_t grid2 = iq3s_grid[qs[2*l+1] | ((bq2->qh[ib32] << (7 - 2*l)) & 256)];
++        const uint32_t signs = bq2->signs[4 * ib32 + l];
++        const uint32_t signs0 = iq_sign_mask(signs);
++        const uint32_t signs1 = iq_sign_mask(signs >> 4);
++        const int grid_l = (grid1 ^ signs0) + (signs0 & 0x01010101);
++        const int grid_h = (grid2 ^ signs1) + (signs1 & 0x01010101);
+         sumi = dpct::dp4a(grid_l, *((const int *)q8 + 0), sumi);
+         sumi = dpct::dp4a(grid_h, *((const int *)q8 + 1), sumi);
+         q8 += 8;
+@@ -1733,6 +1789,50 @@ vec_dot_iq3_s_q8_1(const void *__restrict__ vbq,
+ #endif
+ }
+ 
++template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_IQ3_S> {
++    static constexpr ggml_type gtype = GGML_TYPE_IQ3_S;
++
++    __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
++                                     const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr,
++                                     const sycl::half2 * q8_1_ds, const int & iqs) {
++#if QK_K == 256
++        const uint8_t * base     = static_cast<const uint8_t *>(vbq);
++        const uint8_t * qs       = base + ibx_offset.first + 8 * iqs;
++        const uint8_t * qh       = base + ibx_offset.second;
++        const uint8_t * signs    = base + d_offset.first + 4 * iqs;
++        const uint8_t * metadata = base + d_offset.second;
++        const ggml_half d        = *reinterpret_cast<const ggml_half *>(metadata);
++        const uint8_t * scales   = metadata + sizeof(ggml_half);
++        const int8_t * q8        = q8_1_quant_ptr + iqs * QK8_1;
++
++        int sumi = 0;
++#pragma unroll
++        for (int l = 0; l < 4; ++l) {
++            const uint32_t grid1 = iq3s_grid[qs[2*l+0] | ((qh[iqs] << (8 - 2*l)) & 256)];
++            const uint32_t grid2 = iq3s_grid[qs[2*l+1] | ((qh[iqs] << (7 - 2*l)) & 256)];
++            const uint32_t signs0 = iq_sign_mask(signs[l]);
++            const uint32_t signs1 = iq_sign_mask(signs[l] >> 4);
++            const int grid_l = (grid1 ^ signs0) + (signs0 & 0x01010101);
++            const int grid_h = (grid2 ^ signs1) + (signs1 & 0x01010101);
++            sumi = dpct::dp4a(grid_l, *((const int *) q8 + 0), sumi);
++            sumi = dpct::dp4a(grid_h, *((const int *) q8 + 1), sumi);
++            q8 += 8;
++        }
++
++        const float scale = 1 + 2 * ((scales[iqs / 2] >> (4 * (iqs % 2))) & 0xf);
++        return (float) d * scale * q8_1_ds[iqs][0] * sumi;
++#else
++        GGML_UNUSED(vbq);
++        GGML_UNUSED(ibx_offset);
++        GGML_UNUSED(d_offset);
++        GGML_UNUSED(q8_1_quant_ptr);
++        GGML_UNUSED(q8_1_ds);
++        GGML_UNUSED(iqs);
++        GGML_ABORT("IQ3_S reorder vec dot not supported for QK_K != 256");
++#endif
++    }
++};
++
+ #define VDR_IQ1_S_Q8_1_MMVQ 1
+ 
+ static __dpct_inline__ float

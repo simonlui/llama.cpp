@@ -1,0 +1,16 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index f5f2451d7da94cf32b819e61a9a53f0aaa00e200..576c0de14b5abb3d5e8e6fa577fe5ee997980c79 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -4064,6 +4064,11 @@ vk_device ggml_vk_get_device(size_t idx) {
+             device->coopmat_support = false;
+         }
+ 
++        if (!device->coopmat_support) {
++            // VK_NV_cooperative_matrix2 requires VK_KHR_cooperative_matrix.
++            coopmat2_support = false;
++        }
++
+         device->integer_dot_product = device->integer_dot_product && shader_integer_dot_product_props.integerDotProduct4x8BitPackedSignedAccelerated;
+ 
+         device->min_imported_host_pointer_alignment = external_memory_host_props.minImportedHostPointerAlignment;

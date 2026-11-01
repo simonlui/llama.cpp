@@ -1,0 +1,19 @@
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 41449db66..fe7017d59 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -5500,14 +5500,11 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
+                     case GGML_TYPE_IQ3_S:
+                     case GGML_TYPE_IQ4_NL:
+                     case GGML_TYPE_IQ4_XS:
+-                    case GGML_TYPE_Q2_K:
+                     case GGML_TYPE_Q3_K:
+                     case GGML_TYPE_Q4_0:
+                     case GGML_TYPE_Q4_1:
+-                    case GGML_TYPE_Q4_K:
+                     case GGML_TYPE_Q5_0:
+                     case GGML_TYPE_Q5_1:
+-                    case GGML_TYPE_Q5_K:
+                     case GGML_TYPE_Q6_K:
+                     case GGML_TYPE_Q8_0:
+                         return true;
