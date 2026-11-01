@@ -1,19 +1,17 @@
 diff --git a/ggml/CMakeLists.txt b/ggml/CMakeLists.txt
-index 4dab3a62..d0296671 100644
+index 4dab3a62..692c488f 100644
 --- a/ggml/CMakeLists.txt
 +++ b/ggml/CMakeLists.txt
-@@ -252,6 +252,9 @@ option(GGML_SYCL                            "ggml: use SYCL"
+@@ -252,6 +252,7 @@ option(GGML_SYCL                            "ggml: use SYCL"
  option(GGML_SYCL_F16                        "ggml: use 16 bit floats for sycl calculations"   OFF)
  option(GGML_SYCL_SUPPORT_XMX                "ggml: build the XMX (DPAS) code paths in the SYCL backend" ON)
  option(GGML_SYCL_GRAPH                      "ggml: enable graphs in the SYCL backend"         ON)
 +option(GGML_SYCL_MMQ_XMX                    "ggml: enable experimental XMX MMQ kernels for the SYCL backend" OFF)
-+set   (GGML_SYCL_MMQ_XMX_SG "16" CACHE STRING
-+                                            "ggml: sub-group size of the XMX MMQ tile: 16 (Xe2, Xe-HPC) or 8 (Xe-HPG, Arc A-series)")
  option(GGML_SYCL_HOST_MEM_FALLBACK          "ggml: allow host memory fallback in SYCL reorder (requires kernel 6.8+)" ON)
  option(GGML_SYCL_SUPPORT_LEVEL_ZERO_API     "ggml: use Level Zero API in SYCL backend"  ON)
  option(GGML_SYCL_DNN                        "ggml: enable oneDNN in the SYCL backend"         ON)
 diff --git a/ggml/src/ggml-sycl/CMakeLists.txt b/ggml/src/ggml-sycl/CMakeLists.txt
-index 2a2cc2b4..015e0da7 100644
+index 2a2cc2b4..a98e1abd 100644
 --- a/ggml/src/ggml-sycl/CMakeLists.txt
 +++ b/ggml/src/ggml-sycl/CMakeLists.txt
 @@ -313,6 +313,11 @@ if (GGML_SYCL_GRAPH)
@@ -22,7 +20,7 @@ index 2a2cc2b4..015e0da7 100644
  
 +if (GGML_SYCL_MMQ_XMX)
 +    message(STATUS "Compiling with experimental GGML_SYCL_MMQ_XMX kernels.")
-+    target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_MMQ_XMX GGML_SYCL_MMQ_XMX_SG=${GGML_SYCL_MMQ_XMX_SG})
++    target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_MMQ_XMX)
 +endif()
 +
  if (GGML_SYCL_HOST_MEM_FALLBACK)
@@ -60,10 +58,10 @@ index 75d4d572..40b005e0 100644
      }
 diff --git a/ggml/src/ggml-sycl/mmq_xmx.cpp b/ggml/src/ggml-sycl/mmq_xmx.cpp
 new file mode 100644
-index 00000000..94017997
+index 00000000..771a0052
 --- /dev/null
 +++ b/ggml/src/ggml-sycl/mmq_xmx.cpp
-@@ -0,0 +1,4219 @@
+@@ -0,0 +1,240 @@
 +//
 +// XMX-accelerated quantized matrix multiplication for Intel Arc GPUs
 +// Uses Intel Xe Matrix eXtensions (XMX) via SYCL joint_matrix API
@@ -94,19 +92,279 @@ index 00000000..94017997
 +namespace sycl_xmx = sycl::ext::oneapi::experimental::matrix;
 +
 +// =============================================================================
++// Int8 DPAS tile shapes
++// =============================================================================
++// 8x16x32 at sub-group 16 (Xe2, Xe-HPC) and 8x8x32 at sub-group 8 (Xe-HPG, Arc A-series). Both are
++// built, except in an AOT build for a single XMX width (GGML_SYCL_XMX_AOT_SG), and the shape the
++// device lists is picked at run time. The two shapes have different reqd_sub_group_size, so they
++// land in separate device images: a JIT build never asks IGC for the shape the device lacks, which
++// matters because IGC fails building the sub-group-16 tile for Xe-HPG.
++#if !defined(GGML_SYCL_XMX_AOT_SG) || GGML_SYCL_XMX_AOT_SG == 16
++#    define GGML_SYCL_MMQ_XMX_SG16 1
++namespace ggml_sycl_mmq_xmx_sg16 {
++#    define MMQ_XMX_TILE_SG 16
++#    include "mmq_xmx_tile.inc"
++#    undef MMQ_XMX_TILE_SG
++}  // namespace ggml_sycl_mmq_xmx_sg16
++#endif
++
++#if !defined(GGML_SYCL_XMX_AOT_SG) || GGML_SYCL_XMX_AOT_SG == 8
++#    define GGML_SYCL_MMQ_XMX_SG8 1
++namespace ggml_sycl_mmq_xmx_sg8 {
++#    define MMQ_XMX_TILE_SG 8
++#    include "mmq_xmx_tile.inc"
++#    undef MMQ_XMX_TILE_SG
++}  // namespace ggml_sycl_mmq_xmx_sg8
++#endif
++
++// whether the device lists the int8 8 x sg x 32 tile at sub-group size sg
++static bool ggml_sycl_mmq_xmx_device_has_tile(const sycl::device & dev, int sg) {
++    namespace mx        = sycl::ext::oneapi::experimental::matrix;
++    const auto sg_sizes = dev.get_info<sycl::info::device::sub_group_sizes>();
++    if (std::find(sg_sizes.begin(), sg_sizes.end(), (size_t) sg) == sg_sizes.end()) {
++        return false;
++    }
++    for (const auto & c : dev.get_info<sycl::ext::oneapi::experimental::info::device::matrix_combinations>()) {
++        if (c.atype == mx::matrix_type::sint8 && c.btype == mx::matrix_type::sint8 &&
++            c.ctype == mx::matrix_type::sint32 && c.dtype == mx::matrix_type::sint32 &&
++            (c.max_msize >= 8 || c.msize == 8) && (c.max_nsize >= (size_t) sg || c.nsize == (size_t) sg) &&
++            (c.max_ksize >= 32 || c.ksize == 32)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++// sub-group size of the built int8 tile the current device lists (the wider one first), 0 for none
++static int ggml_sycl_mmq_xmx_device_sg() {
++    static std::mutex                   mtx;
++    static std::unordered_map<int, int> known;
++    std::lock_guard<std::mutex>         lock(mtx);
++    const int                           id = ggml_sycl_get_device();
++    const auto                          it = known.find(id);
++    if (it != known.end()) {
++        return it->second;
++    }
++    int sg = 0;
++    try {
++        const sycl::device dev = dpct::dev_mgr::instance().get_device(id);
++        GGML_UNUSED(dev);
++#ifdef GGML_SYCL_MMQ_XMX_SG16
++        if (sg == 0 && ggml_sycl_mmq_xmx_device_has_tile(dev, 16)) {
++            sg = 16;
++        }
++#endif
++#ifdef GGML_SYCL_MMQ_XMX_SG8
++        if (sg == 0 && ggml_sycl_mmq_xmx_device_has_tile(dev, 8)) {
++            sg = 8;
++        }
++#endif
++    } catch (const sycl::exception &) {
++        sg = 0;
++    }
++    if (sg != 0) {
++        GGML_LOG_INFO("%s: device %d: int8 XMX tile 8x%dx32 at sub-group %d\n", __func__, id, sg, sg);
++    } else {
++        GGML_LOG_INFO("%s: device %d: no int8 XMX tile for it in this build, keeping the regular MMQ path\n",
++                      __func__, id);
++    }
++    known.emplace(id, sg);
++    return sg;
++}
++
++// =============================================================================
++// Public XMX Mul Mat Operation
++// =============================================================================
++
++void ggml_sycl_op_mul_mat_q_xmx(ggml_backend_sycl_context & ctx,
++                                const ggml_tensor *         src0,
++                                const ggml_tensor *         src1,
++                                ggml_tensor *               dst,
++                                const char *                src0_dd_i,
++                                const float *               src1_ddf_i,
++                                const char *                src1_ddq_i,
++                                float *                     dst_dd_i,
++                                const int64_t               row_low,
++                                const int64_t               row_high,
++                                const int64_t               src1_ncols,
++                                const int64_t               src1_padded_row_size,
++                                const dpct::queue_ptr &     stream) {
++    switch (ggml_sycl_mmq_xmx_device_sg()) {
++#ifdef GGML_SYCL_MMQ_XMX_SG16
++        case 16:
++            ggml_sycl_mmq_xmx_sg16::op_mul_mat_q_xmx(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i,
++                                                     row_low, row_high, src1_ncols, src1_padded_row_size, stream);
++            return;
++#endif
++#ifdef GGML_SYCL_MMQ_XMX_SG8
++        case 8:
++            ggml_sycl_mmq_xmx_sg8::op_mul_mat_q_xmx(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i,
++                                                    row_low, row_high, src1_ncols, src1_padded_row_size, stream);
++            return;
++#endif
++        default:
++            GGML_ABORT("%s: no int8 XMX tile for this device; check ggml_sycl_mmq_xmx_available() first", __func__);
++    }
++}
++
++// =============================================================================
++// XMX Support Checks
++// =============================================================================
++
++bool ggml_sycl_mmq_xmx_supports_type(ggml_type type) {
++    switch (type) {
++        case GGML_TYPE_Q4_0:
++            return true;
++        case GGML_TYPE_Q4_1:
++            return true;
++        case GGML_TYPE_Q8_0:
++            return true;
++        case GGML_TYPE_Q5_0:
++            return true;  // 5-bit, 1.52x speedup at pp
++        case GGML_TYPE_Q5_1:
++            return true;  // 5-bit with min offset
++        case GGML_TYPE_Q3_K:
++            return true;  // Re-enabled after fixing bit unpacking and scale extraction
++        case GGML_TYPE_Q4_K:
++            return true;  // 1.55x speedup at pp16 (256-element super-blocks)
++        case GGML_TYPE_Q5_K:
++            return true;  // 1.66x speedup at pp16
++        case GGML_TYPE_Q2_K:
++            return true;  // 2-bit K-quant
++        case GGML_TYPE_Q6_K:
++            return true;  // 6-bit K-quant
++        default:
++            return false;
++    }
++}
++
++bool ggml_sycl_mmq_xmx_available() {
++    return ggml_sycl_mmq_xmx_device_sg() != 0;
++}
++
++void ggml_sycl_mmq_xmx_get_tile_dims(int * m, int * n, int * k) {
++    if (!m || !n || !k) {
++        return;
++    }
++    // the int8 tile picked for the current device, all zero when it has none
++    const int sg = ggml_sycl_mmq_xmx_device_sg();
++    *m           = sg ? 8 : 0;
++    *n           = sg;
++    *k           = sg ? 32 : 0;
++}
++
++#else   // !SYCL_XMX_AVAILABLE
++
++void ggml_sycl_op_mul_mat_q_xmx(ggml_backend_sycl_context & ctx,
++                                const ggml_tensor *         src0,
++                                const ggml_tensor *         src1,
++                                ggml_tensor *               dst,
++                                const char *                src0_dd_i,
++                                const float *               src1_ddf_i,
++                                const char *                src1_ddq_i,
++                                float *                     dst_dd_i,
++                                const int64_t               row_low,
++                                const int64_t               row_high,
++                                const int64_t               src1_ncols,
++                                const int64_t               src1_padded_row_size,
++                                const dpct::queue_ptr &     stream) {
++    GGML_LOG_WARN("XMX not available\n");
++    (void) ctx;
++    (void) src0;
++    (void) src1;
++    (void) dst;
++    (void) src0_dd_i;
++    (void) src1_ddf_i;
++    (void) src1_ddq_i;
++    (void) dst_dd_i;
++    (void) row_low;
++    (void) row_high;
++    (void) src1_ncols;
++    (void) src1_padded_row_size;
++    (void) stream;
++}
++
++bool ggml_sycl_mmq_xmx_supports_type(ggml_type type) {
++    (void) type;
++    return false;
++}
++
++bool ggml_sycl_mmq_xmx_available() {
++    return false;
++}
++
++void ggml_sycl_mmq_xmx_get_tile_dims(int * m, int * n, int * k) {
++    *m = 0;
++    *n = 0;
++    *k = 0;
++}
++
++#endif  // SYCL_XMX_AVAILABLE
++
++#endif  // GGML_SYCL_MMQ_XMX
+diff --git a/ggml/src/ggml-sycl/mmq_xmx.hpp b/ggml/src/ggml-sycl/mmq_xmx.hpp
+new file mode 100644
+index 00000000..a2513d42
+--- /dev/null
++++ b/ggml/src/ggml-sycl/mmq_xmx.hpp
+@@ -0,0 +1,37 @@
++//
++// XMX-accelerated quantized matrix multiplication for Intel Arc GPUs
++// Uses Intel Xe Matrix eXtensions (XMX) via SYCL joint_matrix API
++//
++
++#ifndef GGML_SYCL_MMQ_XMX_HPP
++#define GGML_SYCL_MMQ_XMX_HPP
++
++#include "common.hpp"
++
++// Check if XMX is available for GEMM acceleration
++bool ggml_sycl_mmq_xmx_available();
++
++// Get XMX tile dimensions (M, N, K) for Int8
++// For Intel Arc B50: M=8, N=16, K=32
++void ggml_sycl_mmq_xmx_get_tile_dims(int * m, int * n, int * k);
++
++// Check if a quantization type is supported by XMX kernels
++bool ggml_sycl_mmq_xmx_supports_type(ggml_type type);
++
++// XMX-accelerated quantized matrix multiplication operation
++// Matches the signature of ggml_sycl_op_mul_mat_q for drop-in replacement
++void ggml_sycl_op_mul_mat_q_xmx(ggml_backend_sycl_context & ctx,
++                                const ggml_tensor *         src0,
++                                const ggml_tensor *         src1,
++                                ggml_tensor *               dst,
++                                const char *                src0_dd_i,
++                                const float *               src1_ddf_i,
++                                const char *                src1_ddq_i,
++                                float *                     dst_dd_i,
++                                const int64_t               row_low,
++                                const int64_t               row_high,
++                                const int64_t               src1_ncols,
++                                const int64_t               src1_padded_row_size,
++                                const dpct::queue_ptr &     stream);
++
++#endif  // GGML_SYCL_MMQ_XMX_HPP
+diff --git a/ggml/src/ggml-sycl/mmq_xmx_tile.inc b/ggml/src/ggml-sycl/mmq_xmx_tile.inc
+new file mode 100644
+index 00000000..1e13045f
+--- /dev/null
++++ b/ggml/src/ggml-sycl/mmq_xmx_tile.inc
+@@ -0,0 +1,4063 @@
++// int8 XMX MMQ kernels for one DPAS tile shape. mmq_xmx.cpp includes this file once per shape,
++// inside a namespace, with MMQ_XMX_TILE_SG set to the sub-group size (= tile columns), so there is
++// no include guard.
++#ifndef MMQ_XMX_TILE_SG
++#    error "include mmq_xmx_tile.inc through mmq_xmx.cpp"
++#endif
++
++// =============================================================================
 +// XMX Int8 GEMM configuration
 +// =============================================================================
-+// The int8 DPAS tile is 8x16x32 at sub-group 16 on Xe2/Xe-HPC and 8x8x32 at sub-group 8 on Xe-HPG
-+// (Arc A-series). GGML_SYCL_MMQ_XMX_SG picks the shape at build time; a device without that shape
-+// keeps the regular MMQ path (ggml_sycl_mmq_xmx_available), because IGC cannot build these kernels for it.
-+#ifndef GGML_SYCL_MMQ_XMX_SG
-+#    define GGML_SYCL_MMQ_XMX_SG 16
-+#endif
-+static_assert(GGML_SYCL_MMQ_XMX_SG == 8 || GGML_SYCL_MMQ_XMX_SG == 16, "GGML_SYCL_MMQ_XMX_SG must be 8 or 16");
-+constexpr int XMX_M       = 8;                     // Tile rows
-+constexpr int XMX_N       = GGML_SYCL_MMQ_XMX_SG;  // Tile columns
-+constexpr int XMX_K       = 32;                    // Reduction dimension (matches QK8_0 and QK4_0!)
-+constexpr int XMX_SG_SIZE = GGML_SYCL_MMQ_XMX_SG;  // Sub-group size of the DPAS tile
++constexpr int XMX_M       = 8;                // Tile rows
++constexpr int XMX_N       = MMQ_XMX_TILE_SG;  // Tile columns: 16 on Xe2/Xe-HPC, 8 on Xe-HPG
++constexpr int XMX_K       = 32;               // Reduction dimension (matches QK8_0 and QK4_0!)
++constexpr int XMX_SG_SIZE = MMQ_XMX_TILE_SG;  // Sub-group size of the DPAS tile
 +
 +// =============================================================================
 +// Single-Tile Configuration (optimized for XMX)
@@ -4065,22 +4323,22 @@ index 00000000..94017997
 +}
 +
 +// =============================================================================
-+// Public XMX Mul Mat Operation
++// XMX Mul Mat Operation for this tile shape
 +// =============================================================================
 +
-+void ggml_sycl_op_mul_mat_q_xmx(ggml_backend_sycl_context & ctx,
-+                                const ggml_tensor *         src0,
-+                                const ggml_tensor *         src1,
++void op_mul_mat_q_xmx(ggml_backend_sycl_context & ctx,
++                       const ggml_tensor *         src0,
++                       const ggml_tensor *         src1,
 +                                ggml_tensor *               dst,
-+                                const char *                src0_dd_i,
-+                                const float *               src1_ddf_i,
-+                                const char *                src1_ddq_i,
++                       const char *                src0_dd_i,
++                       const float *               src1_ddf_i,
++                       const char *                src1_ddq_i,
 +                                float *                     dst_dd_i,
-+                                const int64_t               row_low,
-+                                const int64_t               row_high,
-+                                const int64_t               src1_ncols,
-+                                const int64_t               src1_padded_row_size,
-+                                const dpct::queue_ptr &     stream) {
++                       const int64_t               row_low,
++                       const int64_t               row_high,
++                       const int64_t               src1_ncols,
++                       const int64_t               src1_padded_row_size,
++                       const dpct::queue_ptr &     stream) {
 +    const int64_t ne00     = src0->ne[0];         // K dimension
 +    const int64_t row_diff = row_high - row_low;  // M dimension (rows to process)
 +
@@ -4156,173 +4414,3 @@ index 00000000..94017997
 +    GGML_UNUSED(src1);
 +    GGML_UNUSED(src1_ddf_i);
 +}
-+
-+// =============================================================================
-+// XMX Support Checks
-+// =============================================================================
-+
-+bool ggml_sycl_mmq_xmx_supports_type(ggml_type type) {
-+    switch (type) {
-+        case GGML_TYPE_Q4_0:
-+            return true;
-+        case GGML_TYPE_Q4_1:
-+            return true;
-+        case GGML_TYPE_Q8_0:
-+            return true;
-+        case GGML_TYPE_Q5_0:
-+            return true;  // 5-bit, 1.52x speedup at pp
-+        case GGML_TYPE_Q5_1:
-+            return true;  // 5-bit with min offset
-+        case GGML_TYPE_Q3_K:
-+            return true;  // Re-enabled after fixing bit unpacking and scale extraction
-+        case GGML_TYPE_Q4_K:
-+            return true;  // 1.55x speedup at pp16 (256-element super-blocks)
-+        case GGML_TYPE_Q5_K:
-+            return true;  // 1.66x speedup at pp16
-+        case GGML_TYPE_Q2_K:
-+            return true;  // 2-bit K-quant
-+        case GGML_TYPE_Q6_K:
-+            return true;  // 6-bit K-quant
-+        default:
-+            return false;
-+    }
-+}
-+
-+bool ggml_sycl_mmq_xmx_available() {
-+    namespace mx = sycl::ext::oneapi::experimental::matrix;
-+    static std::mutex                   mtx;
-+    static std::unordered_map<int, bool> known;
-+    std::lock_guard<std::mutex>         lock(mtx);
-+    const int                           id = ggml_sycl_get_device();
-+    const auto                          it = known.find(id);
-+    if (it != known.end()) {
-+        return it->second;
-+    }
-+    bool ok = false;
-+    try {
-+        const sycl::device dev      = dpct::dev_mgr::instance().get_device(id);
-+        const auto         sg_sizes = dev.get_info<sycl::info::device::sub_group_sizes>();
-+        const bool         sg_ok    = std::find(sg_sizes.begin(), sg_sizes.end(), (size_t) XMX_SG_SIZE) != sg_sizes.end();
-+        for (const auto & c : dev.get_info<sycl::ext::oneapi::experimental::info::device::matrix_combinations>()) {
-+            if (sg_ok && c.atype == mx::matrix_type::sint8 && c.btype == mx::matrix_type::sint8 &&
-+                c.ctype == mx::matrix_type::sint32 && c.dtype == mx::matrix_type::sint32 &&
-+                (c.max_msize >= (size_t) XMX_M || c.msize == (size_t) XMX_M) &&
-+                (c.max_nsize >= (size_t) XMX_N || c.nsize == (size_t) XMX_N) &&
-+                (c.max_ksize >= (size_t) XMX_K || c.ksize == (size_t) XMX_K)) {
-+                ok = true;
-+                break;
-+            }
-+        }
-+    } catch (const sycl::exception &) {
-+        ok = false;
-+    }
-+    GGML_LOG_INFO("%s: device %d: int8 XMX tile %dx%dx%d at sub-group %d %s\n", __func__, id, XMX_M, XMX_N, XMX_K,
-+                  XMX_SG_SIZE, ok ? "available" : "not available, keeping the regular MMQ path");
-+    known.emplace(id, ok);
-+    return ok;
-+}
-+
-+void ggml_sycl_mmq_xmx_get_tile_dims(int * m, int * n, int * k) {
-+    if (!m || !n || !k) {
-+        return;
-+    }
-+    // Fixed Int8 XMX tile for the mainline-shaped extraction (see note in
-+    // ggml_sycl_op_mul_mat_q_xmx): the fork's per-device xmx_caps struct is not
-+    // present, so report the compile-time tile dimensions.
-+    *m = XMX_M;
-+    *n = XMX_N;
-+    *k = XMX_K;
-+}
-+
-+#else   // !SYCL_XMX_AVAILABLE
-+
-+void ggml_sycl_op_mul_mat_q_xmx(ggml_backend_sycl_context & ctx,
-+                                const ggml_tensor *         src0,
-+                                const ggml_tensor *         src1,
-+                                ggml_tensor *               dst,
-+                                const char *                src0_dd_i,
-+                                const float *               src1_ddf_i,
-+                                const char *                src1_ddq_i,
-+                                float *                     dst_dd_i,
-+                                const int64_t               row_low,
-+                                const int64_t               row_high,
-+                                const int64_t               src1_ncols,
-+                                const int64_t               src1_padded_row_size,
-+                                const dpct::queue_ptr &     stream) {
-+    GGML_LOG_WARN("XMX not available\n");
-+    (void) ctx;
-+    (void) src0;
-+    (void) src1;
-+    (void) dst;
-+    (void) src0_dd_i;
-+    (void) src1_ddf_i;
-+    (void) src1_ddq_i;
-+    (void) dst_dd_i;
-+    (void) row_low;
-+    (void) row_high;
-+    (void) src1_ncols;
-+    (void) src1_padded_row_size;
-+    (void) stream;
-+}
-+
-+bool ggml_sycl_mmq_xmx_supports_type(ggml_type type) {
-+    (void) type;
-+    return false;
-+}
-+
-+bool ggml_sycl_mmq_xmx_available() {
-+    return false;
-+}
-+
-+void ggml_sycl_mmq_xmx_get_tile_dims(int * m, int * n, int * k) {
-+    *m = 0;
-+    *n = 0;
-+    *k = 0;
-+}
-+
-+#endif  // SYCL_XMX_AVAILABLE
-+
-+#endif  // GGML_SYCL_MMQ_XMX
-diff --git a/ggml/src/ggml-sycl/mmq_xmx.hpp b/ggml/src/ggml-sycl/mmq_xmx.hpp
-new file mode 100644
-index 00000000..a2513d42
---- /dev/null
-+++ b/ggml/src/ggml-sycl/mmq_xmx.hpp
-@@ -0,0 +1,37 @@
-+//
-+// XMX-accelerated quantized matrix multiplication for Intel Arc GPUs
-+// Uses Intel Xe Matrix eXtensions (XMX) via SYCL joint_matrix API
-+//
-+
-+#ifndef GGML_SYCL_MMQ_XMX_HPP
-+#define GGML_SYCL_MMQ_XMX_HPP
-+
-+#include "common.hpp"
-+
-+// Check if XMX is available for GEMM acceleration
-+bool ggml_sycl_mmq_xmx_available();
-+
-+// Get XMX tile dimensions (M, N, K) for Int8
-+// For Intel Arc B50: M=8, N=16, K=32
-+void ggml_sycl_mmq_xmx_get_tile_dims(int * m, int * n, int * k);
-+
-+// Check if a quantization type is supported by XMX kernels
-+bool ggml_sycl_mmq_xmx_supports_type(ggml_type type);
-+
-+// XMX-accelerated quantized matrix multiplication operation
-+// Matches the signature of ggml_sycl_op_mul_mat_q for drop-in replacement
-+void ggml_sycl_op_mul_mat_q_xmx(ggml_backend_sycl_context & ctx,
-+                                const ggml_tensor *         src0,
-+                                const ggml_tensor *         src1,
-+                                ggml_tensor *               dst,
-+                                const char *                src0_dd_i,
-+                                const float *               src1_ddf_i,
-+                                const char *                src1_ddq_i,
-+                                float *                     dst_dd_i,
-+                                const int64_t               row_low,
-+                                const int64_t               row_high,
-+                                const int64_t               src1_ncols,
-+                                const int64_t               src1_padded_row_size,
-+                                const dpct::queue_ptr &     stream);
-+
-+#endif  // GGML_SYCL_MMQ_XMX_HPP

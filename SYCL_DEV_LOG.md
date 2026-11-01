@@ -106,11 +106,14 @@ oneAPI came from conda-forge into `/opt/oneapi` on a GPU-less cloud box:
   tile was 8x16x32 at sub-group 16 (the Xe2 shape), and IGC 2.43 crashes on it
   for `acm-g10` (floating point exception). The A/B in this log never noticed
   because Q4_0 never reaches MMQ on the A770; the first K-quant MMQ call would
-  have crashed the JIT. 0016 now takes `GGML_SYCL_MMQ_XMX_SG` (16 default, 8 for
-  the A770): with 8, all 15 kernels compile to `dpas.8x8` for `acm-g10`, and the
-  JIT sub-group-16 build still compiles. `ggml_sycl_mmq_xmx_available()` now
-  checks the device reports the built int8 shape, so a mismatched build keeps
-  the regular MMQ path. Numerics of the 8-wide tile are unverified.
+  have crashed the JIT. 0016 now builds both int8 tiles, 8x16x32 at sub-group 16
+  and 8x8x32 at sub-group 8, and picks the one the device lists at run time;
+  nothing to configure. The two shapes land in separate device images (one per
+  `reqd_sub_group_size`), so the A770's JIT only ever compiles the 8-wide image.
+  An AOT build keeps only its target's shape (`GGML_SYCL_XMX_AOT_SG`):
+  `acm-g10` gets 15 kernels with `dpas.8x8 (8|M0)`, `bmg-g21` 15 with
+  `dpas.8x8 (16|M0)`. A device with neither shape keeps the regular MMQ path.
+  Numerics of the 8-wide tile are unverified on hardware.
 - **Candidate C40 (ef777 GQA decode) did not build for DG2 as published.** The
   q8_0 D=256 SLM ESIMD kernel's in-kernel `mask` null test made IGC emit a
   64-bit shift (`shr ... 0x20:uq`, "Q destination data type is not supported"),

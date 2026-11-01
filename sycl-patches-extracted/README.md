@@ -55,17 +55,19 @@ public entry points (`ggml_sycl_mmq_xmx_available()`,
 - The whole translation unit is wrapped in `#ifdef GGML_SYCL_MMQ_XMX` (mainline
   globs `*.cpp`, so the file is always compiled; when the option is OFF it is an
   empty TU).
-- The per-device `xmx_caps` struct is replaced with a compile-time Int8 tile:
-  `XMX_M=8, XMX_K=32`, and `XMX_N` = sub-group size = `GGML_SYCL_MMQ_XMX_SG`
-  (CMake cache variable, default 16). The default 8x16x32 sub-group-16 tile is
-  the Xe2/Xe-HPC shape: IGC 2.43 crashes building it for `acm-g10`, so on an
-  A770 configure with `-DGGML_SYCL_MMQ_XMX_SG=8` (the Xe-HPG 8x8x32 shape; all
-  15 kernels then compile to `dpas.8x8` for `acm-g10`, numerics unverified on
-  hardware). `ggml_sycl_mmq_xmx_available()` checks that the device reports the
-  built shape and otherwise keeps the regular MMQ path, so a mismatched build no
-  longer reaches the driver compiler. Before 2026-11-01 the tile was fixed at
-  sub-group 16, so an MMQ_XMX=ON build on the A770 only worked because Q4_0 never
-  reached the MMQ path.
+- The per-device `xmx_caps` struct is replaced with the two Int8 DPAS tiles,
+  picked per device at run time: 8x16x32 at sub-group 16 (Xe2, Xe-HPC) and
+  8x8x32 at sub-group 8 (Xe-HPG, so the A770). The kernels live once in
+  `mmq_xmx_tile.inc`, which `mmq_xmx.cpp` includes into one namespace per shape;
+  `ggml_sycl_mmq_xmx_available()` queries the device's `matrix_combinations` and
+  routes to the shape it lists, or keeps the regular MMQ path if it lists
+  neither. The shapes have different `reqd_sub_group_size`, so they land in
+  separate device images and a JIT build never asks IGC for the other one (IGC
+  2.43 crashes building the sub-group-16 tile for `acm-g10`). An AOT build keeps
+  only its target's shape through `GGML_SYCL_XMX_AOT_SG`. Before 2026-11-01 the
+  tile was fixed at sub-group 16, so an MMQ_XMX=ON build on the A770 only
+  worked because Q4_0 never reached the MMQ path. The 8-wide numerics are
+  unverified on hardware.
 - The tiered-cache lookup, the `GGML_SYCL_XMX_GEMM` env/global machinery, the
   `GGML_SYCL_KTRACE` profiling, the weight-layout tier check, and the
   `mem-ops` / `unified_allocate` self-test are removed.
@@ -212,6 +214,6 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
     -m ~/LLM/Gemma-4-E2B-It-Heretic-Ara-4.6B-Q4_0.gguf \
     -p 512 -n 128 -r 3
 
-# To opt into 0016's XMX path on the A770 (8x8x32 sub-group-8 tile), rebuild with:
-cmake -B build -DGGML_SYCL_MMQ_XMX=ON -DGGML_SYCL_MMQ_XMX_SG=8 && cmake --build build -j$(nproc) --target llama-bench
+# To opt into 0016's XMX path (the tile shape is picked per device), rebuild with:
+cmake -B build -DGGML_SYCL_MMQ_XMX=ON && cmake --build build -j$(nproc) --target llama-bench
 ```
