@@ -153,6 +153,56 @@ oneAPI came from conda-forge into `/opt/oneapi` on a GPU-less cloud box:
   floating point exception, likely from GPU-only device properties. The only
   numeric test of SYCL kernels here is C60's standalone emulation above.
 
+## Quant-type gap fill (2026-11-01)
+
+Audit of which kernel each quant type reaches with the stack applied, against what the carried PRs
+cover. Two gaps were filled as local patches; the rest are listed with the reason they stay open.
+
+- **`ZZ-LOCAL-0003`, multi-column MMVQ for i-quants.** IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ4_NL
+  (and IQ3_XXS without the reorder) were the only quantized types whose 2..8-column MMVQ (speculative
+  decoding verify, small batches) looped one column at a time and reread the weights per column. They
+  now use the generic `mul_mat_vec_q_ncols` kernel with their one-column qi / vdr / vec_dot.
+- **`ZZ-LOCAL-0004`, MoE expert reorder for Q4_0 / Q2_K / Q3_K.** The 2D reorder covers these, the MoE
+  reorder did not (only Q8_0, Q4_K, Q5_K, Q6_K, MXFP4), so their fused MoE decode read the block layout.
+  Each expert slice now gets the 2D layout (one tail writer shared with the 2D reorder) and runs the
+  generic MoE reorder MMVQ. All other readers of a reordered expert tensor already handle these types
+  (per-expert MMVQ / DMMV / ESIMD / dequantize, the grouped GEMM's `fg_soa`, candidate C20/C21).
+- **Verification.** The SYCL backend now runs on the CPU OpenCL device
+  (`sycl-patches-extracted/tools/cpu-device-test/`). The earlier attempt failed because the
+  `-ze-intel-greater-than-4GB-buffer-required` link option is embedded in every device image and the
+  CPU compiler rejects it; with it dropped, a per-kernel device-code split, and the GPU-only paths
+  (ESIMD, DPAS, oneDNN, the `joint_matrix` dequant GEMM) switched off, `test-backend-ops` runs against
+  the CPU backend. Before and after the two patches, all of these pass: MUL_MAT for iq2_xxs 74/74,
+  iq2_xs / iq2_s / iq1_s / iq1_m 49/49 each, iq4_nl 56/56, iq3_xxs without reorder 49/49, q4_0
+  111/111, q2_K 55/55, q3_K 48/48; MUL_MAT_ID q4_0 106/106, q2_K 14/14, q3_K 14/14. With the reorder
+  forced on: MUL_MAT_ID q4_0 106/106, q2_K 14/14, q3_K 14/14, q4_K 110/110, q8_0 108/108; MUL_MAT
+  q4_0, q2_K, q3_K, iq3_xxs all pass. SYCL debug logging shows the new multi-column kernels run, and
+  the device-program cache shows the per-expert reorder and the MoE reorder MMVQ kernels being built
+  for Q4_0, Q2_K and Q3_K once the reorder is on. `mmvq.cpp` with both patches builds for `acm-g10`:
+  49 new multi-column kernels, no spills; the Q3_K MoE reorder kernel's first IGC attempt spilled
+  192 bytes, its retry none. Not measured: speed on the A770.
+- **`0014` is probably obsolete.** It drops Q2_K / Q4_K / Q5_K from GET_ROWS because they missed the
+  test epsilon on the A770 (NMSE 2-4e-7 against 1e-7), a half-precision symptom. Those types now
+  dequantize through the float `dequantize_q*_K_f32` paths, and with 0014's gate lifted all three pass
+  GET_ROWS on the CPU device (8/8 each). One A770 run decides: unapply 0014, then
+  `test-backend-ops -b SYCL0 -o GET_ROWS`.
+- **`0016`'s XMX MMQ path cannot run.** Its dispatch sits in the `use_mul_mat_q` branch, and upstream's
+  `ggml_sycl_supports_mmq()` returns false for every type ("accuracy issues in MMQ"), so
+  `-DGGML_SYCL_MMQ_XMX=ON` changes nothing. That, not the oneMKL routing, is why the ON / OFF numbers
+  in `sycl-patches-extracted/README.md` match.
+- **Left open:**
+  - IQ4_NL 2D reorder: its block matches Q4_0's, but the grouped GEMM has no SoA stage for it and
+    candidate C20 has its own IQ4_NL SoA reader, so a new layout would need both kept in step.
+  - IQ3_XXS / IQ3_S MoE reorder: the grouped GEMM has no SoA stage for them, so MoE prefill would
+    drop from the grouped GEMM to the per-expert loop.
+  - TQ1_0, TQ2_0, PTQ1_0 (carried PR 29672) and F8_E4M3 have no SYCL kernels and run on the CPU.
+    PR 29676 (not carried, CUDA) is the reference for PTQ1_0.
+  - Flash attention already takes every legacy KV type (q4_0, q4_1, q5_0, q5_1, q8_0, f16, bf16) and
+    different K and V types: `common.hpp` defines `GGML_SYCL_FA_ALL_QUANTS`. Only C60's DPAS kernel
+    and C40's decode kernel are limited to q4_0 / q8_0 (C40: q8_0 / f16).
+  - MMQ is off for every type (above); prompt processing goes through dequantize + oneDNN / the XMX
+    dequant GEMM.
+
 ## Update (2026-11-01, upstream refresh to `dde879bc1`)
 
 Refreshed from `23b0202a1` (480 upstream commits). The header bullets above

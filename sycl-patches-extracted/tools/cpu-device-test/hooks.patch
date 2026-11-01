@@ -1,0 +1,52 @@
+TEST ONLY - never part of the stack, never applied by apply.sh.
+
+Lets ggml-sycl run on Intel's CPU OpenCL device, so test-backend-ops can check SPMD kernels without an
+Intel GPU (ESIMD, DPAS and joint_matrix still need the GPU):
+- dpct picks the CPU platform when GGML_SYCL_TEST_CPU_DEVICE is set;
+- GGML_SYCL_TEST_FORCE_REORDER turns the reorder (SoA) optimization on, which is otherwise only
+  enabled on Intel GPUs;
+- the -ze-intel-greater-than-4GB-buffer-required link option is dropped: the CPU OpenCL compiler
+  rejects it, and every kernel build failed (UR_RESULT_ERROR_UNKNOWN) while it was embedded.
+
+diff --git a/ggml/src/ggml-sycl/CMakeLists.txt b/ggml/src/ggml-sycl/CMakeLists.txt
+index a98e1abd..6a923729 100644
+--- a/ggml/src/ggml-sycl/CMakeLists.txt
++++ b/ggml/src/ggml-sycl/CMakeLists.txt
+@@ -291,7 +291,7 @@ endif()
+ if (GGML_SYCL_TARGET STREQUAL "INTEL")
+     add_compile_definitions(GGML_SYCL_WARP_SIZE=16)
+     if (NOT GGML_SYCL_DEVICE_ARCH)
+-        target_link_options(ggml-sycl PRIVATE -Xs -ze-intel-greater-than-4GB-buffer-required)
++        # scratch CPU-device test build: option dropped (the CPU OpenCL compiler rejects it)
+     else()
+         message(STATUS "Skipping -ze-intel-greater-than-4GB-buffer-required for spir64_gen AOT")
+     endif()
+diff --git a/ggml/src/ggml-sycl/dpct/helper.hpp b/ggml/src/ggml-sycl/dpct/helper.hpp
+index fd3b9655..3f23dc7c 100644
+--- a/ggml/src/ggml-sycl/dpct/helper.hpp
++++ b/ggml/src/ggml-sycl/dpct/helper.hpp
+@@ -910,6 +910,10 @@ namespace dpct
+ 
+         inline std::string get_preferred_gpu_platform_name() {
+             std::string result;
++            // scratch test hook, not part of the stack: run the backend on the CPU OpenCL device
++            if (getenv("GGML_SYCL_TEST_CPU_DEVICE")) {
++                return sycl::device(sycl::cpu_selector_v).get_platform().get_info<sycl::info::platform::name>();
++            }
+ 
+             std::string filter = "";
+             char* env = getenv("ONEAPI_DEVICE_SELECTOR");
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 5a32b657..7f83181b 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -255,7 +255,8 @@ static ggml_sycl_device_info ggml_sycl_init() {
+         info.devices[i].cc =
+             100 * prop.get_major_version() + 10 * prop.get_minor_version();
+         info.devices[i].nsm = prop.get_max_compute_units() / 16; //16: Number of Xe Cores
+-        info.devices[i].opt_feature.reorder = device.ext_oneapi_architecture_is(syclex::arch_category::intel_gpu);
++        info.devices[i].opt_feature.reorder = device.ext_oneapi_architecture_is(syclex::arch_category::intel_gpu) ||
++            getenv("GGML_SYCL_TEST_FORCE_REORDER") != nullptr; // scratch CPU-device test hook
+ #if GGML_SYCL_DNNL
+         info.devices[i].opt_feature.onednn_optimized_gemm = ggml_sycl_dnnl_detect_optimized_gemm(i);
+ #endif

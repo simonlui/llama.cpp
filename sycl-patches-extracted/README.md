@@ -14,10 +14,11 @@ research tree (memory tiering, autotuning dispatch, ESIMD, profiling) is **not**
 extractable as idiomatic backend code and is intentionally excluded — see
 "What was deliberately left behind".
 
-Manual repairs that are required by the current upstream tree go in the
-separate `ZZ-LOCAL-*` group in this directory. They are not folded into the
-numbered extracted history and remain independently reversible. None is active
-at the moment.
+Local work on top of the stack goes in the separate `ZZ-LOCAL-*` group in this
+directory: repairs the current upstream tree needs, and gap fills for quant types
+the carried PRs leave out. They are not folded into the numbered extracted
+history and remain independently reversible. Two are active: `ZZ-LOCAL-0003` and
+`ZZ-LOCAL-0004` (see the patch index).
 
 ## Patch index
 
@@ -25,6 +26,8 @@ at the moment.
 |---|------|--------------|------|
 | 0015 | `0015-sycl-softmax-reduce-over-group.patch` | Replaces the block max/sum barrier+SLM reductions in `softmax.cpp` with `sycl::reduce_over_group`. Reduction-only; **keeps upstream exp semantics** (`sycl::native::exp` + the `-80.0f` clamp). | cleanup |
 | 0016 | `0016-sycl-mmq-xmx.patch` | Experimental XMX (Intel Xe Matrix eXtensions / `joint_matrix`) Int8 MMQ path, gated behind the `GGML_SYCL_MMQ_XMX` CMake option (default OFF). Reshaped from the fork's `mmq_xmx.*`. | perf (build-flag gated) |
+| ZZ-LOCAL-0003 | `ZZ-LOCAL-0003-sycl-mmvq-multi-col-iq.patch` | 2..8-column MMVQ for IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ4_NL and non-reordered IQ3_XXS, the only quantized types that reread their weights per column in a speculative-decoding verify or small batch. Generic `mul_mat_vec_q_ncols` with each type's one-column qi / vdr / vec_dot. | perf (gap fill) |
+| ZZ-LOCAL-0004 | `ZZ-LOCAL-0004-sycl-moe-reorder-q4_0-q2_k-q3_k.patch` | Reorders Q4_0, Q2_K and Q3_K MoE expert weights per expert slice (the 2D reorder layout, one shared tail writer per type) and runs them through the generic MoE reorder MMVQ. Before, only Q8_0, Q4_K, Q5_K, Q6_K and MXFP4 experts were reordered. IQ3 is left out because the grouped GEMM has no SoA stage for it. | perf (gap fill) |
 
 The former `ZZ-LOCAL-0001` made direct SYCL `CONV_2D` index input, kernel, and
 output by their real strides. It was retired on 2026-11-01 as superseded by
@@ -99,6 +102,11 @@ is gone, so runtime behavior/perf differs from the research tree.
   symbol scan found no call without a definition, no removed definition that
   is still referenced, and no duplicate definition inside one TU. Build with
   `icpx` before relying on it, both with and without `-DGGML_SYCL_MMQ_XMX=ON`.
+- **`ZZ-LOCAL-0003` / `ZZ-LOCAL-0004` (2026-11-01):** built with `icpx` 2026.2 (JIT, and `mmvq.cpp`
+  for `acm-g10`) and tested with `test-backend-ops` on the CPU OpenCL device through
+  `tools/cpu-device-test/`, with and without the reorder forced on: every MUL_MAT and MUL_MAT_ID case
+  of the affected types passes against the CPU backend. Speed on the A770 is not measured. Details
+  in `SYCL_DEV_LOG.md` ("Quant-type gap fill").
 - The scripts snapshot pre-existing untracked paths in the worktree's Git
   administrative directory. Files introduced by an apply are removed on
   unapply, while paths present before apply are protected. The state file is
