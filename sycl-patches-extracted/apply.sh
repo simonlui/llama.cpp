@@ -2,10 +2,8 @@
 # Apply the full SYCL patch stack in dependency order:
 #   1. Fork patches:  sycl-patches/0*.patch       (the author's experimental SYCL work)
 #   2. Upstream PRs:  sycl-patches/PR-*.patch     (pulled from upstream llama.cpp)
-#   3. Late upstream: PR 29864 follows PR 29889 because its re-anchored diff
-#                     includes both changes.
-#   4. Extracted:     sycl-patches-extracted/0*.patch (isolated fork patches)
-#   5. Local repairs: sycl-patches-extracted/ZZ-LOCAL-*.patch
+#   3. Extracted:     sycl-patches-extracted/0*.patch (isolated fork patches)
+#   4. Local repairs: sycl-patches-extracted/ZZ-LOCAL-*.patch
 # Already-applied patches are skipped; real conflicts stop with diagnostics.
 
 set -euo pipefail
@@ -29,16 +27,6 @@ STATE_FILE="$STATE_DIR/sycl-patches-extracted.untracked"
 shopt -s nullglob
 FORK_PATCHES=("$FORK_DIR"/0*.patch)
 UPSTREAM_PATCHES=("$FORK_DIR"/PR-*.patch)
-UPSTREAM_ORDERED=()
-UPSTREAM_LATE_PATCHES=()
-for patch_path in "${UPSTREAM_PATCHES[@]}"; do
-    if [[ "${patch_path##*/}" == "PR-29864.patch" ]]; then
-        UPSTREAM_LATE_PATCHES+=("$patch_path")
-    else
-        UPSTREAM_ORDERED+=("$patch_path")
-    fi
-done
-UPSTREAM_PATCHES=("${UPSTREAM_ORDERED[@]}")
 EXTRACTED_PATCHES=("$SCRIPT_DIR"/0*.patch)
 LOCAL_PATCHES=("$SCRIPT_DIR"/ZZ-LOCAL-*.patch)
 shopt -u nullglob
@@ -109,7 +97,6 @@ snapshot_untracked_files
 
 apply_group "Fork" "${FORK_PATCHES[@]+"${FORK_PATCHES[@]}"}"
 apply_group "Upstream" "${UPSTREAM_PATCHES[@]+"${UPSTREAM_PATCHES[@]}"}"
-apply_group "Upstream late dependencies" "${UPSTREAM_LATE_PATCHES[@]+"${UPSTREAM_LATE_PATCHES[@]}"}"
 apply_group "Extracted" "${EXTRACTED_PATCHES[@]+"${EXTRACTED_PATCHES[@]}"}"
 apply_group "Local repairs" "${LOCAL_PATCHES[@]+"${LOCAL_PATCHES[@]}"}"
 

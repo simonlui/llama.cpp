@@ -9,7 +9,7 @@ This directory contains a series of patches for the SYCL backend of `llama.cpp`,
 | ~~0001~~ | ~~BMG AOT + reorder dequant + async~~ | ~~Bugfix~~ | Merged upstream via PR #22147/#22152/#22153/#22156 — retired |
 | 0002 | Remove dpct capability checks | Cleanup | Code quality |
 | ~~0003~~ | ~~PAD non-contiguous stride~~ | ~~Bugfix~~ | Merged upstream as PR #22148 — retired |
-| 0004 | Relax SUM + split GROUP_NORM gate | Bugfix | Relaxes SUM to `contiguous_rows`; splits GROUP_NORM to its own full-contiguous gate. NORM/L2_NORM/RMS_NORM no longer touched here - upstream #25044 made those kernels stride-generic, verified 81/81 on A770 |
+| 0004 | Split GROUP_NORM gate | Bugfix | Gives GROUP_NORM its own full-contiguous gate (its kernel has no stride params). NORM/L2_NORM/RMS_NORM are not touched here - upstream #25044 made those kernels stride-generic, verified 81/81 on A770. The former SUM relaxation to `contiguous_rows` was dropped on 2026-11-01: `ggml_sycl_op_sum` sums `ne` consecutive floats, so the row-contiguous view with gaps that upstream #28851 now tests (`test_sum`, `slice=true`) would compute wrong data. The file name is unchanged so the `pull_base.sh` pin still matches |
 | ~~0005~~ | ~~RMS_NORM+MUL fusion~~ | ~~Optimization~~ | Superseded by upstream RMS_NORM+MUL implementation; retired |
 | ~~0006~~ | ~~6 new ops + oneMKL TRSM~~ | ~~Feature~~ | Merged upstream as PR #22149 — retired |
 | 0007 | Barrier local_space fence | Bugfix | Correctness |
@@ -23,49 +23,50 @@ This directory contains a series of patches for the SYCL backend of `llama.cpp`,
 | ~~0016~~ | ~~quant: use `n_layer_all` for MoE ffn counts~~ | ~~Bugfix (non-SYCL)~~ | Merged upstream as `b3ce5cedf` (`quant : fix quantizing moe with mtp (#24986)`) — retired |
 | 0017 | Gate the ternary types out of `supports_op` | Correctness | The SYCL backend implements no kernel for `TQ1_0`/`TQ2_0` anywhere, but `supports_op` only checks operand types per op, so the `TQ2_0` entry in test-backend-ops' `all_types` aborts the run three times over - `set_rows.cpp:547 Unsupported tensor type!`, then `cpy.cpp:1409 fatal error`, then `mmvq.cpp:2681 unsupport data type=tq2_0`. One central type gate (metadata-only ops excepted) replaces what would otherwise be three per-op gates; the types fall back to CPU |
 
-### Fetched upstream PRs (`PR-*.patch`) - checked 2026-10-10
+### Fetched upstream PRs (`PR-*.patch`) - checked 2026-11-01
 
 `pull_prs.sh` uses the `SYCL` label as its scope and does not require `SYCL` in
 the title. It carries open, non-draft PRs created in the last 60 days. This
-snapshot uses upstream `23b0202a189c44a54625aadcb37a946dd1d6278` and a
-creation-date window starting 2026-08-11.
+snapshot uses upstream `dde879bc1` (`sycl: Try PkgConfig for LevelZero includes
+/ libs (#31076)`) and a creation-date window starting 2026-09-02.
 
 | PR | What | State |
 |----|------|-------|
-| 28725 | SYCL graph record and replay | open; collapsed from 11 commits into one cumulative diff |
-| 29107 | IQ3 code reorder | open; includes the standard IQ3_S multi-column path |
-| 29337 | reordered Q8_0 MoE weights | open |
-| 29338 | guard DMMV reads at row tails | open; re-anchored after PR 29337 |
-| 29506 | build the SYCL backend with a separate compiler | open |
-| 29672 | add PTQ1_0 ternary type | open; re-anchored with both quantization regression tests |
-| 29696 | wide q4_K/q5_K dequant stores | open; re-anchored after PR 29687 |
-| 29864 | multi-column XMX MMVQ and fused gate/up | open; regenerated against the current stack and applied after the other PRs |
-| 29889 | fix `mul_mat`, split-buffer, and host-pool memory errors | open; re-anchored after PR 29809 |
-| 30206 | support `truncate=false` for YaRN | open |
-| 30226 | Q4_K MMVQ wide row pairing | open |
-| 30271 | fix SYCL compiler warnings | open |
-| 30286 | fix flash-attention crash for query-head dimension mismatch | open |
+| 29506 | build the SYCL backend with a separate compiler | open; re-anchored on the upstream F16 footnote anchor in `docs/backend/SYCL.md` (pinned) |
+| 29672 | add PTQ1_0 ternary type | open; re-anchored next to upstream `GGML_TYPE_F8_E4M3` (pinned) |
+| 30156 | device-side MoE scheduler | open; was explicitly skipped for its overlap with PR 28725, which has merged; applies cleanly on the current stack |
+| 30206 | support `truncate=false` for YaRN | open; re-anchored: `test_rope_set_rows` keeps upstream `n_dims` and adds the PR's `yarn`/`truncate` (pinned) |
+| 30606 | route BMG D=256 single-query decode to the FA vector kernel | open |
+| 30857 | f16 support for SWIGLU_OAI | open |
+| 30956 | fast `ggml_sycl_comm_exchange()` for `-sm tensor` | open; carries two trailing-whitespace lines from the PR |
+| 31109 | bound CONV_TRANSPOSE_1D input iteration | open |
+| 31126 | cache the current device id | open |
+| 31138 | thread-safe oneDNN FA cache, memoized runtime failures | open |
+| 31208 | drop the fattn-mkl host-wait check from graph checks | open |
+| 31285 | refuse device buffers that would exceed VRAM | open |
+| 31325 | dmmv launcher cleanup | open; re-anchored after fork patches 0002/0008 (pinned) |
+| 31355 | fuse recurrent convolution windows | open |
+| 31460 | accept only implemented types in MUL_MAT, SET_ROWS and CPY | open; re-anchored after PR 29672: its whitelist replaces the per-op TQ1_0/TQ2_0/PTQ1_0 blocklists (pinned) |
+| 31465 | exact rounding in CPY to Q4_1, Q5_1 and Q8_0 | open |
 
-PR 30156 (device-side MoE scheduler) is open and non-draft but explicitly
-skipped. Its branch merges cleanly with current upstream by itself, but its
-SYCL dispatch changes conflict with the carried PR 28725 graph-replay changes
-when combined. The patch is archived until those changes can be reconciled as
-one stack. PR 26631 remains explicitly skipped because its patch conflicts
-with current upstream and GitHub reports `mergeable_state=dirty`; its previous
-test-matrix defect is documented in `SYCL_DEV_LOG.md`.
+Retired in this refresh because upstream merged them: `28725`, `29107`,
+`29337`, `29338`, `29696`, `29864`, `29889`, `30271`, and `30286`. PR 30226
+closed without merging and was retired. Their pins and the `SKIP_PRS` entries
+for merged PR 26631 and now-carried PR 30156 were removed. The retired files
+are in this branch's Git history; no `../patch-backups/` copy was made because
+the refresh ran outside the usual checkout.
 
-The current query skipped drafts `30239`, `29801`, `29676`, `29510`, `29367`,
-`29247`, `27983`, `27325`, `27324`, and `27322`. PR 29367's draft status also
-means its dependent extracted patch 0013 and local repairs 0002/0004 are not
-active. PR 29809 and PR 29500 are merged; local repair 0003 was superseded by
-PR 29809 and is archived. PR 29796 is an older open draft and was archived
-during stale-patch cleanup.
+New open, non-draft PRs in the window that are explicitly skipped in
+`SKIP_PRS` because they are not SYCL-primary: `29510` (llama + CUDA
+`flash_attn_ext_rows`), `29676` (CUDA PTQ1_0), `30559` (CUDA IQ4_NL
+GET_ROWS), `30715` (CPU JQ*_K types), `30743` (cross-backend argsort/top-k),
+`30967` (docs only), `31066` (nix only), `31139` (cross-backend max
+allocation size), and `31236` (CPU reference MXFP4/NVFP4 rounding).
 
-Previously carried PR patches merged or became drafts and were archived:
-`26610`, `27689`, `29071`, `29171`, `29245`, `29367`, `29375`, `29507`,
-`29687`, `29796`, and `29809`. Other merged PRs are already part of the
-upstream base. Retired patch files are archived with a SHA-256 prefix under
-`../patch-backups/upstream-refresh-YYYYMMDD/sycl-patches/`.
+The query skipped drafts `31428`, `31379`, `31313`, `30802`, `30718`, `30717`,
+`30716`, `29896`, `29801`, `29367`, `29247`, and `28898`. PR 29367's draft
+status still keeps the archived extracted 0013 and local repairs 0002/0004
+inactive.
 
 `PINNED` is reserved for carried, locally re-anchored patches. `SKIP_PRS`
 records explicit open-PR exclusions with reasons. Drafts are skipped
@@ -74,7 +75,8 @@ maintained in a separate drop list. If GitHub cannot be queried, the script
 leaves local patches untouched.
 
 Earlier refresh backups remain under
-`../patch-backups/upstream-refresh-20261003/` and
+`../patch-backups/upstream-refresh-20261010/`,
+`../patch-backups/upstream-refresh-20261003/`, and
 `../patch-backups/upstream-refresh-20260920/`.
 
 ### Extracted (experimental, `sycl-patches-extracted/`)
@@ -85,15 +87,12 @@ fusion is supplied by merged upstream PR 27610 and is not carried locally.
 The former 0013 MMVQ multirow-Y SLM optimization depends on draft PR 29367's
 integer-tag dispatch, so it is archived and its number is not reused.
 
-`ZZ-LOCAL-0001-sycl-conv2d-strided-layout.patch` fixes direct CONV_2D for
-non-contiguous tensors. Upstream PR 26786 proposed a narrower input-only fix
-and closed without merging. The local patch covers input, kernel, and output
-strides, so it remains active.
-
-The former local repairs 0002 and 0004 depended on draft PR 29367 and are
-archived. Local repair 0003 was superseded when PR 29809 merged and is archived.
-The independently applicable `ZZ-LOCAL-0001` CONV_2D stride repair remains
-active and reversible.
+No local repairs are active. `ZZ-LOCAL-0001` (CONV_2D strides) was retired on
+2026-11-01: upstream #30363 runs WHCN and CWHN input/kernel layouts on SYCL and
+gates every other layout to CPU, and CONV_2D's destination is always a new
+contiguous tensor, so the output-stride half of the repair had no effect.
+The former local repairs 0002 and 0004 depended on draft PR 29367, and local
+repair 0003 was superseded by PR 29809; all three stay archived.
 
 ## Quick start
 

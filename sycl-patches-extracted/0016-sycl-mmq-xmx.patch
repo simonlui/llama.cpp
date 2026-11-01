@@ -1,20 +1,20 @@
 diff --git a/ggml/CMakeLists.txt b/ggml/CMakeLists.txt
-index 7f8a1f706..2fdb42196 100644
+index 4dab3a62..692c488f 100644
 --- a/ggml/CMakeLists.txt
 +++ b/ggml/CMakeLists.txt
-@@ -250,6 +250,7 @@ option(GGML_RPC                             "ggml: use RPC"
- option(GGML_SYCL                            "ggml: use SYCL"                                  OFF)
+@@ -252,6 +252,7 @@ option(GGML_SYCL                            "ggml: use SYCL"
  option(GGML_SYCL_F16                        "ggml: use 16 bit floats for sycl calculations"   OFF)
+ option(GGML_SYCL_SUPPORT_XMX                "ggml: build the XMX (DPAS) code paths in the SYCL backend" ON)
  option(GGML_SYCL_GRAPH                      "ggml: enable graphs in the SYCL backend"         ON)
 +option(GGML_SYCL_MMQ_XMX                    "ggml: enable experimental XMX MMQ kernels for the SYCL backend" OFF)
  option(GGML_SYCL_HOST_MEM_FALLBACK          "ggml: allow host memory fallback in SYCL reorder (requires kernel 6.8+)" ON)
  option(GGML_SYCL_SUPPORT_LEVEL_ZERO_API     "ggml: use Level Zero API in SYCL backend"  ON)
  option(GGML_SYCL_DNN                        "ggml: enable oneDNN in the SYCL backend"         ON)
 diff --git a/ggml/src/ggml-sycl/CMakeLists.txt b/ggml/src/ggml-sycl/CMakeLists.txt
-index d2196f74d..300fd2564 100644
+index 2a2cc2b4..a98e1abd 100644
 --- a/ggml/src/ggml-sycl/CMakeLists.txt
 +++ b/ggml/src/ggml-sycl/CMakeLists.txt
-@@ -193,6 +193,11 @@ if (GGML_SYCL_GRAPH)
+@@ -313,6 +313,11 @@ if (GGML_SYCL_GRAPH)
      target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_GRAPH)
  endif()
  
@@ -27,10 +27,10 @@ index d2196f74d..300fd2564 100644
      message(STATUS "find GGML_SYCL_HOST_MEM_FALLBACK")
      target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_HOST_MEM_FALLBACK)
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 7cabc9dcf..925f9e581 100644
+index c94620f7..69627901 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -65,6 +65,9 @@
+@@ -71,6 +71,9 @@
  #include "ggml-sycl/getrows.hpp"
  #include "ggml-sycl/mem.hpp"
  #include "ggml-sycl/norm.hpp"
@@ -40,13 +40,13 @@ index 7cabc9dcf..925f9e581 100644
  #include "ggml-sycl/presets.hpp"
  #include "ggml-sycl/quantize.hpp"
  #include "ggml-sycl/repeat_back.hpp"
-@@ -4933,7 +4936,14 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
+@@ -5308,7 +5311,14 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
              ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
          }
      } else if (use_mul_mat_q) {
 -        ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_q);
 +#ifdef GGML_SYCL_MMQ_XMX
-+        if (ggml_sycl_xmx_available() && ggml_sycl_xmx_supports_type(src0->type)) {
++        if (ggml_sycl_mmq_xmx_available() && ggml_sycl_mmq_xmx_supports_type(src0->type)) {
 +            ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_q_xmx);
 +        } else
 +#endif
@@ -58,7 +58,7 @@ index 7cabc9dcf..925f9e581 100644
      }
 diff --git a/ggml/src/ggml-sycl/mmq_xmx.cpp b/ggml/src/ggml-sycl/mmq_xmx.cpp
 new file mode 100644
-index 000000000..bd3a3f6fa
+index 00000000..ea9bf1ff
 --- /dev/null
 +++ b/ggml/src/ggml-sycl/mmq_xmx.cpp
 @@ -0,0 +1,4178 @@
@@ -4148,7 +4148,7 @@ index 000000000..bd3a3f6fa
 +// XMX Support Checks
 +// =============================================================================
 +
-+bool ggml_sycl_xmx_supports_type(ggml_type type) {
++bool ggml_sycl_mmq_xmx_supports_type(ggml_type type) {
 +    switch (type) {
 +        case GGML_TYPE_Q4_0:
 +            return true;
@@ -4175,11 +4175,11 @@ index 000000000..bd3a3f6fa
 +    }
 +}
 +
-+bool ggml_sycl_xmx_available() {
++bool ggml_sycl_mmq_xmx_available() {
 +    return true;
 +}
 +
-+void ggml_sycl_xmx_get_tile_dims(int * m, int * n, int * k) {
++void ggml_sycl_mmq_xmx_get_tile_dims(int * m, int * n, int * k) {
 +    if (!m || !n || !k) {
 +        return;
 +    }
@@ -4222,16 +4222,16 @@ index 000000000..bd3a3f6fa
 +    (void) stream;
 +}
 +
-+bool ggml_sycl_xmx_supports_type(ggml_type type) {
++bool ggml_sycl_mmq_xmx_supports_type(ggml_type type) {
 +    (void) type;
 +    return false;
 +}
 +
-+bool ggml_sycl_xmx_available() {
++bool ggml_sycl_mmq_xmx_available() {
 +    return false;
 +}
 +
-+void ggml_sycl_xmx_get_tile_dims(int * m, int * n, int * k) {
++void ggml_sycl_mmq_xmx_get_tile_dims(int * m, int * n, int * k) {
 +    *m = 0;
 +    *n = 0;
 +    *k = 0;
@@ -4242,7 +4242,7 @@ index 000000000..bd3a3f6fa
 +#endif  // GGML_SYCL_MMQ_XMX
 diff --git a/ggml/src/ggml-sycl/mmq_xmx.hpp b/ggml/src/ggml-sycl/mmq_xmx.hpp
 new file mode 100644
-index 000000000..34b716a24
+index 00000000..a2513d42
 --- /dev/null
 +++ b/ggml/src/ggml-sycl/mmq_xmx.hpp
 @@ -0,0 +1,37 @@
@@ -4257,14 +4257,14 @@ index 000000000..34b716a24
 +#include "common.hpp"
 +
 +// Check if XMX is available for GEMM acceleration
-+bool ggml_sycl_xmx_available();
++bool ggml_sycl_mmq_xmx_available();
 +
 +// Get XMX tile dimensions (M, N, K) for Int8
 +// For Intel Arc B50: M=8, N=16, K=32
-+void ggml_sycl_xmx_get_tile_dims(int * m, int * n, int * k);
++void ggml_sycl_mmq_xmx_get_tile_dims(int * m, int * n, int * k);
 +
 +// Check if a quantization type is supported by XMX kernels
-+bool ggml_sycl_xmx_supports_type(ggml_type type);
++bool ggml_sycl_mmq_xmx_supports_type(ggml_type type);
 +
 +// XMX-accelerated quantized matrix multiplication operation
 +// Matches the signature of ggml_sycl_op_mul_mat_q for drop-in replacement

@@ -1,0 +1,156 @@
+From 747f1817d3af77f2336831b885d47919d1bf7128 Mon Sep 17 00:00:00 2001
+From: Jesse Symons <155509533+Torchit1@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 21:30:31 +1100
+Subject: [PATCH] [SYCL] exact rounding in CPY to Q4_1, Q5_1 and Q8_0
+
+Division and tie rounding in the conversion path don't match the CPU, so
+test-backend-ops -o CPY fails 20/50 runs on a B70 and 19/50 on a B580.
+
+Fixes #31140.
+
+Assisted-by: Claude
+---
+ ggml/src/CMakeLists.txt    |  6 ++++
+ ggml/src/ggml-sycl/cpy.hpp | 61 ++++++++++++++++++++------------------
+ 2 files changed, 38 insertions(+), 29 deletions(-)
+
+diff --git a/ggml/src/CMakeLists.txt b/ggml/src/CMakeLists.txt
+index fe001a04..8717820b 100644
+--- a/ggml/src/CMakeLists.txt
++++ b/ggml/src/CMakeLists.txt
+@@ -216,6 +216,12 @@ set_target_properties(ggml-base PROPERTIES
+ configure_file(ggml-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/ggml-version.h @ONLY)
+ 
+ target_include_directories(ggml-base PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
++
++# icx/icpx default to -fp-model=fast, which contracts and reassociates the reference quantizers, so their output
++# depends on the compiler; keep ggml-base IEEE-exact so the CPU reference matches gcc/clang builds
++if (CMAKE_C_COMPILER_ID STREQUAL "IntelLLVM")
++    target_compile_options(ggml-base PRIVATE -fp-model=precise)
++endif()
+ if (GGML_BACKEND_DL)
+     target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)
+ endif()
+diff --git a/ggml/src/ggml-sycl/cpy.hpp b/ggml/src/ggml-sycl/cpy.hpp
+index 9d639608..d0e20f46 100644
+--- a/ggml/src/ggml-sycl/cpy.hpp
++++ b/ggml/src/ggml-sycl/cpy.hpp
+@@ -25,6 +25,24 @@ __dpct_inline__ int best_index_int8(int n, const int8_t * val, float x) {
+     return x - val[mu - 1] < val[mu] - x ? mu - 1 : mu;
+ }
+ 
++// exact roundf (half away from zero); x + 0.5f carries for x = 0.5 - 2^-25, and sycl::round is not exact under fast fp
++inline int round_half_away_int(float x) {
++    const float t = sycl::trunc(x);
++    return (int) (sycl::fabs(x - t) >= 0.5f ? t + sycl::copysign(1.0f, x) : t);
++}
++
++// correctly rounded a / b to match the CPU: fast fp gives an approximate reciprocal (~12% off by an ulp on B580),
++// so pick the approximation or a neighbour by smallest exact FMA residual
++inline float div_correctly_rounded(float a, float b) {
++    const float y  = a / b;
++    const float lo = sycl::nextafter(y, -INFINITY);
++    const float hi = sycl::nextafter(y, INFINITY);
++    const float e  = sycl::fabs(sycl::fma(-b, y, a));
++    const float el = sycl::fabs(sycl::fma(-b, lo, a));
++    const float eh = sycl::fabs(sycl::fma(-b, hi, a));
++    return el < e && el <= eh ? lo : (eh < e ? hi : y);
++}
++
+ inline void cpy_blck_f32_q8_0(const char * cxi, char * cdsti) {
+     const float * xi   = (const float *) cxi;
+     block_q8_0 *  dsti = (block_q8_0 *) cdsti;
+@@ -36,15 +54,16 @@ inline void cpy_blck_f32_q8_0(const char * cxi, char * cdsti) {
+         amax          = sycl::fmax(amax, sycl::fabs((float) v));
+     }
+ 
+-    const float d  = amax / ((1 << 7) - 1);
+-    const float id = d ? 1.0f / d : 0.0f;
++    // matches the x86 AVX/AVX2 CPU path (ggml-cpu/arch/x86/quants.c): id = 127/amax, round half to even
++    const float d  = div_correctly_rounded(amax, 127.0f);
++    const float id = amax != 0.0f ? div_correctly_rounded(127.0f, amax) : 0.0f;
+ 
+     dsti->d = d;
+ 
+     for (int j = 0; j < QK8_0; ++j) {
+         const float x0 = xi[j] * id;
+ 
+-        dsti->qs[j] = sycl::round((float) x0);
++        dsti->qs[j] = (int) sycl::rint(x0);
+     }
+ }
+ 
+@@ -70,24 +89,6 @@ inline void cpy_blck_f32_q1_0(const char * cxi, char * cdsti) {
+     }
+ }
+ 
+-// exact roundf (half away from zero); x + 0.5f carries for x = 0.5 - 2^-25, and sycl::round is not exact under fast fp
+-inline int round_half_away_int(float x) {
+-    const float t = sycl::trunc(x);
+-    return (int) (sycl::fabs(x - t) >= 0.5f ? t + sycl::copysign(1.0f, x) : t);
+-}
+-
+-// correctly rounded a / b to match the CPU: fast fp gives an approximate reciprocal (~12% off by an ulp on B580),
+-// so pick the approximation or a neighbour by smallest exact FMA residual
+-inline float div_correctly_rounded(float a, float b) {
+-    const float y  = a / b;
+-    const float lo = sycl::nextafter(y, -INFINITY);
+-    const float hi = sycl::nextafter(y, INFINITY);
+-    const float e  = sycl::fabs(sycl::fma(-b, y, a));
+-    const float el = sycl::fabs(sycl::fma(-b, lo, a));
+-    const float eh = sycl::fabs(sycl::fma(-b, hi, a));
+-    return el < e && el <= eh ? lo : (eh < e ? hi : y);
+-}
+-
+ inline void cpy_blck_f32_q2_0(const char * cxi, char * cdsti) {
+     const float * xi   = (const float *) cxi;
+     block_q2_0 *  dsti = (block_q2_0 *) cdsti;
+@@ -423,8 +424,8 @@ inline void cpy_blck_f32_q4_1(const char * cxi, char * cdsti) {
+         vmax = sycl::max(v, vmax);
+     }
+ 
+-    const float d  = (vmax - vmin) / ((1 << 4) - 1);
+-    const float id = d ? 1.0f / d : 0.0f;
++    const float d  = div_correctly_rounded(vmax - vmin, (1 << 4) - 1);
++    const float id = d ? div_correctly_rounded(1.0f, d) : 0.0f;
+ 
+     dsti->dm.x() = d;
+     dsti->dm.y() = vmin;
+@@ -433,8 +434,9 @@ inline void cpy_blck_f32_q4_1(const char * cxi, char * cdsti) {
+         const float x0 = (xi[0 + j] - vmin) * id;
+         const float x1 = (xi[QK4_1 / 2 + j] - vmin) * id;
+ 
+-        const uint8_t xi0 = dpct::min(15, (int8_t) (x0 + 0.5f));
+-        const uint8_t xi1 = dpct::min(15, (int8_t) (x1 + 0.5f));
++        // fmin: no FMA, see cpy_blck_f32_q4_0
++        const uint8_t xi0 = dpct::min(15, (int8_t) (sycl::fmin(x0, 15.5f) + 0.5f));
++        const uint8_t xi1 = dpct::min(15, (int8_t) (sycl::fmin(x1, 15.5f) + 0.5f));
+ 
+         dsti->qs[j] = xi0;
+         dsti->qs[j] |= xi1 << 4;
+@@ -490,8 +492,8 @@ inline void cpy_blck_f32_q5_1(const char * cxi, char * cdsti) {
+         max           = v > max ? v : max;
+     }
+ 
+-    const float d  = (max - min) / 31;
+-    const float id = d ? 1.0f / d : 0.0f;
++    const float d  = div_correctly_rounded(max - min, 31);
++    const float id = d ? div_correctly_rounded(1.0f, d) : 0.0f;
+ 
+     dsti->dm.x() = d;
+     dsti->dm.y() = min;
+@@ -501,8 +503,9 @@ inline void cpy_blck_f32_q5_1(const char * cxi, char * cdsti) {
+         const float x0 = (xi[0 + j] - min) * id;
+         const float x1 = (xi[QK5_1 / 2 + j] - min) * id;
+ 
+-        const uint8_t xi0 = (uint8_t) (x0 + 0.5f);
+-        const uint8_t xi1 = (uint8_t) (x1 + 0.5f);
++        // fmin: no FMA, see cpy_blck_f32_q4_0
++        const uint8_t xi0 = (uint8_t) (sycl::fmin(x0, 31.5f) + 0.5f);
++        const uint8_t xi1 = (uint8_t) (sycl::fmin(x1, 31.5f) + 0.5f);
+ 
+         dsti->qs[j] = (xi0 & 0xf) | ((xi1 & 0xf) << 4);
+         qh |= ((xi0 & 0x10u) >> 4) << (j + 0);
+-- 
+2.43.0
+

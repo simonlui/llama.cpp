@@ -29,21 +29,25 @@ fi
 # draft patches are archived by the cleanup pass.
 declare -A PINNED=(
     # carried: locally re-anchored patches that must not be overwritten by a force-push
-    [28725]="collapsed the 11-commit PR series into one cumulative diff for clean application"
-    [29107]="re-anchored against current upstream with IQ3_XXS, IQ3_S, and MXFP4 tensor cases combined"
-    [29337]="re-anchored after PR-29107, retaining Q8_0 reorder and the upstream MXFP4 alignment guard"
-    [29338]="re-anchored after PR-29337 for the current upstream SYCL source"
-    [29672]="re-anchored after PR-29507 while preserving both quantization regression tests"
-    [29696]="re-anchored after PR-29687 while retaining the fork's no-capability-check policy"
-    [29864]="re-anchored after PR-29889 against the carried patch stack; apply after the other upstream PRs"
-    [29889]="re-anchored after PR-29809 using the existing host-forward-copy helper"
+    [29506]="re-anchored on upstream's sycl-f16-footnote anchor in docs/backend/SYCL.md; PR footnote 2 kept"
+    [29672]="re-anchored next to upstream GGML_TYPE_F8_E4M3 (43): PTQ1_0 stays 143, both ftypes and gguf-py entries kept; x86 q2_0 generic alias dropped as upstream did"
+    [30206]="re-anchored: test_rope_set_rows keeps upstream n_dims and the PR's yarn/truncate; the PR's yarn call site passes n_dims=128 explicitly so the bools do not bind to n_dims"
+    [31325]="re-anchored after fork patches 0002/0008: the dmmv launcher templates replace the capability-check-free launchers"
+    [31460]="re-anchored after PR-29672: the type whitelist replaces the per-op TQ1_0/TQ2_0/PTQ1_0 blocklists, and PTQ1_0 stays unsupported"
 )
 
 # Explicit exclusions are distinct from pinned carries and automatic draft or
 # merged/closed retirement. Keep the reason here so each open PR is auditable.
 declare -A SKIP_PRS=(
-    [30156]="overlaps the carried PR-28725 graph replay changes in SYCL dispatch; combined rebase needs a semantic resolution"
-    [26631]="open and non-draft, but its patch conflicts with current upstream and GitHub reports mergeable_state=dirty; archived pending a rebase"
+    [29510]="llama + CUDA flash_attn_ext_rows across 49 files; SYCL only gains a supports_op line; not SYCL-primary"
+    [29676]="CUDA support for PTQ1_0 on top of PR-29672; no SYCL kernel change; not SYCL-primary"
+    [30559]="CUDA IQ4_NL GET_ROWS; SYCL only gains a supports_op line; not SYCL-primary"
+    [30715]="new JQ*_K quantization types for CPU (2k lines); SYCL only gates the types out; not SYCL-primary"
+    [30743]="cross-backend argsort/top-k stride fix (CPU, CUDA, Metal, OpenCL); SYCL only gates; not SYCL-primary"
+    [30967]="docs only (README, build.md, SYCL.md); no SYCL backend change"
+    [31066]="nix packaging only; no SYCL backend change"
+    [31139]="cross-backend max-allocation-size reporting and MoE cache groups across 25 files; not SYCL-primary"
+    [31236]="changes the CPU reference MXFP4/NVFP4 rounding and gguf-py quantizers; not SYCL-primary"
     [21067]="cross-backend prefetch; not SYCL-primary"
     [21160]="cross-backend profiler; not SYCL-primary"
     [22098]="UMA-only allocation path; not applicable to the target dGPU"

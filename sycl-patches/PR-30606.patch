@@ -1,0 +1,306 @@
+From 4f645e0b86f9354e95b27625cb134a8038a5b30c Mon Sep 17 00:00:00 2001
+From: Anant Shrivastava <anant@anantshri.info>
+Date: Thu, 15 Oct 2026 20:12:51 +0530
+Subject: [PATCH 1/2] sycl: route BMG D=256 single-query decode to the FA
+ vector kernel
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The GQA-optimized tile config has been the dispatcher's preference for
+masked single-query decode since it landed. On Battlemage (bmg_g21/g31)
+with head dim 256 the vector kernel is materially faster at that shape:
+832 vs 1150 us per call at kv=65536, GQA4 (B70, op-level twins).
+
+Route single-query (Q->ne[1] == 1), non-quantized-KV, max_bias == 0 decode
+to BEST_FATTN_KERNEL_VEC on those parts/head sizes; every other arch, head
+size, and query count keeps the existing preference. Also drop the now
+redundant K->ne[1] % FATTN_KQ_STRIDE gate: the GQA-optimized TILE variant
+iterates its trailing chunk out-of-bounds-checked, so n_kv no longer needs
+to be a multiple of FATTN_KQ_STRIDE.
+
+End-to-end (Arc Pro B70, llama-bench -fa 1, 2 rounds reversed order):
+
+| cell | before | after | delta |
+|---|---:|---:|---:|
+| Spark-X2.5-4B BF16 tg @0 / @8k / @64k | 52.05 / 47.93 / 33.68 | 52.91 / 49.84 / 37.68 | +1.7 / +4.0 / +11.9% |
+| Spark-4B-Uncensored Q8_0 tg @0 / @8k / @64k | 98.11 / 84.65 / 48.49 | 101.73 / 90.68 / 57.14 | +3.7 / +7.1 / +17.8% |
+| Qwen3.8-27B Q4_K_XL tg128 @32k | 18.59 | 20.58 | +10.7% |
+
+Prefill unchanged by construction (dispatch edit is Q->ne[1] == 1 only);
+tail-arm pp cells measured flat (7603/7326/4859 vs 7603/7323/4853).
+
+Correctness gates: FA op suite 4073/4085 — the 12 non-green are
+pre-existing on the production binary (2 failures) plus 10 known >=32k-KV
+tolerance overages identical across both kernels; perplexity byte-identical
+between arms (14.7975 +/- 0.37670); greedy parity 4/5 byte-identical, the
+5th differs only in whitespace.
+---
+ ggml/src/ggml-sycl/fattn-tile.hpp | 29 ++++++++++++++++++++++++-----
+ ggml/src/ggml-sycl/fattn.cpp      | 14 ++++++++++++--
+ tests/test-backend-ops.cpp        | 28 +++++++++++++++++++++++++++-
+ 3 files changed, 63 insertions(+), 8 deletions(-)
+
+diff --git a/ggml/src/ggml-sycl/fattn-tile.hpp b/ggml/src/ggml-sycl/fattn-tile.hpp
+index dcdcad88..f4b35452 100644
+--- a/ggml/src/ggml-sycl/fattn-tile.hpp
++++ b/ggml/src/ggml-sycl/fattn-tile.hpp
+@@ -5,6 +5,7 @@
+ #include "fattn-common.hpp"
+ 
+ #include <cmath>
++#include <cstdio>
+ #include <float.h>
+ 
+ namespace syclex = sycl::ext::oneapi::experimental;
+@@ -880,15 +881,24 @@ static void flash_attn_tile(const char *  Q,
+                                             KQ_max_new_shared);
+         }
+     } else {
+-        // Branch without out-of-bounds checks.
+-        for (int k_VKQ_0 = item_ct1.get_group(1) * nbatch_fa; k_VKQ_0 < k_VKQ_max;
+-             k_VKQ_0 += item_ct1.get_group_range(1) * nbatch_fa) {
+-
++        // Branch without out-of-bounds checks for full chunks; the trailing partial
++        // chunk (n_kv not a multiple of nbatch_fa) takes the checked iteration, so
++        // the GQA-optimized variants no longer require K->ne[1] % FATTN_KQ_STRIDE == 0.
++        int k_VKQ_0 = item_ct1.get_group(1) * nbatch_fa;
++        while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
+             constexpr bool oob_check = false;
+             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap,
+                                  oob_check>(Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
+                                             stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
+                                             KQ_max_new_shared);
++            k_VKQ_0 += item_ct1.get_group_range(1) * nbatch_fa;
++        }
++        if (k_VKQ_0 < k_VKQ_max) {
++            constexpr bool oob_check = true;
++            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap,
++                                 oob_check>(Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
++                                            stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
++                                            KQ_max_new_shared);
+         }
+     }
+ 
+@@ -1166,7 +1176,16 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_sycl_context & ctx, ggm
+     // However, for DKQ == 576, DV == 512 only the kernel variant with GQA optimizations is implemented.
+     //const bool nvidia = GGML_SYCL_CC_IS_NVIDIA(ggml_sycl_info().devices[ggml_sycl_get_device()].cc);
+     const int gqa_limit = gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
+-    const bool use_gqa_opt = mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
++    // n_kv need not be a multiple of FATTN_KQ_STRIDE: the kernel handles the trailing
++    // partial chunk with the out-of-bounds checked iteration.
++    const bool use_gqa_opt = mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit;
++    {
++        static int dbg = ggml_sycl_get_env("GGML_SYCL_FA_TILE_DEBUG", 0);
++        if (dbg == 1) {
++            fprintf(stderr, "[FA-TILE] DKQ=%d DV=%d gqa=%d q=%lld n_kv=%lld gqa_opt=%d\n",
++                    DKQ, DV, gqa_ratio, (long long) Q->ne[1], (long long) K->ne[1], (int) use_gqa_opt);
++        }
++    }
+ 
+     if constexpr (DV == 512) {
+         if (use_gqa_opt && gqa_ratio % 16 == 0) {
+diff --git a/ggml/src/ggml-sycl/fattn.cpp b/ggml/src/ggml-sycl/fattn.cpp
+index 8bd946e0..ca1f95e8 100644
+--- a/ggml/src/ggml-sycl/fattn.cpp
++++ b/ggml/src/ggml-sycl/fattn.cpp
+@@ -127,7 +127,9 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
+     float logit_softcap = 0.0f;
+     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+ 
+-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
++    // The GQA-optimized TILE variant handles a trailing partial chunk (out-of-bounds
++    // checked iteration), so n_kv no longer needs to be a multiple of FATTN_KQ_STRIDE.
++    bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f;
+ 
+     // XMX-accelerated path: oneDNN SDPA (native F16 and dequant+non-F16).
+     // ONEDNN requires min 32 query tokens — short-circuit decode to avoid
+@@ -260,7 +262,15 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
+     if (can_use_vector_kernel) {
+         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
+             if (Q->ne[1] == 1) {
+-                if (!gqa_opt_applies) {
++                // BMG, D=256: single-query decode runs materially faster on the vector
++                // kernel than on the GQA-optimized tile config (832 vs 1150 us at
++                // kv=65536, GQA4, B70-measured; +4..+18% end-to-end tg at 8k..64k
++                // context on spark2_5/qwen35 D=256 models). Other archs and head sizes
++                // keep the tile dispatcher's original preference.
++                const gpu_arch arch = ggml_sycl_info().devices[device].hw_info.arch;
++                const bool vec_decode = (arch == gpu_arch::intel_gpu_bmg_g21 ||
++                                         arch == gpu_arch::intel_gpu_bmg_g31) && Q->ne[0] == 256;
++                if (vec_decode || !gqa_opt_applies) {
+                     return BEST_FATTN_KERNEL_VEC;
+                 }
+             }
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index ba7f7eb4..fb10553c 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11804,6 +11804,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     }
+ 
++    // GQA decode at long KV, aligned AND unaligned (spark2_5 GQA4, qwen35 GQA6): exercises the
++    // GQA-optimized tile variants' trailing partial chunk (n_kv % FATTN_KQ_STRIDE != 0).
++    for (int64_t kv : { 1024, 1025, 5003, 16383, 16384, 32767, 32768, 65535, 65536 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1}, kv, 1, true, false, 0, 0,
++                                                        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 1, true, false, 0, 0,
++                                                        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    }
++    // multi-row GQA (speculative-decode shape) and quantized K/V with the unaligned tail
++    for (int64_t kv : { 1025, 5003, 65535 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1}, kv, 2, true, false, 0, 0,
++                                                        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1}, kv, 5, true, false, 0, 0,
++                                                        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1}, kv, 1, true, false, 0, 0,
++                                                        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
++    }
++
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},   512, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  4096,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  4096,  16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+@@ -12315,8 +12333,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+ 
++    // GQA decode at long KV: the GQA-optimized tile variants (max_bias=0) vs the
++    // ncols2=1 fallback (max_bias=8 disables gqa_opt) — spark2_5 GQA4, qwen35 GQA6.
++    for (int64_t kv : { 1024, 8192, 16384, 32768, 65535, 65536 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1}, kv, 1, true, false, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    }
++
+     // sparse decode at long context
+-    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,    0));
++    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,    0));;
+     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
+     // gemma-4-26b-a4b global-attn layers: head_count_kv=2, 16 query heads (gqa_ratio=8)
+     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, { 8, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,    0));
+-- 
+2.43.0
+
+
+From d8d7400b33723a06248daef722844dd8c4929705 Mon Sep 17 00:00:00 2001
+From: Anant Shrivastava <anant@anantshri.info>
+Date: Mon, 19 Oct 2026 11:29:45 +0000
+Subject: [PATCH 2/2] sycl: wire GGML_SYCL_FA_TILE_DEBUG like
+ GGML_SYCL_DEV_DEBUG
+
+Address review feedback on the FA TILE dispatch instrumentation added in
+this PR: it read the env var through a static-local getenv at the call
+site. Follow the GGML_SYCL_DEV_DEBUG pattern instead:
+
+- g_ggml_sycl_fa_tile_debug is a global (extern in base.hpp, defined in
+  ggml-sycl.cpp), read once in ggml_check_sycl() during backend init,
+  so the per-call cost on the dispatch path is one unlikely branch: no
+  lazy first-call getenv and no per-template-instantiation static guard
+  (fattn-tile.hpp is instantiated once per DKQ/DV combination)
+- the call site in fattn-tile.hpp uses a GGML_SYCL_FA_TILE_DEBUG()
+  macro shaped like GGML_SYCL_DEV_DEBUG()
+- documented in docs/backend/SYCL.md (runtime env table) and echoed in
+  the init "Running with Environment Variables" log alongside the other
+  debug vars
+---
+ docs/backend/SYCL.md              |  1 +
+ ggml/src/ggml-sycl/base.hpp       |  7 +++++++
+ ggml/src/ggml-sycl/fattn-tile.hpp | 10 ++--------
+ ggml/src/ggml-sycl/ggml-sycl.cpp  |  3 +++
+ 4 files changed, 13 insertions(+), 8 deletions(-)
+
+diff --git a/docs/backend/SYCL.md b/docs/backend/SYCL.md
+index 81d293e4..2170547d 100644
+--- a/docs/backend/SYCL.md
++++ b/docs/backend/SYCL.md
+@@ -814,6 +814,7 @@ User can use the device management in [docs/multi-gpu.md](https://github.com/ggm
+ | GGML_SYCL_ENABLE_VMM | 0 or 1 (default) | Enable the virtual-memory device pool. |
+ | GGML_SYCL_ENABLE_MKL_FA | 1 (default) or 0 | Enable oneMKL GEMM flash attention for XMX-accelerated prompt processing with quantized KV cache. Automatically activates during prefill (prompt processing) when all conditions are met: (1) flash-attn enabled (`-fa` or `--flash-attn on`), (2) KV cache quantized (`--cache-type-k q8_0 --cache-type-v q8_0` or other `*_0/*_1` types), (3) batch size ≥ 1024 (`--batch-size 1024`), (4) prompt length ≥ 1024 tokens. Set to 0 to force the TILE kernel for A/B testing. Example minimum command: `llama-cli -m model.gguf -fa -ngl 99 --cache-type-k q8_0 --cache-type-v q8_0 --batch-size 1024 -p "your prompt"` |
+ | GGML_SYCL_MKL_FA_DEBUG | 0 (default) or 1 | Enable per-call diagnostic logging for MKL flash attention: GEMM/softmax timings, interleaved-head detection, and buffer memory usage. |
++| GGML_SYCL_FA_TILE_DEBUG | 0 (default) or 1 | Enable per-call diagnostic logging for the flash-attention TILE kernel dispatcher: head dims (DKQ/DV), GQA ratio, query rows, KV length, and whether the GQA-optimized variant is selected. |
+ | GGML_SYCL_MEMTRACE | 0 (default), 1, 2 | Enable record and output memory allocation diagnostics. Requires `-lv 4`. <br>0 -  Disable<br>1 - Basic memory info, including current and peak allocations, as well allocations from other sources, around 50 lines per model load.<br>2 - More verbose, logging around 900 specific allocations and deallocations. |
+ | GGML_SYCL_MEMTRACE_STEP | 64 (default) or positive integer | With GGML_SYCL_MEMTRACE=1, the minimum growth in memory usage to trigger another log record. |
+ | GGML_SYCL_MKL_FA_DIAG | 0 (default) or 1 | Enable output fingerprinting for MKL flash attention. Dumps the first 64 float output values for the first 6 FA calls with n_kv ≥ 1024, labeled with kernel type (MKL/TILE/VEC) for cross-kernel comparison. |
+diff --git a/ggml/src/ggml-sycl/base.hpp b/ggml/src/ggml-sycl/base.hpp
+index fe96c4ab..74812bba 100644
+--- a/ggml/src/ggml-sycl/base.hpp
++++ b/ggml/src/ggml-sycl/base.hpp
+@@ -18,6 +18,7 @@
+ 
+ extern int g_ggml_sycl_debug;
+ extern int g_ggml_sycl_dev_debug;
++extern int g_ggml_sycl_fa_tile_debug;
+ 
+ #if defined(__clang__) && __has_builtin(__builtin_expect)
+ // Hint the optimizer to pipeline the more likely following instruction in branches
+@@ -40,4 +41,10 @@ extern int g_ggml_sycl_dev_debug;
+             fprintf(stderr, __VA_ARGS__); \
+     } while (0)
+ 
++#define GGML_SYCL_FA_TILE_DEBUG(...)          \
++    do {                                      \
++        if (UNLIKELY(g_ggml_sycl_fa_tile_debug))  \
++            fprintf(stderr, __VA_ARGS__);     \
++    } while (0)
++
+ #endif  // GGML_SYCL_BASE_HPP
+diff --git a/ggml/src/ggml-sycl/fattn-tile.hpp b/ggml/src/ggml-sycl/fattn-tile.hpp
+index f4b35452..efd7fdc6 100644
+--- a/ggml/src/ggml-sycl/fattn-tile.hpp
++++ b/ggml/src/ggml-sycl/fattn-tile.hpp
+@@ -5,7 +5,6 @@
+ #include "fattn-common.hpp"
+ 
+ #include <cmath>
+-#include <cstdio>
+ #include <float.h>
+ 
+ namespace syclex = sycl::ext::oneapi::experimental;
+@@ -1179,13 +1178,8 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_sycl_context & ctx, ggm
+     // n_kv need not be a multiple of FATTN_KQ_STRIDE: the kernel handles the trailing
+     // partial chunk with the out-of-bounds checked iteration.
+     const bool use_gqa_opt = mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit;
+-    {
+-        static int dbg = ggml_sycl_get_env("GGML_SYCL_FA_TILE_DEBUG", 0);
+-        if (dbg == 1) {
+-            fprintf(stderr, "[FA-TILE] DKQ=%d DV=%d gqa=%d q=%lld n_kv=%lld gqa_opt=%d\n",
+-                    DKQ, DV, gqa_ratio, (long long) Q->ne[1], (long long) K->ne[1], (int) use_gqa_opt);
+-        }
+-    }
++    GGML_SYCL_FA_TILE_DEBUG("[FA-TILE] DKQ=%d DV=%d gqa=%d q=%lld n_kv=%lld gqa_opt=%d\n",
++                            DKQ, DV, gqa_ratio, (long long) Q->ne[1], (long long) K->ne[1], (int) use_gqa_opt);
+ 
+     if constexpr (DV == 512) {
+         if (use_gqa_opt && gqa_ratio % 16 == 0) {
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 6759af0e..e335b404 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -94,6 +94,7 @@
+ static bool g_sycl_loaded = false;
+ int g_ggml_sycl_debug = 0;
+ int g_ggml_sycl_dev_debug = 0;
++int g_ggml_sycl_fa_tile_debug = 0;
+ int g_ggml_sycl_enable_optimize = 1;
+ int g_ggml_sycl_enable_graph = 0;
+ int g_ggml_sycl_enable_dnn = 1;
+@@ -415,6 +416,7 @@ static void ggml_check_sycl() try {
+ 
+         g_ggml_sycl_debug = ggml_sycl_get_env("GGML_SYCL_DEBUG", 0);
+         g_ggml_sycl_dev_debug = ggml_sycl_get_env("GGML_SYCL_DEV_DEBUG", 0);
++        g_ggml_sycl_fa_tile_debug = ggml_sycl_get_env("GGML_SYCL_FA_TILE_DEBUG", 0);
+         g_ggml_sycl_enable_optimize = ggml_sycl_get_env("GGML_SYCL_ENABLE_OPT", 1);
+         g_ggml_sycl_enable_graph = ggml_sycl_get_env("GGML_SYCL_ENABLE_GRAPH", 0);
+         g_ggml_sycl_enable_dnn = ggml_sycl_get_env("GGML_SYCL_ENABLE_DNN", 1);
+@@ -507,6 +509,7 @@ static void ggml_check_sycl() try {
+         GGML_LOG_INFO("Running with Environment Variables:\n");
+         GGML_LOG_INFO("  GGML_SYCL_DEBUG: %d\n", g_ggml_sycl_debug);
+         GGML_LOG_INFO("  GGML_SYCL_DEV_DEBUG: %d\n", g_ggml_sycl_dev_debug);
++        GGML_LOG_INFO("  GGML_SYCL_FA_TILE_DEBUG: %d\n", g_ggml_sycl_fa_tile_debug);
+ 
+ #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
+         GGML_LOG_INFO("  GGML_SYCL_DEV2DEV_MEMCPY: %d (%s)\n", g_ggml_sycl_dev2dev_memcpy, dev2dev_int2str(g_ggml_sycl_dev2dev_memcpy));
+-- 
+2.43.0
+

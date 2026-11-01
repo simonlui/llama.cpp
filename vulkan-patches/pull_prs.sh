@@ -33,7 +33,10 @@ fi
 # When a pinned PR merges or closes, the cleanup pass prints a NOTE so the
 # entry (and any file) can be retired by hand.
 declare -A PINNED=(
+    # carried: locally collapsed, file exists
+    [29357]="collapsed the 3-commit series into one cumulative diff: commit 3 edits flash_attn_prefill.comp, which commit 1 creates, and git apply -R of the series leaves that new file behind"
     # not carried: intentionally out of scope, no patch file
+    [30641]="q8/q4 KV for the Xe FA decode kernel; merges cleanly with upstream but rewrites the same Xe FA dispatch block and decode-shader K/V offsets as carried PR-29357, so the two need a semantic merge"
     # Intel-titled drafts, including 24408 and 26829, are auto-skipped below.
 )
 

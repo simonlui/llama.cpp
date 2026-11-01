@@ -1,0 +1,173 @@
+diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
+index 9d665557..df26116b 100644
+--- a/ggml/src/ggml-sycl/common.hpp
++++ b/ggml/src/ggml-sycl/common.hpp
+@@ -240,6 +240,53 @@ typedef sycl::float2 dfloat2;
+ // most columns the fused gate and up XMX kernel is built for, GGML_SYCL_XMX_GLU_MAX_COLS can only lower this limit
+ #define GGML_SYCL_XMX_GLU_MAX_COLS 16
+ 
++// block-quantized types the SYCL kernels implement (dequantize, set_rows, cpy)
++static inline bool ggml_sycl_is_quantized_type(ggml_type type) {
++    switch (type) {
++        case GGML_TYPE_Q1_0:
++        case GGML_TYPE_Q2_0:
++        case GGML_TYPE_Q4_0:
++        case GGML_TYPE_Q4_1:
++        case GGML_TYPE_Q5_0:
++        case GGML_TYPE_Q5_1:
++        case GGML_TYPE_Q8_0:
++        case GGML_TYPE_MXFP4:
++        case GGML_TYPE_NVFP4:
++        case GGML_TYPE_Q2_K:
++        case GGML_TYPE_Q3_K:
++        case GGML_TYPE_Q4_K:
++        case GGML_TYPE_Q5_K:
++        case GGML_TYPE_Q6_K:
++        case GGML_TYPE_IQ2_XXS:
++        case GGML_TYPE_IQ2_XS:
++        case GGML_TYPE_IQ2_S:
++        case GGML_TYPE_IQ3_XXS:
++        case GGML_TYPE_IQ3_S:
++        case GGML_TYPE_IQ1_S:
++        case GGML_TYPE_IQ1_M:
++        case GGML_TYPE_IQ4_NL:
++        case GGML_TYPE_IQ4_XS:
++            return true;
++        default:
++            return false;
++    }
++}
++
++// float and quantized types the SYCL kernels can convert from and to; supports_op accepts only these,
++// so a type newly added to ggml stays unsupported until the backend implements it
++static inline bool ggml_sycl_supports_type(ggml_type type) {
++    switch (type) {
++        case GGML_TYPE_F32:
++        case GGML_TYPE_F16:
++#ifdef GGML_SYCL_HAS_BF16
++        case GGML_TYPE_BF16:
++#endif
++            return true;
++        default:
++            return ggml_sycl_is_quantized_type(type);
++    }
++}
++
+ static inline bool ggml_sycl_xmx_supports_type(ggml_type type) {
+     switch (type) {
+         case GGML_TYPE_Q2_K:
+diff --git a/ggml/src/ggml-sycl/cpy.cpp b/ggml/src/ggml-sycl/cpy.cpp
+index c488ef9c..b1118733 100644
+--- a/ggml/src/ggml-sycl/cpy.cpp
++++ b/ggml/src/ggml-sycl/cpy.cpp
+@@ -610,37 +610,6 @@ static void ggml_cpy_f16_q5_0_sycl(const char * cx, char * cdst, const int ne, c
+                          });
+ }
+ 
+-static bool ggml_sycl_is_quantized_type(enum ggml_type type) {
+-    switch (type) {
+-        case GGML_TYPE_Q1_0:
+-        case GGML_TYPE_Q2_0:
+-        case GGML_TYPE_Q4_0:
+-        case GGML_TYPE_Q4_1:
+-        case GGML_TYPE_Q5_0:
+-        case GGML_TYPE_Q5_1:
+-        case GGML_TYPE_Q8_0:
+-        case GGML_TYPE_MXFP4:
+-        case GGML_TYPE_NVFP4:
+-        case GGML_TYPE_Q2_K:
+-        case GGML_TYPE_Q3_K:
+-        case GGML_TYPE_Q4_K:
+-        case GGML_TYPE_Q5_K:
+-        case GGML_TYPE_Q6_K:
+-        case GGML_TYPE_IQ2_XXS:
+-        case GGML_TYPE_IQ2_XS:
+-        case GGML_TYPE_IQ2_S:
+-        case GGML_TYPE_IQ3_XXS:
+-        case GGML_TYPE_IQ3_S:
+-        case GGML_TYPE_IQ1_S:
+-        case GGML_TYPE_IQ1_M:
+-        case GGML_TYPE_IQ4_NL:
+-        case GGML_TYPE_IQ4_XS:
+-            return true;
+-        default:
+-            return false;
+-    }
+-}
+-
+ static bool ggml_sycl_can_quantize_rows_sycl(enum ggml_type type) {
+     switch (type) {
+         case GGML_TYPE_Q1_0:
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 2ef4072d..c94620f7 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -7395,7 +7395,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
+                     return false;
+                 }
+ 
+-                if (src0_type == GGML_TYPE_TQ2_0 || src0_type == GGML_TYPE_TQ1_0 || src0_type == GGML_TYPE_PTQ1_0) {
++                // the fallback path dequantizes src0, so it needs a type the SYCL converters implement
++                if (!ggml_sycl_supports_type(src0_type)) {
+                     return false;
+                 }
+ 
+@@ -7452,7 +7453,7 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
+ 
+         case GGML_OP_SET_ROWS:
+             {
+-                if (op->type == GGML_TYPE_TQ2_0 || op->type == GGML_TYPE_TQ1_0 || op->type == GGML_TYPE_PTQ1_0) {
++                if (!ggml_sycl_supports_type(op->type)) {
+                     return false;
+                 }
+                 auto res = (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 ||
+@@ -7486,7 +7487,26 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
+             {
+                 ggml_type src0_type = op->src[0]->type;
+                 ggml_type src1_type = op->src[1]->type;
+-
++                // contiguous same-type copies are a memcpy and work for any type; the rest needs kernels,
++                // which also exist for I16 and I32
++                auto cpy_type_ok = [](ggml_type t) {
++                    return ggml_sycl_supports_type(t) || t == GGML_TYPE_I16 || t == GGML_TYPE_I32;
++                };
++                const bool is_memcpy = src0_type == src1_type && ggml_is_contiguous(op->src[0]) &&
++                                       ggml_is_contiguous(op->src[1]);
++                if (!is_memcpy && (!cpy_type_ok(src0_type) || !cpy_type_ok(src1_type))) {
++                    return false;
++                }
++                // I16/I32 cross-type conversions only exist for F32<->I32; the rest have no kernels
++                const bool involves_i16_i32 = (src0_type == GGML_TYPE_I16 || src0_type == GGML_TYPE_I32) ||
++                                              (src1_type == GGML_TYPE_I16 || src1_type == GGML_TYPE_I32);
++                if (involves_i16_i32 && src0_type != src1_type &&
++                    !((src0_type == GGML_TYPE_F32 && src1_type ==
++GGML_TYPE_I32) ||
++                      (src0_type == GGML_TYPE_I32 && src1_type ==
++GGML_TYPE_F32))) {
++                    return false;
++                }
+                 if (src0_type == GGML_TYPE_F16) {
+                     if (src1_type == GGML_TYPE_Q2_K ||
+                         src1_type == GGML_TYPE_Q3_K ||
+@@ -7573,20 +7593,11 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
+                         src1_type == GGML_TYPE_IQ3_XXS ||
+                         src1_type == GGML_TYPE_IQ3_S ||
+                         src1_type == GGML_TYPE_IQ1_S ||
+-                        src1_type == GGML_TYPE_IQ1_M ||
+-                        src1_type == GGML_TYPE_TQ2_0 ||
+-                        src1_type == GGML_TYPE_TQ1_0 ||
+-                        src1_type == GGML_TYPE_PTQ1_0) {
++                        src1_type == GGML_TYPE_IQ1_M) {
+                         return false;
+                     }
+                 }
+ 
+-                if (src0_type == GGML_TYPE_TQ2_0 || src1_type == GGML_TYPE_TQ2_0 ||
+-                    src0_type == GGML_TYPE_TQ1_0 || src1_type == GGML_TYPE_TQ1_0 ||
+-                    src0_type == GGML_TYPE_PTQ1_0 || src1_type == GGML_TYPE_PTQ1_0) {
+-                    return false;
+-                }
+-
+                 return true;
+             }
+         case GGML_OP_REPEAT_BACK:

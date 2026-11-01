@@ -23,7 +23,7 @@ validation strategy.
                 ┌─────────────┐
                 │ 0016 landed │   (XMX MMQ — 0016-sycl-mmq-xmx.patch)
                 └──────┬──────┘
-                       │ shares ggml_sycl_xmx_available() / supports_type()
+                       │ shares ggml_sycl_mmq_xmx_available() / mmq_xmx_supports_type()
                        ▼
         ┌──────────────────────────┐
         │ 0016 fattn-onednn        │
@@ -249,7 +249,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
 
 Port joint_matrix-based flash attention for Intel Arc Alchemist / Battlemage.
 Slot into mainline's `BEST_FATTN_KERNEL` enum as a new case, chosen when
-`ggml_sycl_xmx_available()` returns true and the shape fits.
+`ggml_sycl_mmq_xmx_available()` returns true and the shape fits.
 
 ## Design decisions to make first
 
@@ -277,7 +277,7 @@ Add:
 ```
 
 `ggml_sycl_get_best_fattn_kernel` needs updating to prefer XMX when:
-- `ggml_sycl_xmx_available()` returns true (from 0013's port)
+- `ggml_sycl_mmq_xmx_available()` returns true (from 0013's port)
 - Q/K/V are F16
 - head_dim is in the supported set (typically {64, 96, 128})
 - Batch is in the supported range (XMX FA tends to win at moderate batch sizes)
@@ -312,7 +312,7 @@ deferred, Phase 1 of 0017 has to do that work itself.
 ```cpp
 static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(int device, const ggml_tensor * dst) {
 #ifdef GGML_SYCL_MMQ_XMX
-    if (ggml_sycl_xmx_available() && fattn_xmx_f16_eligible(dst, device)) {
+    if (ggml_sycl_mmq_xmx_available() && fattn_xmx_f16_eligible(dst, device)) {
         return BEST_FATTN_KERNEL_XMX;
     }
 #endif
@@ -433,7 +433,7 @@ routes to moe-xmx **before** the mmvq_fused check.
 ```cpp
 static void ggml_sycl_mul_mat_id(...) {
 #ifdef GGML_SYCL_MMQ_XMX
-    if (ggml_sycl_xmx_available() &&
+    if (ggml_sycl_mmq_xmx_available() &&
         ggml_sycl_xmx_moe_supports_type(src0->type) &&
         moe_xmx_eligible(src0, src1, ids, dst)) {
         moe_xmx::dispatch(build_moe_context_from_mul_mat_id(src0, src1, ids, dst));

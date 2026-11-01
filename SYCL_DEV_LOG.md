@@ -66,6 +66,54 @@ aborts on either backend):
   test code stays pristine, and this abort is accepted as a known upstream test
   defect until upstream defines what a skipped expert's lane scale should be.
 
+## Update (2026-11-01, upstream refresh to `dde879bc1`)
+
+Refreshed from `23b0202a1` (480 upstream commits). The header bullets above
+predate the October refreshes; `sycl-patches/README.md`,
+`sycl-patches-extracted/README.md` and `vulkan-patches/README.md` hold the
+current sets.
+
+- **Stack**: 7 fork + 16 upstream PR + 2 extracted SYCL patches, then 1
+  upstream PR + 3 local Vulkan patches; 29 patches. All apply with plain
+  `git apply` (no three-way fallback) and both unapply scripts return the tree
+  to upstream, alone or combined.
+- **Merged upstream and retired**: SYCL `28725` `29107` `29337` `29338` `29696`
+  `29864` `29889` `30271` `30286`; Vulkan `29835`. `30226` closed unmerged.
+- **New carries**: `30156` (its skip reason, overlap with 28725, went away when
+  28725 merged), `30606` `30857` `30956` `31109` `31126` `31138` `31208` `31285`
+  `31325` `31355` `31460` `31465`. Nine new cross-backend or non-code SYCL-labeled
+  PRs went into `SKIP_PRS`. Vulkan `30641` is in scope but not carried: it
+  overlaps `29357` in the Xe FA dispatch and decode shaders.
+- **Re-anchored by hand**: fork `0002` (upstream rewrote the dequant and MMQ
+  launchers it edits), `29506` (docs footnote), `29672` (next to upstream
+  `F8_E4M3`), `30206` (`test_rope_set_rows`: upstream `n_dims` plus the PR's
+  `yarn`/`truncate`; the PR call site now passes `n_dims` explicitly so the bools
+  cannot bind to it), `31325` (after `0002`/`0008`), `31460` (whitelist replaces
+  the `29672`-extended blocklists), `0016` (context only), Vulkan `29357`
+  (collapsed to one diff so unapply removes its new shader).
+- **Behavior changes to local patches**:
+  - `0004` no longer relaxes SUM. `ggml_sycl_op_sum` sums `ne` consecutive
+    floats, and upstream #28851 added `test_sum(..., slice=true)`, a
+    row-contiguous view with gaps that the relaxed gate would have accepted and
+    computed wrong. The GROUP_NORM gate stays.
+  - `0016` entry points renamed to `ggml_sycl_mmq_xmx_*`. Upstream's
+    `static inline ggml_sycl_xmx_supports_type()` (from PR 29864) made
+    `mmq_xmx.cpp` a redefinition error with `-DGGML_SYCL_MMQ_XMX=ON`; this was
+    already latent in the 2026-10-10 stack while 29864 was carried.
+  - `ZZ-LOCAL-0001` (CONV_2D strides) retired, superseded by upstream #30363.
+  - Vulkan `ZZ-LOCAL-0004` retired: upstream declares the same debug entry
+    points, and the patch's repeated default argument no longer compiles.
+- **Verification**: no SYCL compiler or Intel GPU was available, so the SYCL TUs
+  were not compiled. A GCC 13 build of the applied tree with Vulkan and tests
+  built all 524 targets with `GGML_VULKAN_CHECK_RESULTS=ON` and
+  `GGML_VULKAN_RUN_TESTS=ON`; `ctest -L main -LE model` passed 16/17 (the miss
+  needs a model download). Vulkan llvmpipe results are in
+  `vulkan-patches/README.md`. First thing on the A770: an `icpx` build with and
+  without `GGML_SYCL_MMQ_XMX`, then `test-backend-ops -b SYCL0`.
+- **Not re-verified**: the "Known failing cases" above. PR 26631 is now
+  upstream, and upstream gates TQ1_0/TQ2_0 per op on its own, so `0017` may be
+  redundant; it still applies and was kept.
+
 ## Update (2026-06-25, upstream sync + NORM contiguity fix)
 
 Master fast-forwarded and rebased all patches cleanly.

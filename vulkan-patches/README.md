@@ -26,28 +26,34 @@ title filter is applied client-side (jq `test("Intel"; "i")`) inside `pull_prs.s
 Draft PRs are skipped and are not downloaded or applied. If a previously
 carried PR becomes a draft, its patch is archived out of the active directory.
 
-## Carried set (checked 2026-10-10)
+## Carried set (checked 2026-11-01)
 
 `pull_prs.sh` downloads open, non-draft Vulkan PRs whose title contains `Intel`.
-This snapshot uses upstream `23b0202a189c44a54625aadcb37a946dd1d6278` and a
-365-day creation-date window starting 2025-10-10.
+This snapshot uses upstream `dde879bc1` and a 365-day creation-date window
+starting 2025-11-01.
 
 | PR | What | State |
 |----|------|-------|
-| 29357 | Intel Vulkan flash-attention prefill kernel | open; downloaded |
-| 29835 | handle free-memory reports greater than total memory on Intel Windows | open; downloaded |
+| 29357 | Intel Vulkan flash-attention prefill kernel | open; now 3 commits, collapsed into one cumulative diff and pinned |
 
-The live query found no other ready, open PRs matching both scope filters.
-Drafts remain skipped: `26829`, `24408`, `18138`, `18126`, and `17374`.
-PR 24406 has merged and is now upstream, so its local patch was retired. Other
-merged Intel Vulkan PRs in the current window are `29476`, `27471`, `27049`,
-`25380`, `25192`, `24406`, `24404`, `23964`, `22461`, `20818`, `20672`, and
-`20059`. They are not carried as local patches.
+PR 29357's third commit edits `flash_attn_prefill.comp`, which its first commit
+creates. `git apply -R` of that multi-commit series reverses the edit but leaves
+the new shader behind, so `unapply.sh` no longer returned a clean tree. The
+collapsed single diff creates the file once and reverses cleanly. `PINNED`
+keeps the sync from replacing it with the multi-commit form.
 
-The refreshed SYCL stack no longer carries PR 26631, so its former
-`test_mul_mat_vec_fusion` abort does not apply to the current combined stack.
+PR 30641 (q8_0/q4_0 KV for the Xe FA decode kernel) is open and in scope but not
+carried. It merges cleanly with upstream on its own, but it rewrites the same
+Xe FA dispatch block in `ggml_vk_flash_attn` and the same K/V offset math in
+`flash_attn_decode_phase_{1,2}.comp` as PR 29357, so the two need a semantic
+merge. It is recorded as a file-less `PINNED` entry. That FA path only turns on
+for Xe2 and Xe-LPG UMA devices, not the A770.
 
-### Local validation patch
+PR 29835 merged upstream and its patch was retired; PR 30431 (Arc Pro B65/B70
+shader count) also merged in this window. Drafts `24408` and `26829` and the
+non-draft `30810` closed without merging.
+
+### Local validation patches
 
 `ZZ-LOCAL-0001-vulkan-check-results.patch` is not an upstream feature patch. It
 repairs two current result-checker gaps needed to run `GGML_VULKAN_CHECK_RESULTS`:
@@ -66,11 +72,12 @@ execution only when `GGML_VULKAN_CHECK_RESULTS` is enabled. The optional checker
 uses process-global comparison state, so this keeps concurrent backend tests from
 overwriting one another's reference buffer and counter.
 
-`ZZ-LOCAL-0004-vulkan-debug-cross-tu.patch` exports the result-checker and
-optional built-in Vulkan test entry points moved into `ggml-vulkan-debug.cpp`,
-and declares them in the shared header. This keeps the current upstream split
-translation units linkable when `GGML_VULKAN_CHECK_RESULTS` or
-`GGML_VULKAN_RUN_TESTS` is enabled.
+The former `ZZ-LOCAL-0004-vulkan-debug-cross-tu.patch` was retired on
+2026-11-01. Upstream `ggml-vulkan-common.h` now declares the result-checker and
+built-in test entry points itself, and the patch's second declaration of
+`ggml_vk_test_dequant_matmul(..., bool mmq = false)` repeated the default
+argument, which GCC rejects. Upstream alone builds with
+`GGML_VULKAN_CHECK_RESULTS=ON` and `GGML_VULKAN_RUN_TESTS=ON`.
 
 ### Auto-skipped drafts (not applied)
 
@@ -81,8 +88,6 @@ Still labeled `Vulkan` + `Intel` but left as drafts and not carried:
 | 17374 | Change default subgroup/block size on selected pipelines for Intel Xe2 and newer |
 | 18138 | [WIP] Reduce the number of FA rows for Intel |
 | 18126 | [WIP] Enable cooperative matrix support for Intel Arrow Lake H GPUs |
-| 24408 | Intel Xe flash-attention and GEMM mega-PR |
-| 26829 | Intel Vulkan kernel optimizations for LLM inference (Arc B70 Pro) |
 
 ## Quick start
 
@@ -125,14 +130,26 @@ The pre-refresh snapshot and retired patches are under
 `../patch-backups/upstream-refresh-20261010/` and
 `../patch-backups/upstream-refresh-20261003/`.
 
-### Refresh apply/unapply check (2026-10-10)
+### Refresh apply/unapply and build check (2026-11-01)
 
-The current Vulkan stack applied and reversed in a clean worktree at upstream
-`23b0202a189c44a54625aadcb37a946dd1d6278`. Unapply returned the tracked and
-untracked tree exactly to upstream, and the applied diff passed
-`git diff --check`. The upstream `PR-29835.patch` emits a harmless warning for one
-blank-at-EOF line while applying and reversing. No compile, build, or backend
-tests were run in this refresh; the user will build the applied stack.
+The Vulkan stack (PR 29357 plus three local patches) applied with plain
+`git apply` and reversed in a clean worktree at upstream `dde879bc1`, alone and
+on top of the SYCL stack. Unapply returned the tracked and untracked tree
+exactly to upstream.
+
+The applied tree (SYCL and Vulkan stacks together) was built with GCC 13,
+Ubuntu's Vulkan 1.3.275 headers and glslc 2023.8 (`GL_KHR_cooperative_matrix`
+supported, so the Xe FA shaders compiled; coopmat2 and bf16 not supported):
+
+- `GGML_VULKAN_CHECK_RESULTS=ON`, `GGML_VULKAN_RUN_TESTS=ON`, tests on: all
+  524 targets built. `ctest -L main -LE model` passed 16/17; the failure is
+  `test-thread-safety`, which needs `test-download-model` and had no network.
+- Default options: `test-backend-ops -b Vulkan0` on Mesa llvmpipe (no Intel
+  GPU was available) passed ROPE 484/484, ROPE_SET_ROWS 73/73, SET_ROWS
+  319/319, SUM 10/10 and GROUP_NORM 2/2. FLASH_ATTN_EXT was stopped after
+  65 cases, all OK; llvmpipe runs about four FA cases a minute.
+
+None of this exercises the Intel-only Xe FA path; that still needs the A770.
 
 ## Build and test
 

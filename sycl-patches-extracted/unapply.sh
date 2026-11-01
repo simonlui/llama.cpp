@@ -2,9 +2,8 @@
 # Reverse the full SYCL patch stack, in the exact inverse order of apply.sh:
 #   1. Local repairs: sycl-patches-extracted/ZZ-LOCAL-*.patch
 #   2. Extracted:     sycl-patches-extracted/0*.patch
-#   3. Late upstream: PR 29864
-#   4. Upstream PRs:  sycl-patches/PR-*.patch
-#   5. Fork patches:  sycl-patches/0*.patch
+#   3. Upstream PRs:  sycl-patches/PR-*.patch
+#   4. Fork patches:  sycl-patches/0*.patch
 # Each group is reversed in reverse-sorted order.
 # Already-reversed patches are skipped safely; real reverse conflicts stop the
 # run with diagnostics.
@@ -29,16 +28,6 @@ STATE_FILE="$STATE_DIR/sycl-patches-extracted.untracked"
 shopt -s nullglob
 FORK_PATCHES=("$FORK_DIR"/0*.patch)
 UPSTREAM_PATCHES=("$FORK_DIR"/PR-*.patch)
-UPSTREAM_ORDERED=()
-UPSTREAM_LATE_PATCHES=()
-for patch_path in "${UPSTREAM_PATCHES[@]}"; do
-    if [[ "${patch_path##*/}" == "PR-29864.patch" ]]; then
-        UPSTREAM_LATE_PATCHES+=("$patch_path")
-    else
-        UPSTREAM_ORDERED+=("$patch_path")
-    fi
-done
-UPSTREAM_PATCHES=("${UPSTREAM_ORDERED[@]}")
 EXTRACTED_PATCHES=("$SCRIPT_DIR"/0*.patch)
 LOCAL_PATCHES=("$SCRIPT_DIR"/ZZ-LOCAL-*.patch)
 shopt -u nullglob
@@ -55,7 +44,6 @@ reverse_in_place() {
 
 reverse_in_place FORK_PATCHES
 reverse_in_place UPSTREAM_PATCHES
-reverse_in_place UPSTREAM_LATE_PATCHES
 reverse_in_place EXTRACTED_PATCHES
 reverse_in_place LOCAL_PATCHES
 
@@ -121,7 +109,6 @@ patch_untracked_files_to_protect() {
 
 reverse_group "Local repairs" "${LOCAL_PATCHES[@]+"${LOCAL_PATCHES[@]}"}"
 reverse_group "Extracted" "${EXTRACTED_PATCHES[@]+"${EXTRACTED_PATCHES[@]}"}"
-reverse_group "Upstream late dependencies" "${UPSTREAM_LATE_PATCHES[@]+"${UPSTREAM_LATE_PATCHES[@]}"}"
 reverse_group "Upstream" "${UPSTREAM_PATCHES[@]+"${UPSTREAM_PATCHES[@]}"}"
 reverse_group "Fork" "${FORK_PATCHES[@]+"${FORK_PATCHES[@]}"}"
 

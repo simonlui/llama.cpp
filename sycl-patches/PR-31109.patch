@@ -1,0 +1,76 @@
+From 2a2e0fac85ee14170c47d868b650ff3829288e9d Mon Sep 17 00:00:00 2001
+From: newjordan <newjordan@gmail.com>
+Date: Sat, 24 Oct 2026 12:03:59 -0500
+Subject: [PATCH] sycl: bound CONV_TRANSPOSE_1D input iteration
+
+Used angelX to optimize SYCL/drama 3 coordination, results are as follows
+
+Each output reads only inputs with i*s0 <= idx < i*s0 + K, in the same ascending order as before.
+
+Arc Pro B70, oneAPI 2026.1, test-backend-ops perf, base 9b56ccf00 vs patch, median of 3 same-boot A/B/A rounds, A/A 1.000-1.001:
+
+| input [ne0, ne1] | kernel [K, OC, IC] | s0 | base us | patch us | speedup |
+|---|---|---|---|---|---|
+| [16, 1536] | [16, 768, 1536] | 8 | 3910.57 | 1348.59 | 2.90x |
+| [128, 768] | [16, 384, 768] | 8 | 37735.00 | 1665.26 | 22.66x |
+| [1024, 384] | [8, 192, 384] | 4 | 270371.75 | 1471.74 | 183.71x |
+| [4096, 192] | [4, 96, 192] | 2 | 534614.63 | 752.74 | 710.23x |
+
+Shapes are the drama 3 codec decoder upsampling stack, added as perf cases. Chained 4-layer stack at 1/4/24 input frames: base 66.3/847.4/28638.5 ms, patch 2.3/6.7/30.7 ms. Kernel numbers, not end-to-end TTS latency.
+
+Correctness: test-backend-ops -o CONV_TRANSPOSE_1D 116/116 on base and patch, and 116/116 rebased on 3f03b1772. Seeded output dump (7.46 MB) byte-identical to base.
+
+Full test-backend-ops aborts on base and patch alike at the non-F32 SWIGLU_OAI assert (element_wise.cpp:1187, see #30857). With only those cases excluded: 20145/20173 on base and patch, and every patch-run failure also fails on base.
+---
+ ggml/src/ggml-sycl/conv.cpp | 13 +++++++------
+ tests/test-backend-ops.cpp  |  6 ++++++
+ 2 files changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-sycl/conv.cpp b/ggml/src/ggml-sycl/conv.cpp
+index 475bd34a..5f15c25a 100644
+--- a/ggml/src/ggml-sycl/conv.cpp
++++ b/ggml/src/ggml-sycl/conv.cpp
+@@ -28,16 +28,17 @@ static  void conv_transpose_1d_kernel(
+ 
+     float accumulator = 0;
+ 
+-    for (int c = 0; c < src0_ne2; c++) {
+-        int idx = global_index % dst_ne0;
++    const int idx = global_index % dst_ne0;
++
++    // only inputs with i*s0 <= idx < i*s0 + src0_ne0 contribute
++    const int i_begin = idx >= src0_ne0 ? (idx - src0_ne0) / s0 + 1 : 0;
++    const int i_end   = sycl::min(src1_ne0, idx / s0 + 1);
+ 
++    for (int c = 0; c < src0_ne2; c++) {
+         int kernel_offset = (src0_ne0 * src0_ne1 * c) + (out_index * src0_ne0);
+         int input_offset = src1_ne0 * c;
+ 
+-        for (int i = 0; i < src1_ne0; i++) {
+-            if (!(idx >= i*s0 && idx < i*s0 + src0_ne0)) {
+-                continue;
+-            }
++        for (int i = i_begin; i < i_end; i++) {
+             int weight_idx = idx - i*s0;
+ 
+             float kernel_weight = src0[kernel_offset + weight_idx];
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 5b583aa4..dc350624 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12879,6 +12879,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {200000, 1,  1, 1}));
+     test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {200000, 16, 1, 1}));
+ 
++    // Independent perf cases using upsampling layer shapes from the Drama 3 audio codec decoder.
++    test_cases.emplace_back(new test_conv_transpose_1d({16,   1536, 1, 1}, {16, 768, 1536, 1}, 8, 0, 1));
++    test_cases.emplace_back(new test_conv_transpose_1d({128,  768,  1, 1}, {16, 384, 768,  1}, 8, 0, 1));
++    test_cases.emplace_back(new test_conv_transpose_1d({1024, 384,  1, 1}, {8,  192, 384,  1}, 4, 0, 1));
++    test_cases.emplace_back(new test_conv_transpose_1d({4096, 192,  1, 1}, {4,  96,  192,  1}, 2, 0, 1));
++
+     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2, 1, 1, 1}, 1));
+     // widths around the tiling threshold
+     for (auto cols : {4096, 8192, 12288, 16384, 24576, 32768, 65536, 131072}) {
+-- 
+2.43.0
+

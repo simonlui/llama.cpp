@@ -1,0 +1,82 @@
+From 47dd57bd9d31e7c1c0611442ac9451863bacf306 Mon Sep 17 00:00:00 2001
+From: Simon Gardling <titaniumtown@proton.me>
+Date: Sat, 24 Oct 2026 18:15:38 -0700
+Subject: [PATCH] sycl: cache device-id
+
+---
+ ggml/src/ggml-sycl/common.cpp    |  8 +++++++-
+ ggml/src/ggml-sycl/common.hpp    | 16 ++++++++--------
+ ggml/src/ggml-sycl/ggml-sycl.cpp |  1 +
+ 3 files changed, 16 insertions(+), 9 deletions(-)
+
+diff --git a/ggml/src/ggml-sycl/common.cpp b/ggml/src/ggml-sycl/common.cpp
+index f01d0ff9..048397cd 100644
+--- a/ggml/src/ggml-sycl/common.cpp
++++ b/ggml/src/ggml-sycl/common.cpp
+@@ -19,8 +19,14 @@
+ #include "ggml-backend-impl.h"
+ #include "ggml-impl.h"
+ 
++thread_local int g_sycl_current_device_id = -1;
++
+ int get_current_device_id() {
+-  return dpct::dev_mgr::instance().current_device_id();
++  if (g_sycl_current_device_id >= 0) {
++    return g_sycl_current_device_id;
++  }
++  g_sycl_current_device_id = (int) dpct::dev_mgr::instance().current_device_id();
++  return g_sycl_current_device_id;
+ }
+ 
+ void* ggml_sycl_host_malloc(size_t size) try {
+diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
+index 8f2f892b..cd853a36 100644
+--- a/ggml/src/ggml-sycl/common.hpp
++++ b/ggml/src/ggml-sycl/common.hpp
+@@ -288,6 +288,10 @@ static size_t g_scratch_offset = 0;
+   (void)bad_arch; // suppress unused function warning
+ }
+ 
++// thread-local cache of the currently selected device, kept in sync by
++// ggml_sycl_set_device and ggml_sycl_set_main_device.
++extern thread_local int g_sycl_current_device_id;
++
+ int get_current_device_id();
+ 
+ inline int ggml_sycl_get_device() {
+@@ -295,16 +299,12 @@ inline int ggml_sycl_get_device() {
+ }
+ 
+ inline dpct::err0 ggml_sycl_set_device(const int device) try {
+-  int current_device_id;
+-  SYCL_CHECK(CHECK_TRY_ERROR(current_device_id = get_current_device_id()));
+-
+-  // GGML_SYCL_DEBUG("ggml_sycl_set_device device_id=%d,
+-  // current_device_id=%d\n", device, current_device);
+-  if (device == current_device_id) {
++  if (device == g_sycl_current_device_id) {
+     return 0;
+   }
+-
+-  return CHECK_TRY_ERROR(dpct::select_device(device));
++  dpct::err0 err = CHECK_TRY_ERROR(dpct::select_device(device));
++  g_sycl_current_device_id = device;
++  return err;
+ } catch (sycl::exception const& exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index f3782c2c..2711b9f8 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -6154,6 +6154,7 @@ static void ggml_sycl_set_main_device(const int main_device) try {
+     }
+     check_allow_gpu_index(main_device);
+     dpct::select_device(main_device);
++    g_sycl_current_device_id = main_device;  // keep the ggml-sycl device cache in sync
+ 
+     if (g_ggml_sycl_debug) {
+         dpct::device_info prop;
+-- 
+2.43.0
+

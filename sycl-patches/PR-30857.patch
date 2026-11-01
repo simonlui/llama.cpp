@@ -1,0 +1,78 @@
+From 7d30e4d1c6026b08fbf64e71d61aa672816fe5a1 Mon Sep 17 00:00:00 2001
+From: Michael Taylor <162068037+mctylr-gh@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 03:35:40 -0300
+Subject: [PATCH] sycl : add f16 support for SWIGLU_OAI
+
+The modified (or fused) GLU activation function, SWIGLU_OAI op support
+already declares f32/f16 as supported. The kernel only instantiated f32
+and asserted on f16. This implements f16 support for SWIGLU_OAI
+
+Resolves Issue ggml-org/llama.cpp#30855
+
+Assisted-by: pi (Greatjedi/Qwen3.8-27B-Intel-Arc-Tuned-GGUF:Q4_K via llama.cpp)
+---
+ ggml/src/ggml-sycl/element_wise.cpp | 37 +++++++++++++++++++----------
+ 1 file changed, 24 insertions(+), 13 deletions(-)
+
+diff --git a/ggml/src/ggml-sycl/element_wise.cpp b/ggml/src/ggml-sycl/element_wise.cpp
+index c7fe70ac..bb4225da 100644
+--- a/ggml/src/ggml-sycl/element_wise.cpp
++++ b/ggml/src/ggml-sycl/element_wise.cpp
+@@ -1183,9 +1183,7 @@ static void ggml_sycl_op_swiglu_oai(ggml_backend_sycl_context & ctx, ggml_tensor
+     GGML_ASSERT(ggml_is_contiguous_1(src0));
+     GGML_ASSERT(src0->nb[0] == ggml_element_size(src0));
+     GGML_ASSERT(ggml_is_contiguous(dst));
+-
+-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+-    GGML_ASSERT( dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+     GGML_ASSERT(src0->type == dst->type);
+     GGML_ASSERT(dst->ne[0] == nc);
+     GGML_ASSERT(ggml_nrows(dst) == ggml_nrows(src0));
+@@ -1197,20 +1195,33 @@ static void ggml_sycl_op_swiglu_oai(ggml_backend_sycl_context & ctx, ggml_tensor
+         GGML_ASSERT(src0->type == src1->type);
+     }
+ 
+-    //const int32_t swapped = ((const int32_t *) dst->op_params)[1];
+     const int32_t swapped = ggml_get_op_params_i32(dst, 1);
+-    const float alpha = ggml_get_op_params_f32(dst, 2);
+-    const float limit = ggml_get_op_params_f32(dst, 3);
++    const float   alpha   = ggml_get_op_params_f32(dst, 2);
++    const float   limit   = ggml_get_op_params_f32(dst, 3);
+ 
+-    float * src0_p = (float *) src0_d;
+-    float * src1_p = (float *) src1_d;
++    if (src0->type == GGML_TYPE_F16) {
++        sycl::half * src0_p = (sycl::half *) src0_d;
++        sycl::half * src1_p = (sycl::half *) src1_d;
+ 
+-    if (!src1) {
+-        src0_p += swapped ? nc : 0;
+-        src1_p += swapped ? 0 : nc;
+-    }
++        if (!src1) {
++            src0_p += swapped ? nc : 0;
++            src1_p += swapped ? 0 : nc;
++        }
++
++        swiglu_oai_sycl(src0_p, src1_p, (sycl::half *) dst_d, ggml_nelements(dst), nc, src0_o / sizeof(sycl::half),
++                        src1_o / sizeof(sycl::half), alpha, limit, stream);
++    } else {
++        float * src0_p = (float *) src0_d;
++        float * src1_p = (float *) src1_d;
+ 
+-    swiglu_oai_sycl(src0_p, src1_p, (float *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), alpha, limit, stream);
++        if (!src1) {
++            src0_p += swapped ? nc : 0;
++            src1_p += swapped ? 0 : nc;
++        }
++
++        swiglu_oai_sycl(src0_p, src1_p, (float *) dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float),
++                        src1_o / sizeof(float), alpha, limit, stream);
++    }
+ }
+ 
+ template <typename T>
+-- 
+2.43.0
+

@@ -1,0 +1,1301 @@
+From 17e702e90ec67a3e8824c931c82e8c91377cba83 Mon Sep 17 00:00:00 2001
+From: cwriter <cwriter@localhost>
+Date: Thu, 8 Oct 2026 12:30:41 +0000
+Subject: [PATCH 1/6] sycl: Add device-side MoE scheduler
+
+Assisted-by: Codex
+---
+ docs/backend/SYCL.md              |   1 +
+ ggml/src/ggml-sycl/fused-gemm.cpp | 231 +++++++++++++++++++++++++++++-
+ ggml/src/ggml-sycl/fused-gemm.hpp |  28 ++++
+ ggml/src/ggml-sycl/ggml-sycl.cpp  | 197 ++++++++++++++++++-------
+ ggml/src/ggml-sycl/mmvq.cpp       |  50 ++++++-
+ ggml/src/ggml-sycl/mmvq.hpp       |   3 +
+ tests/test-backend-ops.cpp        |   9 ++
+ 7 files changed, 463 insertions(+), 56 deletions(-)
+
+diff --git a/docs/backend/SYCL.md b/docs/backend/SYCL.md
+index fb800025..b87d4764 100644
+--- a/docs/backend/SYCL.md
++++ b/docs/backend/SYCL.md
+@@ -826,6 +826,7 @@ User can use the device management in [docs/multi-gpu.md](https://github.com/ggm
+ | GGML_SYCL_XMX_MAX_COLS | non-negative integer, 80 (default) | Most activation columns (batch size) the `GGML_SYCL_ENABLE_XMX_ESIMD` kernels take; wider batches use the other mat-mul kernels. A larger value keeps XMX for bigger batches (as repeated launches), `0` never uses it. |
+ | GGML_SYCL_XMX_GLU_MAX_COLS | 0 to 16, 16 (default) | Most columns the fused gate and up XMX kernel takes; wider batches run gate and up as separate mat-vecs. 16 is the most the kernel is built for, larger values are clamped to 16 and `0` turns the fused kernel off. |
+ | GGML_SYCL_XMX_GATHER_TYPES | decimal bitmask, all bits set (default) | Weight formats that may use the XMX dequant-GEMM paths, which dequantize weights straight into the XMX tiles. This speeds up prompt processing of MoE models on GPUs with XMX units (Arc A- and B-series, Arc Pro, Data Center GPU Max), for example pp512 of Qwen3-30B-A3B UD-IQ3_XXS by about 50% on an Arc Pro B60. Bits:<br>* 1: IQ4_NL, 2: IQ3_S, 4: IQ4_XS, 8: IQ3_XXS, 16: IQ2_XXS, 32: IQ2_XS, 64: IQ2_S, 128: IQ1_S, 256: IQ1_M<br>* 512: Q8_0, 1024: Q4_K, 2048: Q5_K, 4096: Q6_K (MoE `MUL_MAT_ID` only)<br>Add values to combine them, for example `3` for IQ4_NL and IQ3_S; `0` disables the paths. A set bit does not force the path: batches of more than 64 tokens per expert or row lengths that are not a multiple of 256 (32 for IQ4_NL and Q8_0) use the library GEMM. |
++| GGML_SYCL_MMID_SCHED | 1 (default), 0 disables | Build the grouped MoE routing and tile schedule on the GPU, avoiding the expert-ID host readback and CPU sort. Unsupported types, shapes and devices use the host schedule. Only bit 0 is used; other bits are ignored. |
+ | GGML_SYCL_XMX_GATHER_SHAPES | decimal bitmask, 255 (default) | XMX `joint_matrix` combinations the paths of `GGML_SYCL_XMX_GATHER_TYPES` may use; the operand type comes from `GGML_SYCL_DYNAMIC_PRECISION` and the best supported combination is picked automatically (logged as `fg_pick_combo`). Bits:<br>* Xe2, Xe3, Xe-HPC: 1: f16 8x16x16, 2: f16 16x16x16, 4: f16 32x64x16, 8: f16 32x64x32, 32: tf32 8x16x8, 64: bf16 8x16x16<br>* Xe-HPG (Arc A770, ARL-H): 16: f16 8x8x16, 128: bf16 8x8x16<br>Clear a bit to exclude a combination, or set a single bit to force one for testing. |
+ | GGML_SYCL_DYNAMIC_PRECISION | `F16` (default with `GGML_SYCL_F16=ON`), `BF16`, `TF32` or `F32` (default otherwise) | Operand type of the XMX dequant-GEMM paths (`GGML_SYCL_XMX_GATHER_TYPES`); accumulation is always f32. `F16` is the fastest, but activations above 65504 overflow. `BF16` keeps the f32 range at a 7-bit mantissa, `TF32` keeps the range and the f16 mantissa but is about 30% slower and needs Xe2, Xe3 or Xe-HPC, and `F32` turns the XMX paths off. Ops that request a higher src1 precision ([TAG_GGML_PREC]) get it regardless of this setting. |
+ | GGML_SYCL_DYNAMIC_REQUIRED_PRECISION | `F32` (default), `TF32`, `BF16` or `F16` | Lowest type the XMX paths may use for an op that requests an F32 src1, such as Mistral 4 `ffn_down_exps`. The default runs such ops on the library f32 GEMM; `TF32` or `BF16` trade mantissa for speed while keeping the f32 range. `F16` ignores the request and can overflow; it is meant for testing only. |
+diff --git a/ggml/src/ggml-sycl/fused-gemm.cpp b/ggml/src/ggml-sycl/fused-gemm.cpp
+index 3024f139..467e12db 100644
+--- a/ggml/src/ggml-sycl/fused-gemm.cpp
++++ b/ggml/src/ggml-sycl/fused-gemm.cpp
+@@ -745,7 +745,7 @@ static void fused_dequant_gemm_tile(
+     const int b0, const int n0, const int n1,
+     sycl::local_accessor<typename S::tsa, 1> tile_a,
+     sycl::local_accessor<float, 1> tile_c,
+-    const sycl::nd_item<2> & item) {
++    const sycl::nd_item<2> & item, ggml_sycl_gg_rows dst_rows = {}) {
+     if constexpr (fg_built<S::SG>()) {
+         using EA = typename S::EA;
+         using TA = typename S::ta;
+@@ -854,7 +854,13 @@ static void fused_dequant_gemm_tile(
+                 for (int s = 0; s < FG_KSPLIT; ++s) {
+                     sum += tile_c[s * S::SG_ROWS * S::BN + r * S::BN + c];
+                 }
+-                dst[(size_t) n * ldd + m] = sum;
++                if (dst_rows.map) {
++                    const mmid_row_mapping row = dst_rows.map[n];
++                    float * out = (float *) (dst_rows.base + (row.i1 % dst_rows.ne1) * dst_rows.nb1 + row.i2 * dst_rows.nb2);
++                    out[m] = sum;
++                } else {
++                    dst[(size_t) n * ldd + m] = sum;
++                }
+             }
+         }
+     }
+@@ -882,7 +888,7 @@ template <typename S, typename block_q_t, bool reordered>
+ static void grouped_dequant_gemm_launch(const char * src0_dd, const size_t expert_stride,
+                                         const ggml_sycl_gg_tile * tiles_ptr, const typename S::tsb * packed, float * dst,
+                                         const int M, const int Npad, const int K, const int64_t n_tiles,
+-                                        const int64_t groups_m, dpct::queue_ptr stream) {
++                                        const int64_t groups_m, dpct::queue_ptr stream, ggml_sycl_gg_rows dst_rows = {}) {
+     stream->submit([&](sycl::handler & cgh) {
+         sycl::local_accessor<typename S::tsa, 1> tile_a(FG_KSPLIT * S::SG_ROWS * FG_BK, cgh);
+         sycl::local_accessor<float, 1>          tile_c(FG_KSPLIT * S::SG_ROWS * S::BN, cgh);
+@@ -891,9 +897,12 @@ static void grouped_dequant_gemm_launch(const char * src0_dd, const size_t exper
+             [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(S::SG)]] {
+                 const int               t    = item.get_group(0);
+                 const ggml_sycl_gg_tile tile = tiles_ptr[t];
++                if (tile.n0 == tile.n1) {
++                    return;
++                }
+                 const block_q_t *       x    = (const block_q_t *) (src0_dd + (size_t) tile.expert * expert_stride);
+                 fused_dequant_gemm_tile<S, block_q_t, reordered>(x, packed, dst, M, Npad, K, M, t * S::BN, tile.n0,
+-                                                                 tile.n1, tile_a, tile_c, item);
++                                                                 tile.n1, tile_a, tile_c, item, dst_rows);
+             });
+     });
+ }
+@@ -1097,3 +1106,217 @@ bool ggml_sycl_grouped_dequant_gemm(ggml_type src0_type, bool reordered, const v
+     });
+     return launched;
+ }
++
++// One work-group sorts routes by expert and builds the tile table.
++static constexpr int MMID_SCHED_WG = 256;
++
++using mmid_sched_atomic = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed,
++                                           sycl::memory_scope::work_group,
++                                           sycl::access::address_space::local_space>;
++
++bool ggml_sycl_build_mmid_schedule(const int32_t * ids_dev, size_t ids_token_stride, int64_t n_as, int64_t n_ids,
++                                   int64_t n_tokens, int64_t n_tiles_max, mmid_row_mapping * row_mapping,
++                                   ggml_sycl_gg_tile * tiles, uint32_t * expert_offsets, dpct::queue_ptr stream) {
++    if (n_as <= 0 || n_as > GGML_SYCL_MMID_SCHED_MAX_EXPERTS || n_ids <= 0 || n_tokens <= 0 || n_ids > INT32_MAX / n_tokens) {
++        return false;
++    }
++    const int64_t n_routes = n_tokens * n_ids;
++    if (n_tiles_max < grouped_gemm_max_tiles(n_routes, n_as, GGML_SYCL_FG_BN)) {
++        return false;
++    }
++
++    stream->submit([&](sycl::handler & cgh) {
++        // l_cnt is reused: route counts, then the write cursors, then the tile count per expert
++        sycl::local_accessor<uint32_t, 1> l_cnt(n_as + 1, cgh);
++        sycl::local_accessor<uint32_t, 1> l_off(n_as + 1, cgh);
++        sycl::local_accessor<uint32_t, 1> l_toff(n_as + 1, cgh);
++        cgh.parallel_for(
++            sycl::nd_range<1>(MMID_SCHED_WG, MMID_SCHED_WG),
++            [=](sycl::nd_item<1> item) {
++                const auto     grp = item.get_group();
++                const int64_t  tid = item.get_local_id(0);
++                uint32_t * cnt  = l_cnt.get_multi_ptr<sycl::access::decorated::no>().get();
++                uint32_t * off  = l_off.get_multi_ptr<sycl::access::decorated::no>().get();
++                uint32_t * toff = l_toff.get_multi_ptr<sycl::access::decorated::no>().get();
++
++                for (int64_t e = tid; e < n_as; e += MMID_SCHED_WG) {
++                    cnt[e] = 0;
++                }
++                // a dropped route must leave a row that names (0, 0) rather than stale memory
++                for (int64_t r = tid; r < n_routes; r += MMID_SCHED_WG) {
++                    row_mapping[r] = { 0, 0 };
++                }
++                sycl::group_barrier(grp);
++
++                for (int64_t r = tid; r < n_routes; r += MMID_SCHED_WG) {
++                    const int64_t   token  = r / n_ids;
++                    const int64_t   slot   = r - token * n_ids;
++                    const int32_t * id_row = (const int32_t *) ((const char *) ids_dev + token * ids_token_stride);
++                    const int32_t   e      = id_row[slot];
++                    if (e >= 0 && e < n_as) {
++                        mmid_sched_atomic(cnt[e]).fetch_add(1u);
++                    }
++                }
++                sycl::group_barrier(grp);
++
++                sycl::joint_exclusive_scan(grp, cnt, cnt + n_as, off, 0u, sycl::plus<uint32_t>());
++                sycl::group_barrier(grp);
++                if (tid == 0) {
++                    off[n_as] = off[n_as - 1] + cnt[n_as - 1];
++                }
++                sycl::group_barrier(grp);
++
++                for (int64_t e = tid; e < n_as; e += MMID_SCHED_WG) {
++                    cnt[e] = off[e];
++                }
++                sycl::group_barrier(grp);
++
++                // Atomic arrival order can differ from the host sort; each expert gets the same rows.
++                for (int64_t r = tid; r < n_routes; r += MMID_SCHED_WG) {
++                    const int64_t   token  = r / n_ids;
++                    const int64_t   slot   = r - token * n_ids;
++                    const int32_t * id_row = (const int32_t *) ((const char *) ids_dev + token * ids_token_stride);
++                    const int32_t   e      = id_row[slot];
++                    if (e >= 0 && e < n_as) {
++                        const uint32_t pos = mmid_sched_atomic(cnt[e]).fetch_add(1u);
++                        row_mapping[pos]   = { (int32_t) slot, (int32_t) token };
++                    }
++                }
++                sycl::group_barrier(grp);
++
++                for (int64_t e = tid; e < n_as; e += MMID_SCHED_WG) {
++                    cnt[e] = (off[e + 1] - off[e] + GGML_SYCL_FG_BN - 1) / GGML_SYCL_FG_BN;
++                }
++                sycl::group_barrier(grp);
++
++                sycl::joint_exclusive_scan(grp, cnt, cnt + n_as, toff, 0u, sycl::plus<uint32_t>());
++                sycl::group_barrier(grp);
++                if (tid == 0) {
++                    toff[n_as] = toff[n_as - 1] + cnt[n_as - 1];
++                }
++                sycl::group_barrier(grp);
++
++                const uint32_t n_tiles = toff[n_as];
++                for (int64_t e = tid; e < n_as; e += MMID_SCHED_WG) {
++                    const uint32_t base = off[e];
++                    const uint32_t end  = off[e + 1];
++                    for (uint32_t j = 0; j < cnt[e]; ++j) {
++                        const uint32_t n0 = base + j * GGML_SYCL_FG_BN;
++                        const uint32_t n1 = n0 + GGML_SYCL_FG_BN < end ? n0 + GGML_SYCL_FG_BN : end;
++                        tiles[toff[e] + j] = { (int32_t) e, (int32_t) n0, (int32_t) n1 };
++                    }
++                }
++                // the launch is bounded, so the unused tail must be tiles the GEMM skips
++                for (int64_t t = n_tiles + tid; t < n_tiles_max; t += MMID_SCHED_WG) {
++                    tiles[t] = { 0, 0, 0 };
++                }
++                for (int64_t e = tid; e <= n_as; e += MMID_SCHED_WG) {
++                    expert_offsets[e] = off[e];
++                }
++            });
++    });
++    return true;
++}
++
++template <typename S>
++static bool fg_grouped_device_run(ggml_type src0_type, bool reordered, const void * src0_base, size_t expert_stride,
++                                   ggml_sycl_gg_rows src1, ggml_sycl_gg_rows dst, const int32_t * ids_dev,
++                                   size_t ids_token_stride, int64_t n_as, int64_t n_ids, int64_t n_tokens,
++                                   int64_t M, int64_t K, ggml_sycl_pool & pool, dpct::queue_ptr stream) {
++    if constexpr (S::BN != GGML_SYCL_FG_BN) {
++        return false;
++    } else {
++        const int64_t total_rows = n_tokens * n_ids;
++        const int64_t max_tiles = grouped_gemm_max_tiles(total_rows, n_as, S::BN);
++        if (max_tiles > INT32_MAX / S::BN) {
++            return false;
++        }
++        const int Npad = (int) (max_tiles * S::BN);
++        ggml_sycl_pool_alloc<mmid_row_mapping> rows(pool, total_rows);
++        ggml_sycl_pool_alloc<ggml_sycl_gg_tile> tiles(pool, max_tiles);
++        ggml_sycl_pool_alloc<uint32_t> offsets(pool, n_as + 1);
++        if (!ggml_sycl_build_mmid_schedule(ids_dev, ids_token_stride, n_as, n_ids, n_tokens, max_tiles,
++                                           rows.get(), tiles.get(), offsets.get(), stream)) {
++            return false;
++        }
++        src1.map = rows.get();
++        dst.map = rows.get();
++        ggml_sycl_pool_alloc<typename S::tsb> packed_b(pool, (size_t) K * Npad);
++        const ggml_sycl_gg_tile * tile_ptr = tiles.get();
++        typename S::tsb * packed = packed_b.get();
++        using E = typename S::EB;
++        constexpr int V = S::VNNI;
++        stream->parallel_for(sycl::range<1>((size_t) Npad * (K / V)), [=](sycl::id<1> id) {
++            const size_t idx = id[0];
++            const int kq = idx / Npad;
++            const int n = idx - (size_t) kq * Npad;
++            const ggml_sycl_gg_tile tile = tile_ptr[n / S::BN];
++            const int row = tile.n0 + n % S::BN;
++            typename S::tsb vals[V] = {};
++            if (row < tile.n1) {
++                const mmid_row_mapping mapping = src1.map[row];
++                const float * in = (const float *) (src1.base + (mapping.i1 % src1.ne1) * src1.nb1 + mapping.i2 * src1.nb2) + V * kq;
++#pragma unroll
++                for (int v = 0; v < V; ++v) {
++                    vals[v] = E::cvt(in[v]);
++                }
++            }
++            typename S::tsb * out = packed + ((size_t) kq * Npad + n) * V;
++#pragma unroll
++            for (int v = 0; v < V; ++v) {
++                out[v] = vals[v];
++            }
++        });
++        const int64_t groups_m = (M + S::SG_ROWS - 1) / S::SG_ROWS;
++        return fg_visit_type(src0_type, reordered, [&](auto tag) {
++            using T = decltype(tag);
++            grouped_dequant_gemm_launch<S, typename T::type, T::reordered>((const char *) src0_base, expert_stride,
++                tile_ptr, packed, (float *) dst.base, (int) M, Npad, (int) K, max_tiles, groups_m, stream, dst);
++        });
++    }
++}
++
++bool ggml_sycl_grouped_dequant_gemm_device_supported(ggml_type src0_type, bool reordered, int32_t src1_prec,
++                                                      int64_t n_as, int64_t n_ids, int64_t n_tokens,
++                                                      int64_t M, int64_t K, dpct::queue_ptr stream) {
++    if (n_as <= 0 || n_as > GGML_SYCL_MMID_SCHED_MAX_EXPERTS || n_ids <= 0 || n_tokens <= 0 ||
++        n_ids > INT32_MAX / n_tokens) {
++        return false;
++    }
++    const int64_t total_rows = n_ids * n_tokens;
++    // The active expert count is unknown until the GPU builds the schedule.
++    if (g_ggml_sycl_dynamic_precision == GGML_SYCL_DYNAMIC_PRECISION_F32 ||
++        !ggml_sycl_xmx_gather_type_enabled(src0_type) || !fg_visit_type(src0_type, reordered, [](auto) {}) ||
++        !ggml_sycl_grouped_dequant_gemm_shape_ok(src0_type, M, K, total_rows, std::min(n_as, total_rows))) {
++        return false;
++    }
++    const sycl::device device = stream->get_device();
++    if (device.get_info<sycl::info::device::max_work_group_size>() < MMID_SCHED_WG ||
++        device.get_info<sycl::info::device::local_mem_size>() < 3 * (n_as + 1) * sizeof(uint32_t)) {
++        return false;
++    }
++    if (grouped_gemm_max_tiles(total_rows, n_as, GGML_SYCL_FG_BN) > INT32_MAX / GGML_SYCL_FG_BN ||
++        fg_pick_combo(stream, GGML_TYPE_F32, src1_prec) < 0) {
++        return false;
++    }
++    return true;
++}
++
++bool ggml_sycl_grouped_dequant_gemm_device(ggml_type src0_type, bool reordered, const void * src0_base,
++                                           size_t expert_stride, const ggml_sycl_gg_rows & src1, int32_t src1_prec,
++                                           const ggml_sycl_gg_rows & dst, const int32_t * ids_dev,
++                                           size_t ids_token_stride, int64_t n_as, int64_t n_ids, int64_t n_tokens,
++                                           int64_t M, int64_t K, ggml_sycl_pool & pool, dpct::queue_ptr stream) {
++    if (src1.ne1 <= 0 || dst.ne1 <= 0 ||
++        !ggml_sycl_grouped_dequant_gemm_device_supported(src0_type, reordered, src1_prec, n_as, n_ids,
++                                                        n_tokens, M, K, stream)) {
++        return false;
++    }
++    const int combo = fg_pick_combo(stream, GGML_TYPE_F32, src1_prec);
++    bool launched = false;
++    fg_visit_combo(combo, [&](auto s) {
++        launched = fg_grouped_device_run<decltype(s)>(src0_type, reordered, src0_base, expert_stride, src1, dst,
++            ids_dev, ids_token_stride, n_as, n_ids, n_tokens, M, K, pool, stream);
++    });
++    return launched;
++}
+diff --git a/ggml/src/ggml-sycl/fused-gemm.hpp b/ggml/src/ggml-sycl/fused-gemm.hpp
+index 226676d1..e45f5e56 100644
+--- a/ggml/src/ggml-sycl/fused-gemm.hpp
++++ b/ggml/src/ggml-sycl/fused-gemm.hpp
+@@ -4,6 +4,18 @@
+ #include "common.hpp"
+ 
+ 
++// Routed row n is at base + (map[n].i1 % ne1)*nb1 + map[n].i2*nb2.
++struct ggml_sycl_gg_rows {
++    char *                   base;
++    const mmid_row_mapping * map;
++    int64_t                  ne1;
++    size_t                   nb1;
++    size_t                   nb2;
++};
++
++static constexpr int GGML_SYCL_FG_BN = 32;
++static constexpr int64_t GGML_SYCL_MMID_SCHED_MAX_EXPERTS = 4096;
++
+ // Shape and type gates for the kernels below. Device capability is separate: it needs a queue to ask.
+ static constexpr int GGML_SYCL_FG_MAX_N = 64; // widest N taken; each shape covers it in BN-wide tiles
+ 
+@@ -85,4 +97,20 @@ bool ggml_sycl_grouped_dequant_gemm(ggml_type src0_type, bool reordered, const v
+                                     int64_t total_rows, std::vector<ggml_sycl_gg_tile> & tiles,
+                                     ggml_sycl_pool & pool, dpct::queue_ptr stream);
+ 
++// Build routing and tile tables on the device; unused tile slots are empty.
++bool ggml_sycl_build_mmid_schedule(const int32_t * ids_dev, size_t ids_token_stride, int64_t n_as, int64_t n_ids,
++                                   int64_t n_tokens, int64_t n_tiles_max, mmid_row_mapping * row_mapping,
++                                   ggml_sycl_gg_tile * tiles, uint32_t * expert_offsets, dpct::queue_ptr stream);
++
++bool ggml_sycl_grouped_dequant_gemm_device_supported(ggml_type src0_type, bool reordered, int32_t src1_prec,
++                                                      int64_t n_as, int64_t n_ids, int64_t n_tokens,
++                                                      int64_t M, int64_t K, dpct::queue_ptr stream);
++
++// Returns false before queuing work when the type, shape, layout or device is unsupported.
++bool ggml_sycl_grouped_dequant_gemm_device(ggml_type src0_type, bool reordered, const void * src0_base,
++                                           size_t expert_stride, const ggml_sycl_gg_rows & src1, int32_t src1_prec,
++                                           const ggml_sycl_gg_rows & dst, const int32_t * ids_dev,
++                                           size_t ids_token_stride, int64_t n_as, int64_t n_ids, int64_t n_tokens,
++                                           int64_t M, int64_t K, ggml_sycl_pool & pool, dpct::queue_ptr stream);
++
+ #endif // GGML_SYCL_FUSED_GEMM_HPP
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index caaafc95..430f92b8 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -118,6 +118,7 @@ int g_ggml_sycl_xmx_glu_max_cols = GGML_SYCL_XMX_GLU_MAX_COLS;
+ int g_ggml_sycl_prioritize_dmmv = 0;
+ int g_ggml_sycl_xmx_gather_types = GGML_SYCL_XMX_GATHER_TYPES_DEFAULT;
+ int g_ggml_sycl_xmx_gather_shapes = GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT;
++static int g_ggml_sycl_mmid_sched = 1;
+ int g_ggml_sycl_dynamic_precision = GGML_SYCL_DYNAMIC_PRECISION_DEFAULT;
+ int g_ggml_sycl_dynamic_required_precision = GGML_SYCL_DYNAMIC_PRECISION_F32;
+ static const char * ggml_sycl_dynamic_precision_names[] = { "F16", "BF16", "TF32", "F32" };
+@@ -450,6 +451,7 @@ static void ggml_check_sycl() try {
+         g_ggml_sycl_prioritize_dmmv = ggml_sycl_get_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
+         g_ggml_sycl_graph_eviction_timeout = ggml_sycl_get_env("GGML_SYCL_GRAPH_EVICTION_TIMEOUT", 10);
+         g_ggml_sycl_xmx_gather_types = ggml_sycl_get_env("GGML_SYCL_XMX_GATHER_TYPES", GGML_SYCL_XMX_GATHER_TYPES_DEFAULT);
++        g_ggml_sycl_mmid_sched = ggml_sycl_get_env("GGML_SYCL_MMID_SCHED", 1) & 1;
+         g_ggml_sycl_xmx_gather_shapes = ggml_sycl_get_env("GGML_SYCL_XMX_GATHER_SHAPES", GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT);
+         g_ggml_sycl_dynamic_precision =
+             ggml_sycl_get_env_precision("GGML_SYCL_DYNAMIC_PRECISION", GGML_SYCL_DYNAMIC_PRECISION_DEFAULT);
+@@ -573,6 +575,7 @@ static void ggml_check_sycl() try {
+ 
+         GGML_LOG_INFO("  GGML_SYCL_ENABLE_OPT: %d\n", g_ggml_sycl_enable_optimize);
+         GGML_LOG_INFO("  GGML_SYCL_XMX_GATHER_TYPES: %d\n", g_ggml_sycl_xmx_gather_types);
++        GGML_LOG_INFO("  GGML_SYCL_MMID_SCHED: %d\n", g_ggml_sycl_mmid_sched);
+         GGML_LOG_INFO("  GGML_SYCL_XMX_GATHER_SHAPES: %d\n", g_ggml_sycl_xmx_gather_shapes);
+         GGML_LOG_INFO("  GGML_SYCL_DYNAMIC_PRECISION: %s\n",
+                       ggml_sycl_dynamic_precision_names[g_ggml_sycl_dynamic_precision]);
+@@ -4471,36 +4474,6 @@ static bool ggml_sycl_supports_dmmv(enum ggml_type type) {
+     }
+ }
+ 
+-static bool ggml_sycl_supports_mmvq_id(enum ggml_type type) {
+-    switch (type) {
+-        case GGML_TYPE_Q4_0:
+-        case GGML_TYPE_Q4_1:
+-        case GGML_TYPE_Q5_0:
+-        case GGML_TYPE_Q5_1:
+-        case GGML_TYPE_Q8_0:
+-        case GGML_TYPE_Q2_0:
+-        case GGML_TYPE_Q2_K:
+-        case GGML_TYPE_Q3_K:
+-        case GGML_TYPE_Q4_K:
+-        case GGML_TYPE_Q5_K:
+-        case GGML_TYPE_Q6_K:
+-        case GGML_TYPE_MXFP4:
+-        case GGML_TYPE_NVFP4:
+-        case GGML_TYPE_IQ2_XXS:
+-        case GGML_TYPE_IQ2_XS:
+-        case GGML_TYPE_IQ2_S:
+-        case GGML_TYPE_IQ3_XXS:
+-        case GGML_TYPE_IQ3_S:
+-        case GGML_TYPE_IQ1_S:
+-        case GGML_TYPE_IQ1_M:
+-        case GGML_TYPE_IQ4_NL:
+-        case GGML_TYPE_IQ4_XS:
+-            return true;
+-        default:
+-            return false;
+-    }
+-}
+-
+ // Helper functions to unify device memory allocation for both async and sync paths
+ static inline void * sycl_ext_malloc_device(dpct::queue_ptr stream, size_t size) {
+     bool use_async = g_ggml_sycl_use_async_mem_op;
+@@ -5638,26 +5611,30 @@ __dpct_inline__ static void k_zero_dst_rows(
+     }
+ }
+ 
+-// returns true when ggml_sycl_mul_mat_id takes the fallback path that requires stream synchronization
+-static bool ggml_sycl_mul_mat_id_needs_sync(const ggml_tensor * dst) {
+-    const ggml_tensor * src0 = dst->src[0];
+-    const ggml_tensor * src1 = dst->src[1];
+-    const ggml_tensor * ids  = dst->src[2];
+-
++static bool ggml_sycl_mul_mat_id_mmvq_shape_ok(
++    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
+     const int64_t ne10 = src1->ne[0];
+     const int64_t ne11 = src1->ne[1];
+     const int64_t ne12 = src1->ne[2];
+ 
+-    if (ne12 != 1) return true;
+-    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return true;
+-    if (ne10 != src0->ne[0] || ne10 % QK8_1 != 0) return true;
+-    if (!ggml_is_contiguous(src1)) return true;
++    if (ne12 != 1) return false;
++    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
++    if (ne10 != src0->ne[0] || ne10 % QK8_1 != 0) return false;
++    if (!ggml_is_contiguous(src1)) return false;
+ 
+     const int64_t n_ids_per_group = ids->ne[0];
+-    if (ids->ne[1] != 1) return true;
+-    if (ne11 != 1 && ne11 != n_ids_per_group) return true;
++    if (ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t)) return false;
++    if (ids->ne[1] != 1) return false;
++    if (ne11 != 1 && ne11 != n_ids_per_group) return false;
+ 
+-    return !ggml_sycl_supports_mmvq_id(src0->type);
++    return true;
++}
++
++// returns true when ggml_sycl_mul_mat_id takes the fused MMVQ path
++static bool ggml_sycl_mul_mat_id_mmvq_ok(const ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];
++    return ggml_sycl_mul_mat_id_mmvq_shape_ok(src0, dst->src[1], dst->src[2], dst) &&
++           ggml_sycl_mul_mat_vec_q_id_supports_type(src0->type);
+ }
+ 
+ // Fused MoE TG fast path. Returns false to fall back to the per-expert loop below.
+@@ -5665,13 +5642,11 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
+     ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
+     const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst)
+ {
+-    if (ggml_sycl_mul_mat_id_needs_sync(dst)) return false;
++    if (!ggml_sycl_mul_mat_id_mmvq_ok(dst)) return false;
+ 
+     const int64_t ne10 = src1->ne[0];
+     const int64_t ne11 = src1->ne[1];
+-
+     const int64_t n_ids_per_group = ids->ne[0];
+-
+     const queue_ptr stream           = ctx.stream();
+     const int       src1_padded_cols = GGML_PAD((int) ne10, MATRIX_ROW_PADDING);
+     const int       n_experts_used   = (int) n_ids_per_group;
+@@ -5769,6 +5744,16 @@ static void mmid_counting_sort_rows(
+     routed_row_src.resize(expert_row_offsets[n_as]);
+ }
+ 
++static bool ggml_sycl_mul_mat_id_grouped_shape_ok(const ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++    const ggml_tensor * ids = dst->src[2];
++    return g_ggml_sycl_mmid_sched && src1->ne[2] != 1 && ggml_is_contiguous(src0) &&
++           ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t) &&
++           src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
++           src1->nb[1] == sizeof(float)*src1->ne[0] && dst->nb[1] == sizeof(float)*dst->ne[0];
++}
++
+ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+                                  ggml_tensor *dst) try {
+     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
+@@ -5789,13 +5774,46 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+             return;
+         }
+     }
+-    GGML_ASSERT(ggml_sycl_mul_mat_id_needs_sync(dst));
++    GGML_ASSERT(!ggml_sycl_mul_mat_id_mmvq_ok(dst));
+ 
+     // The per-expert loop below reads the experts in whatever layout they have: reorder MXFP4 here as well, so prompt processing does not depend on a single-token decode having run first.
+     if (src0->type == GGML_TYPE_MXFP4) {
+         opt_for_reorder_id(&ctx, src0);
+     }
+ 
++    if (ggml_sycl_mul_mat_id_grouped_shape_ok(dst)) {
++        if (g_ggml_sycl_dynamic_precision != GGML_SYCL_DYNAMIC_PRECISION_F32 &&
++            ggml_sycl_xmx_gather_type_enabled(src0->type)) {
++            opt_for_reorder_id(&ctx, src0);
++        }
++        const bool reordered = src0->extra && ((const ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder;
++        const ggml_sycl_gg_rows src1_rows = { (char *) src1->data, nullptr, ne11, nb11, nb12 };
++        const ggml_sycl_gg_rows dst_rows = { (char *) dst->data, nullptr, ne1, nb1, nb2 };
++        if (ggml_sycl_grouped_dequant_gemm_device(src0->type, reordered, src0->data, nb02, src1_rows,
++                ggml_sycl_src1_prec(dst), dst_rows, (const int32_t *) ids->data, ids->nb[1], n_as, n_ids,
++                ids->ne[1], ne01, ne10, ctx.pool(), stream)) {
++            // the device schedule drops skipped slots (id == -1), so their dst rows are zeroed here
++            const char * ids_data = (const char *) ids->data;
++            const size_t ids_nb1  = ids->nb[1];
++            char *       dst_data = (char *) dst->data;
++            const int    nth      = (int) std::min<int64_t>(ne0, 256);
++            stream->parallel_for(
++                sycl::nd_range<2>(sycl::range<2>(ids->ne[1], n_ids * nth), sycl::range<2>(1, nth)),
++                [=](sycl::nd_item<2> item) {
++                    const int64_t iid1 = item.get_group(0);
++                    const int64_t id   = item.get_group(1);
++                    if (*(const int32_t *) (ids_data + iid1*ids_nb1 + id*sizeof(int32_t)) != -1) {
++                        return;
++                    }
++                    float * row = (float *) (dst_data + id*nb1 + iid1*nb2);
++                    for (int64_t j = item.get_local_id(1); j < ne0; j += nth) {
++                        row[j] = 0.0f;
++                    }
++                });
++            return;
++        }
++    }
++
+     std::vector<char> ids_host(ggml_nbytes(ids));
+     const char * ids_dev = (const char *) ids->data;
+ 
+@@ -6901,13 +6919,63 @@ static bool mul_mat_uses_onednn(int device, ggml_tensor * dst) {
+ #endif
+ }
+ 
+-static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgraph * cgraph) {
++static bool mul_mat_id_runs_on_device(ggml_backend_sycl_context * ctx, const ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++    const ggml_tensor * ids = dst->src[2];
++    if (!src0 || !src1 || !ids || ggml_backend_buffer_is_sycl_split(src0->buffer)) {
++        return false;
++    }
++    const bool reordered = src0->extra && ((const ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder;
++    if (ggml_sycl_mul_mat_id_mmvq_shape_ok(src0, src1, ids, dst)) {
++        return reordered ? ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(src0->type) :
++                           ggml_sycl_mul_mat_vec_q_id_supports_type(src0->type);
++    }
++    return ggml_sycl_mul_mat_id_grouped_shape_ok(dst) &&
++           ggml_sycl_grouped_dequant_gemm_device_supported(src0->type, reordered, ggml_sycl_src1_prec(dst),
++               src0->ne[2], ids->ne[0], ids->ne[1], src0->ne[1], src0->ne[0], ctx->stream());
++}
++
++// mirrors the paths in ggml_sycl_mul_mat_id() that call opt_for_reorder_id()
++static bool mul_mat_id_reorders_src0(const ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];
++    if (ggml_sycl_mul_mat_id_mmvq_ok(dst) || src0->type == GGML_TYPE_MXFP4) {
++        return true;
++    }
++    return ggml_sycl_mul_mat_id_grouped_shape_ok(dst) &&
++           g_ggml_sycl_dynamic_precision != GGML_SYCL_DYNAMIC_PRECISION_F32 &&
++           ggml_sycl_xmx_gather_type_enabled(src0->type);
++}
++
++static bool node_is_device_local(ggml_backend_buffer_type_t device_buft, const ggml_tensor * node) {
++    if (!node->buffer || node->buffer->buft != device_buft) {
++        return false;
++    }
++    for (int j = 0; j < GGML_MAX_SRC; ++j) {
++        const ggml_tensor * src = node->src[j];
++        if (!src || !src->buffer) {
++            continue;
++        }
++        if (ggml_backend_buffer_is_sycl_split(src->buffer) ||
++            (ggml_backend_buffer_is_sycl(src->buffer) && src->buffer->buft != device_buft)) {
++            return false;
++        }
++    }
++    return true;
++}
++
++// recheck is set when the result can change without the cgraph changing, so it must not be cached
++static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgraph * cgraph, bool & recheck) {
++    recheck = false;
++
+     if (ggml_sycl_info().active_device_count > 1) {
+         // A sycl_ex::command_graph object can only be created for a single device
+         GGML_LOG_DEBUG("%s: disabling SYCL graphs due to multiple devices\n", __func__);
+         return false;
+     }
+ 
++    const ggml_backend_buffer_type_t device_buft = ggml_backend_sycl_buffer_type(ctx->device);
++
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         ggml_tensor * node = cgraph->nodes[i];
+ 
+@@ -6918,6 +6986,25 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
+ 
+         const ggml_op node_op = node->op;
+ 
++        if (!node_is_device_local(device_buft, node)) {
++            GGML_LOG_DEBUG("%s: disabling SYCL graphs due to node %s not being device local\n", __func__,
++                           ggml_op_name(node_op));
++            return false;
++        }
++
++        // Reorder weights before recording, as allocation during recording can hang.
++        const ggml_tensor * src0 = node->src[0];
++        if (node_op == GGML_OP_MUL_MAT_ID && mul_mat_id_reorders_src0(node)) {
++            opt_for_reorder_id(ctx, src0);
++        } else if (src0 && should_reorder_tensor(*ctx, node)) {
++            // ggml_sycl_mul_mat() reorders lazily: run without a graph until it has
++            const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
++            if (extra && !extra->optimized_feature.reorder) {
++                recheck = true;
++                return false;
++            }
++        }
++
+         switch (node_op) {
+             default:
+                 break;
+@@ -6925,7 +7012,7 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
+                 // The ggml_sycl_mul_mat_id() fallback path does a blocking host wait on the sycl
+                 // queue after submitting a memcpy operation, but wait() can't be called on a queue
+                 // that is recording to a graph.
+-                if (ggml_sycl_mul_mat_id_needs_sync(node)) {
++                if (!mul_mat_id_runs_on_device(ctx, node)) {
+                     GGML_LOG_DEBUG("%s: disabling SYCL graphs due to host wait in %s\n", __func__,
+                                    ggml_op_name(node_op));
+                     return false;
+@@ -6965,6 +7052,13 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
+                 }
+ #endif
+                 break;
++            case GGML_OP_OUT_PROD:
++            case GGML_OP_CONV_3D:
++            case GGML_OP_SOLVE_TRI:
++                // these call oneMKL and wait on the host
++                GGML_LOG_DEBUG("%s: disabling SYCL graphs due to unsupported node type %s\n", __func__,
++                               ggml_op_name(node_op));
++                return false;
+         }
+     }
+     return true;
+@@ -6996,8 +7090,9 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
+             // The nodes of a cgraph do not change while its uid does not, so the compatibility scan
+             // runs again only when the uid changes. A uid of 0 means it is not set.
+             if (cgraph->uid == 0 || cgraph->uid != graph->compatible_uid) {
+-                graph->compatible_uid = cgraph->uid;
+-                graph->compatible     = check_graph_compatibility(sycl_ctx, cgraph);
++                bool recheck          = false;
++                graph->compatible     = check_graph_compatibility(sycl_ctx, cgraph, recheck);
++                graph->compatible_uid = recheck ? 0 : cgraph->uid;
+ 
+                 if (sycl_ctx->graph_compatible != graph->compatible) {
+                     if (graph->compatible) {
+diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+index c3853814..576b48cb 100644
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -2706,6 +2706,49 @@ static void launch_mul_mat_vec_q_moe(
+     });
+ }
+ 
++bool ggml_sycl_mul_mat_vec_q_id_supports_type(enum ggml_type src0_type) {
++    switch (src0_type) {
++        case GGML_TYPE_Q4_0:
++        case GGML_TYPE_Q4_1:
++        case GGML_TYPE_Q5_0:
++        case GGML_TYPE_Q5_1:
++        case GGML_TYPE_Q8_0:
++        case GGML_TYPE_Q2_0:
++        case GGML_TYPE_Q2_K:
++        case GGML_TYPE_Q3_K:
++        case GGML_TYPE_Q4_K:
++        case GGML_TYPE_Q5_K:
++        case GGML_TYPE_Q6_K:
++        case GGML_TYPE_MXFP4:
++        case GGML_TYPE_NVFP4:
++        case GGML_TYPE_IQ2_XXS:
++        case GGML_TYPE_IQ2_XS:
++        case GGML_TYPE_IQ2_S:
++        case GGML_TYPE_IQ3_XXS:
++        case GGML_TYPE_IQ3_S:
++        case GGML_TYPE_IQ1_S:
++        case GGML_TYPE_IQ1_M:
++        case GGML_TYPE_IQ4_NL:
++        case GGML_TYPE_IQ4_XS:
++            return true;
++        default:
++            return false;
++    }
++}
++
++bool ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(enum ggml_type src0_type) {
++    switch (src0_type) {
++        case GGML_TYPE_Q8_0:
++        case GGML_TYPE_Q4_K:
++        case GGML_TYPE_Q5_K:
++        case GGML_TYPE_Q6_K:
++        case GGML_TYPE_MXFP4:
++            return true;
++        default:
++            return false;
++    }
++}
++
+ bool ggml_sycl_mul_mat_vec_q_id(
+     enum ggml_type     src0_type,
+     const void *       vx_base,
+@@ -2719,7 +2762,9 @@ bool ggml_sycl_mul_mat_vec_q_id(
+     size_t             dst_row_stride,
+     size_t             src1_row_stride,
+     dpct::queue_ptr    stream) {
+-    // if adding a new type, ensure it is also added to ggml_sycl_supports_mmvq_id
++    if (!ggml_sycl_mul_mat_vec_q_id_supports_type(src0_type)) {
++        return false;
++    }
+     switch (src0_type) {
+         case GGML_TYPE_Q4_0:
+             launch_mul_mat_vec_q_moe<QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1>(
+@@ -2952,6 +2997,9 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder(
+     size_t             dst_row_stride,
+     size_t             src1_row_stride,
+     dpct::queue_ptr    stream) {
++    if (!ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(src0_type)) {
++        return false;
++    }
+     switch (src0_type) {
+         case GGML_TYPE_Q8_0:
+             launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>>(
+diff --git a/ggml/src/ggml-sycl/mmvq.hpp b/ggml/src/ggml-sycl/mmvq.hpp
+index 5649cbcd..e372d50b 100644
+--- a/ggml/src/ggml-sycl/mmvq.hpp
++++ b/ggml/src/ggml-sycl/mmvq.hpp
+@@ -117,4 +117,7 @@ bool ggml_sycl_mul_mat_vec_q_glu_plain(
+     int                stride_col_dst,       // floats between output columns in dst
+     dpct::queue_ptr    stream);
+ 
++bool ggml_sycl_mul_mat_vec_q_id_supports_type(enum ggml_type src0_type);
++bool ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(enum ggml_type src0_type);
++
+ #endif // GGML_SYCL_MMVQ_HPP
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f75ff11b..5993e467 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11441,6 +11441,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     // the batches of a are padded, nb[2] is not a multiple of nb[1]
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 8, 1, 64, {8, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 16, 16));
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 8, 16, 64, {8, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 16, 16));
++    // Ragged expert slices, strided routing IDs and broadcast activations.
++    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S}) {
++        for (int n : {3, 17, 33}) {
++            for (bool broadcast : {false, true}) {
++                test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 37, 2, broadcast, 65, n, 256));
++            }
++        }
++    }
++
+     // as is a view whose experts are strided by more rows than it uses
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 4, 2, false, 8,  1, 64, 64));
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 4, 2, false, 8, 16, 64, 64));
+-- 
+2.43.0
+
+
+From c2d02b8517871eda0c53120a736f05cb36199941 Mon Sep 17 00:00:00 2001
+From: cwriter <cwriter@localhost>
+Date: Fri, 9 Oct 2026 15:24:30 +0000
+Subject: [PATCH 2/6] Add width-heuristic override bit and Q2_K and Q3_K types
+
+Assisted-by: Codex
+---
+ docs/backend/SYCL.md              |  4 +-
+ ggml/src/ggml-sycl/common.hpp     |  8 +++
+ ggml/src/ggml-sycl/fused-gemm.cpp | 84 ++++++++++++++++++++++++++++++-
+ ggml/src/ggml-sycl/fused-gemm.hpp |  8 ++-
+ ggml/src/ggml-sycl/ggml-sycl.cpp  |  6 +--
+ tests/test-backend-ops.cpp        | 11 +++-
+ 6 files changed, 110 insertions(+), 11 deletions(-)
+
+diff --git a/docs/backend/SYCL.md b/docs/backend/SYCL.md
+index b87d4764..334fe1e6 100644
+--- a/docs/backend/SYCL.md
++++ b/docs/backend/SYCL.md
+@@ -825,8 +825,8 @@ User can use the device management in [docs/multi-gpu.md](https://github.com/ggm
+ | GGML_SYCL_ENABLE_XMX_ESIMD | 0 or 1 (default) | Use the XMX (DPAS) multi-column mat-vec kernels for reordered Q2_K to Q6_K and Q8_0 weights on Xe2 GPUs. Speeds up speculative decoding and short prompt batches. |
+ | GGML_SYCL_XMX_MAX_COLS | non-negative integer, 80 (default) | Most activation columns (batch size) the `GGML_SYCL_ENABLE_XMX_ESIMD` kernels take; wider batches use the other mat-mul kernels. A larger value keeps XMX for bigger batches (as repeated launches), `0` never uses it. |
+ | GGML_SYCL_XMX_GLU_MAX_COLS | 0 to 16, 16 (default) | Most columns the fused gate and up XMX kernel takes; wider batches run gate and up as separate mat-vecs. 16 is the most the kernel is built for, larger values are clamped to 16 and `0` turns the fused kernel off. |
+-| GGML_SYCL_XMX_GATHER_TYPES | decimal bitmask, all bits set (default) | Weight formats that may use the XMX dequant-GEMM paths, which dequantize weights straight into the XMX tiles. This speeds up prompt processing of MoE models on GPUs with XMX units (Arc A- and B-series, Arc Pro, Data Center GPU Max), for example pp512 of Qwen3-30B-A3B UD-IQ3_XXS by about 50% on an Arc Pro B60. Bits:<br>* 1: IQ4_NL, 2: IQ3_S, 4: IQ4_XS, 8: IQ3_XXS, 16: IQ2_XXS, 32: IQ2_XS, 64: IQ2_S, 128: IQ1_S, 256: IQ1_M<br>* 512: Q8_0, 1024: Q4_K, 2048: Q5_K, 4096: Q6_K (MoE `MUL_MAT_ID` only)<br>Add values to combine them, for example `3` for IQ4_NL and IQ3_S; `0` disables the paths. A set bit does not force the path: batches of more than 64 tokens per expert or row lengths that are not a multiple of 256 (32 for IQ4_NL and Q8_0) use the library GEMM. |
+-| GGML_SYCL_MMID_SCHED | 1 (default), 0 disables | Build the grouped MoE routing and tile schedule on the GPU, avoiding the expert-ID host readback and CPU sort. Unsupported types, shapes and devices use the host schedule. Only bit 0 is used; other bits are ignored. |
++| GGML_SYCL_XMX_GATHER_TYPES | decimal bitmask, all bits set (default) | Weight formats that may use the XMX dequant-GEMM paths, which dequantize weights straight into the XMX tiles. This speeds up prompt processing of MoE models on GPUs with XMX units (Arc A- and B-series, Arc Pro, Data Center GPU Max), for example pp512 of Qwen3-30B-A3B UD-IQ3_XXS by about 50% on an Arc Pro B60. Bits:<br>* 1: IQ4_NL, 2: IQ3_S, 4: IQ4_XS, 8: IQ3_XXS, 16: IQ2_XXS, 32: IQ2_XS, 64: IQ2_S, 128: IQ1_S, 256: IQ1_M<br>* 512: Q8_0, 1024: Q4_K, 2048: Q5_K, 4096: Q6_K, 8192: Q2_K, 16384: Q3_K (MoE `MUL_MAT_ID` only)<br>Add values to combine them, for example `3` for IQ4_NL and IQ3_S; `0` disables the paths. A set bit does not force the path: batches of more than 64 tokens per expert use the library GEMM unless the device schedule width heuristic is overridden with `GGML_SYCL_MMID_SCHED=3`. Row lengths must be a multiple of 256 (32 for IQ4_NL and Q8_0). |
++| GGML_SYCL_MMID_SCHED | decimal bitmask, 1 (default) | Build the grouped MoE routing and tile schedule on the GPU, avoiding the expert-ID host readback and CPU sort.<br>* 1: enable the device schedule.<br>* 2: override the fallback for models with few routed experts by disabling the performance heuristic that rejects batches averaging more than 64 routed rows per expert. This may reduce performance; type, shape, precision and device capability checks still apply.<br>Use `3` to enable the device schedule and override this heuristic, or `0` to use the host schedule. Bit 2 alone does not enable the device schedule. Higher bits are ignored. |
+ | GGML_SYCL_XMX_GATHER_SHAPES | decimal bitmask, 255 (default) | XMX `joint_matrix` combinations the paths of `GGML_SYCL_XMX_GATHER_TYPES` may use; the operand type comes from `GGML_SYCL_DYNAMIC_PRECISION` and the best supported combination is picked automatically (logged as `fg_pick_combo`). Bits:<br>* Xe2, Xe3, Xe-HPC: 1: f16 8x16x16, 2: f16 16x16x16, 4: f16 32x64x16, 8: f16 32x64x32, 32: tf32 8x16x8, 64: bf16 8x16x16<br>* Xe-HPG (Arc A770, ARL-H): 16: f16 8x8x16, 128: bf16 8x8x16<br>Clear a bit to exclude a combination, or set a single bit to force one for testing. |
+ | GGML_SYCL_DYNAMIC_PRECISION | `F16` (default with `GGML_SYCL_F16=ON`), `BF16`, `TF32` or `F32` (default otherwise) | Operand type of the XMX dequant-GEMM paths (`GGML_SYCL_XMX_GATHER_TYPES`); accumulation is always f32. `F16` is the fastest, but activations above 65504 overflow. `BF16` keeps the f32 range at a 7-bit mantissa, `TF32` keeps the range and the f16 mantissa but is about 30% slower and needs Xe2, Xe3 or Xe-HPC, and `F32` turns the XMX paths off. Ops that request a higher src1 precision ([TAG_GGML_PREC]) get it regardless of this setting. |
+ | GGML_SYCL_DYNAMIC_REQUIRED_PRECISION | `F32` (default), `TF32`, `BF16` or `F16` | Lowest type the XMX paths may use for an op that requests an F32 src1, such as Mistral 4 `ffn_down_exps`. The default runs such ops on the library f32 GEMM; `TF32` or `BF16` trade mantissa for speed while keeping the f32 range. `F16` ignores the request and can overflow; it is meant for testing only. |
+diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
+index 668e9bef..23ed4c67 100644
+--- a/ggml/src/ggml-sycl/common.hpp
++++ b/ggml/src/ggml-sycl/common.hpp
+@@ -92,9 +92,17 @@ enum ggml_sycl_xmx_gather_type {
+     GGML_SYCL_XMX_GATHER_Q4_K     = 1 << 10,
+     GGML_SYCL_XMX_GATHER_Q5_K     = 1 << 11,
+     GGML_SYCL_XMX_GATHER_Q6_K     = 1 << 12,
++    GGML_SYCL_XMX_GATHER_Q2_K     = 1 << 13,
++    GGML_SYCL_XMX_GATHER_Q3_K     = 1 << 14,
+ };
+ static constexpr int GGML_SYCL_XMX_GATHER_TYPES_DEFAULT = ~0;
+ extern int g_ggml_sycl_xmx_gather_types;
++
++enum ggml_sycl_mmid_sched_bit {
++    GGML_SYCL_MMID_SCHED_DEVICE    = 1 << 0,
++    GGML_SYCL_MMID_SCHED_UNBOUNDED = 1 << 1,
++};
++extern int g_ggml_sycl_mmid_sched;
+ // Which joint_matrix combinations the XMX dequant-GEMM paths may use, one bit each (see fused-gemm.cpp).
+ // GGML_SYCL_DYNAMIC_PRECISION picks the operand type, this mask the combinations of that type.
+ static constexpr int GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT = 0xff;
+diff --git a/ggml/src/ggml-sycl/fused-gemm.cpp b/ggml/src/ggml-sycl/fused-gemm.cpp
+index 467e12db..7e5a17f0 100644
+--- a/ggml/src/ggml-sycl/fused-gemm.cpp
++++ b/ggml/src/ggml-sycl/fused-gemm.cpp
+@@ -411,6 +411,8 @@ template <> struct fg_block_traits<block_iq2_s>   { static constexpr int qk = QK
+ template <> struct fg_block_traits<block_iq1_s>   { static constexpr int qk = QK_K; };
+ template <> struct fg_block_traits<block_iq1_m>   { static constexpr int qk = QK_K; };
+ template <> struct fg_block_traits<block_q8_0>    { static constexpr int qk = QK8_0; };
++template <> struct fg_block_traits<block_q2_K>    { static constexpr int qk = QK_K; };
++template <> struct fg_block_traits<block_q3_K>    { static constexpr int qk = QK_K; };
+ template <> struct fg_block_traits<block_q4_K>    { static constexpr int qk = QK_K; };
+ template <> struct fg_block_traits<block_q5_K>    { static constexpr int qk = QK_K; };
+ template <> struct fg_block_traits<block_q6_K>    { static constexpr int qk = QK_K; };
+@@ -595,6 +597,39 @@ static __dpct_inline__ void fg_scale_min_k4(const int j, const uint8_t * __restr
+     }
+ }
+ 
++template <typename E>
++static __dpct_inline__ void fg_decode_q2_K(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ scales,
++                                           const float d, const float dmin, const int ib, typename E::pair * a) {
++    const uint8_t * q = qs + 32 * (ib / 4);
++    const int shift = 2 * (ib % 4);
++#pragma unroll
++    for (int j = 0; j < 16; ++j) {
++        const uint8_t sc = scales[2 * ib + j / 8];
++        const float dl = d * (sc & 0xF);
++        const float ml = dmin * (sc >> 4);
++        a[j] = E::make(dl * ((q[2 * j] >> shift) & 3) - ml,
++                       dl * ((q[2 * j + 1] >> shift) & 3) - ml);
++    }
++}
++
++template <typename E>
++static __dpct_inline__ void fg_decode_q3_K(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ hmask,
++                                           const uint8_t * __restrict__ scales, const float d, const int ib,
++                                           typename E::pair * a) {
++    const uint8_t * q = qs + 32 * (ib / 4);
++    const int shift = 2 * (ib % 4);
++#pragma unroll
++    for (int j = 0; j < 16; ++j) {
++        const int s = 2 * ib + j / 8;
++        const int sc = ((scales[s % 8] >> (4 * (s / 8))) & 0xF) |
++                       (((scales[8 + s % 4] >> (2 * (s / 4))) & 3) << 4);
++        const float dl = d * (sc - 32);
++        const int q0 = ((q[2 * j] >> shift) & 3) - ((hmask[2 * j] & (1 << ib)) ? 0 : 4);
++        const int q1 = ((q[2 * j + 1] >> shift) & 3) - ((hmask[2 * j + 1] & (1 << ib)) ? 0 : 4);
++        a[j] = E::make(dl * q0, dl * q1);
++    }
++}
++
+ // q4_K sub-block ib (0..7) uses scale/min pair ib and the low (even ib) or high (odd ib) nibbles of
+ // qs[32 * (ib / 2) ...], as in dequantize_row_q4_K
+ template <typename E>
+@@ -658,6 +693,18 @@ static __dpct_inline__ void fg_stage_a(const block_q8_0 * __restrict__ xrow, con
+     fg_decode_q8_0<E>(xrow[kb].qs, (float) xrow[kb].d, a);
+ }
+ 
++template <typename E>
++static __dpct_inline__ void fg_stage_a(const block_q2_K * __restrict__ xrow, const int kb, typename E::pair * a) {
++    FG_SUPERBLOCK(block_q2_K);
++    fg_decode_q2_K<E>(blk->qs, blk->scales, (float) blk->dm[0], (float) blk->dm[1], ib, a);
++}
++
++template <typename E>
++static __dpct_inline__ void fg_stage_a(const block_q3_K * __restrict__ xrow, const int kb, typename E::pair * a) {
++    FG_SUPERBLOCK(block_q3_K);
++    fg_decode_q3_K<E>(blk->qs, blk->hmask, blk->scales, (float) blk->d, ib, a);
++}
++
+ template <typename E>
+ static __dpct_inline__ void fg_stage_a(const block_q4_K * __restrict__ xrow, const int kb, typename E::pair * a) {
+     FG_SUPERBLOCK(block_q4_K);
+@@ -693,6 +740,35 @@ template <> struct fg_soa<block_q8_0> {
+     }
+ };
+ 
++template <> struct fg_soa<block_q2_K> {
++    static constexpr bool supported = true;
++
++    // [qs][scales][dm]
++    template <typename E>
++    static __dpct_inline__ void stage(const uint8_t * x, const size_t nblocks, const size_t ib, const int kb,
++                                      typename E::pair * a) {
++        const uint8_t * scales = x + nblocks * (QK_K / 4);
++        const sycl::half2 dm = ((const sycl::half2 *) (scales + nblocks * (QK_K / 16)))[ib];
++        fg_decode_q2_K<E>(x + ib * (QK_K / 4), scales + ib * (QK_K / 16), (float) dm[0], (float) dm[1],
++                          kb % (QK_K / 32), a);
++    }
++};
++
++template <> struct fg_soa<block_q3_K> {
++    static constexpr bool supported = true;
++
++    // [qs][hmask][scales][d]
++    template <typename E>
++    static __dpct_inline__ void stage(const uint8_t * x, const size_t nblocks, const size_t ib, const int kb,
++                                      typename E::pair * a) {
++        const uint8_t * hmask = x + nblocks * (QK_K / 4);
++        const uint8_t * scales = hmask + nblocks * (QK_K / 8);
++        const float d = (float) ((const sycl::half *) (scales + nblocks * 12))[ib];
++        fg_decode_q3_K<E>(x + ib * (QK_K / 4), hmask + ib * (QK_K / 8), scales + ib * 12, d,
++                          kb % (QK_K / 32), a);
++    }
++};
++
+ template <> struct fg_soa<block_q4_K> {
+     static constexpr bool supported = true;
+     // [qs][scales][dm]
+@@ -941,7 +1017,8 @@ static void grouped_gemm_pack_b(const float * y, typename S::tsb * packed, const
+ // q8_0 and the k-quants take only the grouped path. The plain kernel decodes A again for every BN columns
+ // of a dense batch, and for these formats that costs more than the one dequantization of the library GEMM.
+ template <typename T> static constexpr bool fg_plain_ok() {
+-    return !std::is_same_v<T, block_q8_0> && !std::is_same_v<T, block_q4_K> && !std::is_same_v<T, block_q5_K> &&
++    return !std::is_same_v<T, block_q8_0> && !std::is_same_v<T, block_q2_K> && !std::is_same_v<T, block_q3_K> &&
++           !std::is_same_v<T, block_q4_K> && !std::is_same_v<T, block_q5_K> &&
+            !std::is_same_v<T, block_q6_K>;
+ }
+ 
+@@ -975,6 +1052,8 @@ template <typename F> static bool fg_visit_type(ggml_type type, bool reordered,
+         case GGML_TYPE_IQ1_S:   return fg_visit_layout<block_iq1_s>(reordered, f);
+         case GGML_TYPE_IQ1_M:   return fg_visit_layout<block_iq1_m>(reordered, f);
+         case GGML_TYPE_Q8_0:    return fg_visit_layout<block_q8_0>(reordered, f);
++        case GGML_TYPE_Q2_K:    return fg_visit_layout<block_q2_K>(reordered, f);
++        case GGML_TYPE_Q3_K:    return fg_visit_layout<block_q3_K>(reordered, f);
+         case GGML_TYPE_Q4_K:    return fg_visit_layout<block_q4_K>(reordered, f);
+         case GGML_TYPE_Q5_K:    return fg_visit_layout<block_q5_K>(reordered, f);
+         case GGML_TYPE_Q6_K:    return fg_visit_layout<block_q6_K>(reordered, f);
+@@ -1287,7 +1366,8 @@ bool ggml_sycl_grouped_dequant_gemm_device_supported(ggml_type src0_type, bool r
+     // The active expert count is unknown until the GPU builds the schedule.
+     if (g_ggml_sycl_dynamic_precision == GGML_SYCL_DYNAMIC_PRECISION_F32 ||
+         !ggml_sycl_xmx_gather_type_enabled(src0_type) || !fg_visit_type(src0_type, reordered, [](auto) {}) ||
+-        !ggml_sycl_grouped_dequant_gemm_shape_ok(src0_type, M, K, total_rows, std::min(n_as, total_rows))) {
++        !ggml_sycl_grouped_dequant_gemm_shape_ok(src0_type, M, K, total_rows, std::min(n_as, total_rows),
++                                                (g_ggml_sycl_mmid_sched & GGML_SYCL_MMID_SCHED_UNBOUNDED) != 0)) {
+         return false;
+     }
+     const sycl::device device = stream->get_device();
+diff --git a/ggml/src/ggml-sycl/fused-gemm.hpp b/ggml/src/ggml-sycl/fused-gemm.hpp
+index e45f5e56..b269946c 100644
+--- a/ggml/src/ggml-sycl/fused-gemm.hpp
++++ b/ggml/src/ggml-sycl/fused-gemm.hpp
+@@ -27,6 +27,8 @@ constexpr bool ggml_sycl_fused_dequant_gemm_type_ok(ggml_type src0_type, int64_t
+         return K % 32 == 0;
+     }
+     const bool superblock =
++           src0_type == GGML_TYPE_Q2_K ||
++           src0_type == GGML_TYPE_Q3_K ||
+            src0_type == GGML_TYPE_Q4_K ||
+            src0_type == GGML_TYPE_Q5_K ||
+            src0_type == GGML_TYPE_Q6_K ||
+@@ -51,9 +53,9 @@ constexpr bool ggml_sycl_fused_dequant_gemm_shape_ok(ggml_type src0_type, int64_
+ // grouped variant: the per-expert fused kernel is only worth it while each expert is narrow,
+ // so wider average slices are left to the per-expert library GEMM loop
+ constexpr bool ggml_sycl_grouped_dequant_gemm_shape_ok(ggml_type src0_type, int64_t M, int64_t K,
+-                                                       int64_t total_rows, int64_t n_active) {
++                                                       int64_t total_rows, int64_t n_active, bool unbounded = false) {
+     return ggml_sycl_fused_dequant_gemm_shape_ok(src0_type, M, 1, K, M) && total_rows > 0 &&
+-           total_rows <= INT32_MAX && total_rows <= n_active * GGML_SYCL_FG_MAX_N;
++           total_rows <= INT32_MAX && (unbounded || total_rows <= n_active * GGML_SYCL_FG_MAX_N);
+ }
+ 
+ // Runtime type gate, kept out of the constexpr predicates above so those stay pure.
+@@ -69,6 +71,8 @@ inline bool ggml_sycl_xmx_gather_type_enabled(ggml_type src0_type) {
+         case GGML_TYPE_IQ1_S:   return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_IQ1_S   ) != 0;
+         case GGML_TYPE_IQ1_M:   return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_IQ1_M   ) != 0;
+         case GGML_TYPE_Q8_0:    return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_Q8_0    ) != 0;
++        case GGML_TYPE_Q2_K:    return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_Q2_K    ) != 0;
++        case GGML_TYPE_Q3_K:    return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_Q3_K    ) != 0;
+         case GGML_TYPE_Q4_K:    return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_Q4_K    ) != 0;
+         case GGML_TYPE_Q5_K:    return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_Q5_K    ) != 0;
+         case GGML_TYPE_Q6_K:    return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_Q6_K    ) != 0;
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 430f92b8..ee8497b4 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -118,7 +118,7 @@ int g_ggml_sycl_xmx_glu_max_cols = GGML_SYCL_XMX_GLU_MAX_COLS;
+ int g_ggml_sycl_prioritize_dmmv = 0;
+ int g_ggml_sycl_xmx_gather_types = GGML_SYCL_XMX_GATHER_TYPES_DEFAULT;
+ int g_ggml_sycl_xmx_gather_shapes = GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT;
+-static int g_ggml_sycl_mmid_sched = 1;
++int g_ggml_sycl_mmid_sched = GGML_SYCL_MMID_SCHED_DEVICE;
+ int g_ggml_sycl_dynamic_precision = GGML_SYCL_DYNAMIC_PRECISION_DEFAULT;
+ int g_ggml_sycl_dynamic_required_precision = GGML_SYCL_DYNAMIC_PRECISION_F32;
+ static const char * ggml_sycl_dynamic_precision_names[] = { "F16", "BF16", "TF32", "F32" };
+@@ -451,7 +451,7 @@ static void ggml_check_sycl() try {
+         g_ggml_sycl_prioritize_dmmv = ggml_sycl_get_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
+         g_ggml_sycl_graph_eviction_timeout = ggml_sycl_get_env("GGML_SYCL_GRAPH_EVICTION_TIMEOUT", 10);
+         g_ggml_sycl_xmx_gather_types = ggml_sycl_get_env("GGML_SYCL_XMX_GATHER_TYPES", GGML_SYCL_XMX_GATHER_TYPES_DEFAULT);
+-        g_ggml_sycl_mmid_sched = ggml_sycl_get_env("GGML_SYCL_MMID_SCHED", 1) & 1;
++        g_ggml_sycl_mmid_sched = ggml_sycl_get_env("GGML_SYCL_MMID_SCHED", GGML_SYCL_MMID_SCHED_DEVICE) & 3;
+         g_ggml_sycl_xmx_gather_shapes = ggml_sycl_get_env("GGML_SYCL_XMX_GATHER_SHAPES", GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT);
+         g_ggml_sycl_dynamic_precision =
+             ggml_sycl_get_env_precision("GGML_SYCL_DYNAMIC_PRECISION", GGML_SYCL_DYNAMIC_PRECISION_DEFAULT);
+@@ -5748,7 +5748,7 @@ static bool ggml_sycl_mul_mat_id_grouped_shape_ok(const ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+     const ggml_tensor * src1 = dst->src[1];
+     const ggml_tensor * ids = dst->src[2];
+-    return g_ggml_sycl_mmid_sched && src1->ne[2] != 1 && ggml_is_contiguous(src0) &&
++    return (g_ggml_sycl_mmid_sched & GGML_SYCL_MMID_SCHED_DEVICE) && src1->ne[2] != 1 && ggml_is_contiguous(src0) &&
+            ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t) &&
+            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            src1->nb[1] == sizeof(float)*src1->ne[0] && dst->nb[1] == sizeof(float)*dst->ne[0];
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 5993e467..91bd83c5 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11442,7 +11442,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 8, 1, 64, {8, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 16, 16));
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 8, 16, 64, {8, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 16, 16));
+     // Ragged expert slices, strided routing IDs and broadcast activations.
+-    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S}) {
++    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K}) {
+         for (int n : {3, 17, 33}) {
+             for (bool broadcast : {false, true}) {
+                 test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 37, 2, broadcast, 65, n, 256));
+@@ -11450,6 +11450,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // Both experts receive every token; 65 tokens exceeds the device schedule width heuristic.
++    for (ggml_type type : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K}) {
++        for (int n : {64, 65}) {
++            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 2, 2, false, 33, n, 512));
++        }
++    }
++
+     // as is a view whose experts are strided by more rows than it uses
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 4, 2, false, 8,  1, 64, 64));
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 4, 2, false, 8, 16, 64, 64));
+@@ -12869,7 +12876,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+ 
+     // qwen3-30b-a3b
+     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
+-        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_XS}) {
++        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_XS}) {
+             for (ggml_type type_b : {GGML_TYPE_F32}) {
+                 test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
+                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
+-- 
+2.43.0
+
+
+From ab9ddc1736c380012165e78c2de0045a3b1d0726 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 13:33:34 +0000
+Subject: [PATCH 3/6] tests: cover skipped MUL_MAT_ID slots on the device MoE
+ schedule
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012gLfeVbEnsVZPcPfgmDyqm
+---
+ tests/test-backend-ops.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 91bd83c5..dbad09ca 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11447,6 +11447,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             for (bool broadcast : {false, true}) {
+                 test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 37, 2, broadcast, 65, n, 256));
+             }
++            // skipped slots (id == -1) are dropped by the device schedule and must still be zeroed
++            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 37, 2, false, 65, n, 256, 0, false, true));
+         }
+     }
+ 
+-- 
+2.43.0
+
+
+From b55fd2a9831bd5faf5e4078eeb4375c1e6c7776f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 14:28:14 +0000
+Subject: [PATCH 4/6] sycl: keep graphs on for lazily reordered MUL_MAT and
+ reject BN=64 combos on the device MoE schedule
+
+The graph check disabled SYCL graphs until every MUL_MAT weight with a
+reorder extra was reordered, which never happens for some (dense MXFP4,
+the fused GLU plain path), so graphs stayed off and the check reran on
+every compute. Upstream already reorders those during recording with
+the async memory extension, so only MUL_MAT_ID weights are reordered
+ahead of recording now.
+
+ggml_sycl_grouped_dequant_gemm_device_supported() accepted any XMX
+combo, but the device schedule only runs with BN == GGML_SYCL_FG_BN, so
+a 32x64 combo (GGML_SYCL_XMX_GATHER_SHAPES=4 or 8) made the graph check
+pass and the compute fall back to the host sync path while recording.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012gLfeVbEnsVZPcPfgmDyqm
+---
+ ggml/src/ggml-sycl/fused-gemm.cpp | 12 +++++++++---
+ ggml/src/ggml-sycl/ggml-sycl.cpp  | 23 ++++++-----------------
+ 2 files changed, 15 insertions(+), 20 deletions(-)
+
+diff --git a/ggml/src/ggml-sycl/fused-gemm.cpp b/ggml/src/ggml-sycl/fused-gemm.cpp
+index 7e5a17f0..79afc540 100644
+--- a/ggml/src/ggml-sycl/fused-gemm.cpp
++++ b/ggml/src/ggml-sycl/fused-gemm.cpp
+@@ -1375,11 +1375,17 @@ bool ggml_sycl_grouped_dequant_gemm_device_supported(ggml_type src0_type, bool r
+         device.get_info<sycl::info::device::local_mem_size>() < 3 * (n_as + 1) * sizeof(uint32_t)) {
+         return false;
+     }
+-    if (grouped_gemm_max_tiles(total_rows, n_as, GGML_SYCL_FG_BN) > INT32_MAX / GGML_SYCL_FG_BN ||
+-        fg_pick_combo(stream, GGML_TYPE_F32, src1_prec) < 0) {
++    if (grouped_gemm_max_tiles(total_rows, n_as, GGML_SYCL_FG_BN) > INT32_MAX / GGML_SYCL_FG_BN) {
+         return false;
+     }
+-    return true;
++    const int combo = fg_pick_combo(stream, GGML_TYPE_F32, src1_prec);
++    if (combo < 0) {
++        return false;
++    }
++    // the device schedule is built for GGML_SYCL_FG_BN-wide tiles, see fg_grouped_device_run()
++    bool bn_ok = false;
++    fg_visit_combo(combo, [&](auto s) { bn_ok = decltype(s)::BN == GGML_SYCL_FG_BN; });
++    return bn_ok;
+ }
+ 
+ bool ggml_sycl_grouped_dequant_gemm_device(ggml_type src0_type, bool reordered, const void * src0_base,
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index ee8497b4..09ec8ef3 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -6964,10 +6964,7 @@ static bool node_is_device_local(ggml_backend_buffer_type_t device_buft, const g
+     return true;
+ }
+ 
+-// recheck is set when the result can change without the cgraph changing, so it must not be cached
+-static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgraph * cgraph, bool & recheck) {
+-    recheck = false;
+-
++static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgraph * cgraph) {
+     if (ggml_sycl_info().active_device_count > 1) {
+         // A sycl_ex::command_graph object can only be created for a single device
+         GGML_LOG_DEBUG("%s: disabling SYCL graphs due to multiple devices\n", __func__);
+@@ -6992,17 +6989,10 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
+             return false;
+         }
+ 
+-        // Reorder weights before recording, as allocation during recording can hang.
+-        const ggml_tensor * src0 = node->src[0];
++        // Reorder expert weights before recording, so the reorder state that
++        // mul_mat_id_runs_on_device() sees is the one the recorded graph runs with.
+         if (node_op == GGML_OP_MUL_MAT_ID && mul_mat_id_reorders_src0(node)) {
+-            opt_for_reorder_id(ctx, src0);
+-        } else if (src0 && should_reorder_tensor(*ctx, node)) {
+-            // ggml_sycl_mul_mat() reorders lazily: run without a graph until it has
+-            const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+-            if (extra && !extra->optimized_feature.reorder) {
+-                recheck = true;
+-                return false;
+-            }
++            opt_for_reorder_id(ctx, node->src[0]);
+         }
+ 
+         switch (node_op) {
+@@ -7090,9 +7080,8 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
+             // The nodes of a cgraph do not change while its uid does not, so the compatibility scan
+             // runs again only when the uid changes. A uid of 0 means it is not set.
+             if (cgraph->uid == 0 || cgraph->uid != graph->compatible_uid) {
+-                bool recheck          = false;
+-                graph->compatible     = check_graph_compatibility(sycl_ctx, cgraph, recheck);
+-                graph->compatible_uid = recheck ? 0 : cgraph->uid;
++                graph->compatible_uid = cgraph->uid;
++                graph->compatible     = check_graph_compatibility(sycl_ctx, cgraph);
+ 
+                 if (sycl_ctx->graph_compatible != graph->compatible) {
+                     if (graph->compatible) {
+-- 
+2.43.0
+
+
+From 8227e581a4efea7ca90df6e3f80900f6c0ad41f7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 28 Oct 2026 16:43:03 +0000
+Subject: [PATCH 5/6] sycl: keep the ggml_sycl_mul_mat_id_needs_sync name for
+ the graph check
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-sycl/ggml-sycl.cpp | 18 ++++++++++--------
+ 1 file changed, 10 insertions(+), 8 deletions(-)
+
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 09ec8ef3..ee3bd424 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -6919,20 +6919,22 @@ static bool mul_mat_uses_onednn(int device, ggml_tensor * dst) {
+ #endif
+ }
+ 
+-static bool mul_mat_id_runs_on_device(ggml_backend_sycl_context * ctx, const ggml_tensor * dst) {
++// returns true when ggml_sycl_mul_mat_id takes the fallback path that requires stream synchronization:
++// neither the fused MMVQ path nor the device-scheduled grouped GEMM (GGML_SYCL_MMID_SCHED) handles dst
++static bool ggml_sycl_mul_mat_id_needs_sync(ggml_backend_sycl_context * ctx, const ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+     const ggml_tensor * src1 = dst->src[1];
+     const ggml_tensor * ids = dst->src[2];
+     if (!src0 || !src1 || !ids || ggml_backend_buffer_is_sycl_split(src0->buffer)) {
+-        return false;
++        return true;
+     }
+     const bool reordered = src0->extra && ((const ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder;
+     if (ggml_sycl_mul_mat_id_mmvq_shape_ok(src0, src1, ids, dst)) {
+-        return reordered ? ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(src0->type) :
+-                           ggml_sycl_mul_mat_vec_q_id_supports_type(src0->type);
++        return reordered ? !ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(src0->type) :
++                           !ggml_sycl_mul_mat_vec_q_id_supports_type(src0->type);
+     }
+-    return ggml_sycl_mul_mat_id_grouped_shape_ok(dst) &&
+-           ggml_sycl_grouped_dequant_gemm_device_supported(src0->type, reordered, ggml_sycl_src1_prec(dst),
++    return !ggml_sycl_mul_mat_id_grouped_shape_ok(dst) ||
++           !ggml_sycl_grouped_dequant_gemm_device_supported(src0->type, reordered, ggml_sycl_src1_prec(dst),
+                src0->ne[2], ids->ne[0], ids->ne[1], src0->ne[1], src0->ne[0], ctx->stream());
+ }
+ 
+@@ -6990,7 +6992,7 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
+         }
+ 
+         // Reorder expert weights before recording, so the reorder state that
+-        // mul_mat_id_runs_on_device() sees is the one the recorded graph runs with.
++        // ggml_sycl_mul_mat_id_needs_sync() sees is the one the recorded graph runs with.
+         if (node_op == GGML_OP_MUL_MAT_ID && mul_mat_id_reorders_src0(node)) {
+             opt_for_reorder_id(ctx, node->src[0]);
+         }
+@@ -7002,7 +7004,7 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
+                 // The ggml_sycl_mul_mat_id() fallback path does a blocking host wait on the sycl
+                 // queue after submitting a memcpy operation, but wait() can't be called on a queue
+                 // that is recording to a graph.
+-                if (!mul_mat_id_runs_on_device(ctx, node)) {
++                if (ggml_sycl_mul_mat_id_needs_sync(ctx, node)) {
+                     GGML_LOG_DEBUG("%s: disabling SYCL graphs due to host wait in %s\n", __func__,
+                                    ggml_op_name(node_op));
+                     return false;
+-- 
+2.43.0
+
+
+From c465f6775a1b7d5e5f47835cd2e2a25d09510ffc Mon Sep 17 00:00:00 2001
+From: cwriter <cwriter@localhost>
+Date: Wed, 28 Oct 2026 18:11:02 +0000
+Subject: [PATCH 6/6] fix: stop erroneously reordering host-offloaded tensors
+
+With -ncmoe, prompt processing offloads the CPU-resident expert matmuls
+to the GPU: the scheduler uploads the experts into a copy in the compute
+buffer before every run. init_tensor gave that copy a reorder record, so
+the MUL_MAT_ID gather path reordered every offloaded expert tensor on
+every ubatch, and the next upload overwrote the result.
+
+Qwen3-30B-A3B Q4_K_M, 1x B60, llama-perplexity -c 4096 -ub 2048
+-ncmoe 48, 8 chunks, on master ac8e1694:
+  master                        116 s, PPL 7.739
+  master XMX_GATHER_TYPES=0      67 s, PPL 7.738
+  with this change               67 s, PPL 7.729
+
+Refs ggml-org/llama.cpp#31262
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-sycl/ggml-sycl.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index ee3bd424..fd1dc8f0 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -812,7 +812,9 @@ ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
+         return GGML_STATUS_SUCCESS;
+     }
+ 
+-    if (g_ggml_sycl_enable_optimize) {
++    // a compute buffer copy of a host weight (e.g. -ncmoe experts offloaded for prompt processing) is
++    // refilled in the normal layout before every run, so reordering it is wasted work
++    if (g_ggml_sycl_enable_optimize && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+         // set reorder extra buffer based on supported type
+         switch (tensor->type) {
+             case GGML_TYPE_Q4_0:
+-- 
+2.43.0
+

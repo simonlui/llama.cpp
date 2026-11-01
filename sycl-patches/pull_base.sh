@@ -23,8 +23,8 @@ fi
 # The fork's file listing stays the cleanup authority for unpinned names.
 declare -A PINNED=(
     # carried: locally rebased or local-only, file exists
-    [0002-sycl-remove-dpct-capability-checks.patch]="locally regenerated with unique reverse context so apply/unapply is deterministic"
-    [0004-sycl-relax-sum-mean-contiguous.patch]="locally rebased: relaxes SUM to ggml_is_contiguous_rows and splits GROUP_NORM out to its own full-contiguous gate (its kernel isn't stride-generic, unlike NORM/L2_NORM/RMS_NORM which upstream #25044 made stride-generic - no longer touched here now that they match upstream's unconditional 'true')"
+    [0002-sycl-remove-dpct-capability-checks.patch]="locally regenerated with unique reverse context so apply/unapply is deterministic; re-anchored on dde879bc onto upstream's rewritten dequant and MMQ launchers (same call sites, checks dropped)"
+    [0004-sycl-relax-sum-mean-contiguous.patch]="locally rebased, GROUP_NORM gate only: GROUP_NORM gets its own full-contiguous gate (its kernel isn't stride-generic, unlike NORM/L2_NORM/RMS_NORM which upstream #25044 made stride-generic). The SUM relaxation was dropped on dde879bc: ggml_sycl_op_sum sums ne consecutive floats, so a row-contiguous view with gaps (upstream #28851 test_sum slice=true) would compute wrong data. File name kept so the pin still matches"
     [0007-sycl-barrier-local-space-fence.patch]="locally rebased: ggml-sycl.cpp k_copy_src1_to_contiguous hunk dropped (barrier removed upstream by PR-23142); pinned because the fork sync used to re-download the fork's full copy and clobber the rebase"
     [0008-sycl-native-sycl-shuffles.patch]="locally rebased: obsolete ROLL/ARANGE supports_op relocation dropped"
     [0014-sycl-getrows-ungate-qk-a770-epsilon.patch]="LOCAL-ONLY patch (not on the fork): re-gates Q2_K/Q4_K/Q5_K GET_ROWS unsupported on A770 after PR-23710 merged; pinned so cleanup does not delete it (the fork API never returns it)"
