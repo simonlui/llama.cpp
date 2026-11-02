@@ -17,8 +17,8 @@ extractable as idiomatic backend code and is intentionally excluded — see
 Local work on top of the stack goes in the separate `ZZ-LOCAL-*` group in this
 directory: repairs the current upstream tree needs, and gap fills for quant types
 the carried PRs leave out. They are not folded into the numbered extracted
-history and remain independently reversible. Seven are active, `ZZ-LOCAL-0003` to
-`ZZ-LOCAL-0009` (see the patch index). They apply in number order, and every candidate in
+history and remain independently reversible. Eight are active, `ZZ-LOCAL-0003` to
+`ZZ-LOCAL-0010` (see the patch index). They apply in number order, and every candidate in
 `../sycl-patches-candidates/` applies on top of them with plain `git apply`.
 
 ## Patch index
@@ -34,6 +34,7 @@ history and remain independently reversible. Seven are active, `ZZ-LOCAL-0003` t
 | ZZ-LOCAL-0007 | `ZZ-LOCAL-0007-sycl-reorder-iq4_nl.patch` | IQ4_NL in the reorder (SoA) layout, dense and per MoE expert. The layout is Q4_0's `[qs][d]` (the blocks are identical), read by a codebook variant of Q4_0's reorder vec_dot for 1..8 columns and by the MoE reorder MMVQ. Dequantize and GET_ROWS (tied embeddings) read the layout too, and the fused / grouped XMX dequant GEMM gets a SoA stage, so a reordered weight keeps that GEMM for prompt batches. Candidate C20's ESIMD MoE GEMM already reads this layout. | perf (gap fill) |
 | ZZ-LOCAL-0008 | `ZZ-LOCAL-0008-sycl-moe-reorder-iq3.patch` | Reorders IQ3_XXS and IQ3_S MoE experts per slice (the existing 2D IQ3 layout) for the MoE reorder MMVQ, and adds SoA stages for both types to the fused / grouped XMX dequant GEMM; the block and SoA stages share one decode. MoE prompt batches therefore keep the grouped GEMM after the reorder. The same stages let dense IQ3 weights keep the fused GEMM once the existing 2D reorder is installed; before, those fell back to dequantize plus oneDNN. Candidates C20 / C21 read the same layout. | perf (gap fill) |
 | ZZ-LOCAL-0009 | `ZZ-LOCAL-0009-sycl-getrows-q2_0.patch` | Q2_0 in GET_ROWS, through the generic `get_rows_sycl` and the existing `dequantize_q2_0`. Q2_0 had a dequantizer and MMVQ but fell back to the CPU for row lookups. | feature (gap fill) |
+| ZZ-LOCAL-0010 | `ZZ-LOCAL-0010-sycl-dg2-register-spills.patch` | Stops register spills on Arc A-series (Xe-HPG) in kernels the A770 runs. The XMX dequant GEMM (prompt batches of the i-quants, and of every MoE type it covers) spilled 1.9-3.5 KB per thread in all 72 DG2 kernels; at sub-group 8 a sub-group now owns 8 rows instead of 16 (still 32 columns) and the two k halves of a step are not unrolled, and none spills. The reorder gate + up MMVQ no longer pairs rows on the A-series, where every paired variant spilled 0.5-3.6 KB (q4_K at 2..4 columns; also iq4_xs with C10, q4_K at 5..8 with C30, q5_K). | perf (DG2) |
 
 The former `ZZ-LOCAL-0001` made direct SYCL `CONV_2D` index input, kernel, and
 output by their real strides. It was retired on 2026-11-01 as superseded by
@@ -119,6 +120,11 @@ is gone, so runtime behavior/perf differs from the research tree.
   `tools/cpu-device-test/reorder-reuse.cpp`. The new ternary and FP8 conversions and the SoA GEMM stages
   were also checked bit for bit on the host. The six touched files build for `acm-g10` (AOT); the new MMVQ, dequantize, GET_ROWS, DMMV and CPY kernels do not spill. Not verified: speed on the A770 and the
   XMX / ESIMD paths. Details in `SYCL_DEV_LOG.md` ("Quant-type gap fill, part 2").
+- **`ZZ-LOCAL-0010` (2026-11-02):** `acm-g10` AOT builds of `fused-gemm.cpp` and `mmvq.cpp`, with and
+  without the candidates: no XMX dequant GEMM kernel and no gate + up kernel the A-series takes spills
+  any more (before: all 72 GEMM kernels, and q4_K's gate + up at 2..4 columns). Tested on the CPU OpenCL device with the one-row gate + up
+  forced on (`MUL_MAT_VEC_FUSION` q4_K 140/140) and off (140/140); the GEMM tiles cannot run there.
+  Speed not measured.
 - The scripts snapshot pre-existing untracked paths in the worktree's Git
   administrative directory. Files introduced by an apply are removed on
   unapply, while paths present before apply are protected. The state file is

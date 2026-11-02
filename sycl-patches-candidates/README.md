@@ -105,6 +105,14 @@ the A770 compiles at JIT time) and its DG2 assembly read from IGC dumps:
   kernel, so measure with a JIT build.
 - C10/C30 `mmvq.cpp`: builds. Upstream's Xe2-only XMX MMVQ kernels in the same
   file also compile for DG2, as 8-wide DPAS with spills; they stay gated off.
+- Since local patch `ZZ-LOCAL-0010` (2026-11-02), the stack's own `joint_matrix` grouped
+  GEMM no longer spills on DG2 at 128 GRF (8 rows a sub-group, k halves not unrolled), so
+  `GGML_SYCL_MMID_ESIMD=0` now compares C21 against a spill-free kernel at full occupancy
+  rather than the spilling one C21 was written to replace. The same patch stops the gate + up
+  MMVQ pairing rows on DG2, where every paired variant spills: that covers C10's iq4_xs pairing
+  (3..4 columns, 0.7-1 KB) and C30's 5..8-column q4_K pairing under C90 bit 16 (2.3-3.6 KB),
+  and C90 bit 4 now gives q5_K weight reuse without the paired gate + up (1.1-3.5 KB). C30's
+  plain-MMVQ pairing does not spill on DG2 and is unaffected.
 - C40 `fattn-gqa-dec.cpp`: the original failed. The q8_0 D=256 SLM ESIMD kernel's
   in-kernel `mask` null test made IGC 2.43 emit a 64-bit shift that DG2 cannot
   execute, and that failed every ESIMD kernel in the file. C40 now tests `mask`

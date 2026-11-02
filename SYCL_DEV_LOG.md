@@ -153,6 +153,56 @@ oneAPI came from conda-forge into `/opt/oneapi` on a GPU-less cloud box:
   floating point exception, likely from GPU-only device properties. The only
   numeric test of SYCL kernels here is C60's standalone emulation above.
 
+## DG2 register spills (2026-11-02, `ZZ-LOCAL-0010`)
+
+The part-2 AOT check below found spills on `acm-g10` in kernels the A770 runs. Every number here is
+from `acm-g10` AOT builds (oneAPI 2026.2's IGC, `-ze-opt-enable-auto-large-GRF-mode` as in the CMake
+AOT path) with IGC shader dumps, `//.spill size` per kernel.
+
+- **XMX dequant GEMM** (fused for dense i-quant prompt batches, grouped for MoE): all 72 kernels
+  spilled, 1.9 to 3.5 KB per thread, the block and SoA layouts alike (191 KB in total). The sub-group-8
+  tile (8x8x16, the only DG2 shape) gave a sub-group 16 rows x 32 columns: 8 accumulator tiles (64
+  registers), 4 B tiles (32), the A tile (8), then addressing and the A-stage decode, against 128
+  registers. Tried, each over all 72 kernels:
+
+  | Change at sub-group 8 | Total spill | Kernels spilling |
+  |---|---|---|
+  | none | 191 KB | 72 |
+  | 8 rows | 68 KB | 72 |
+  | 8 rows, one B tile live at a time | 126 KB | 72 |
+  | 16 rows, k halves not unrolled | 121 KB | 72 |
+  | 16 rows x 16 columns | 29 KB | 29 |
+  | 8 rows x 16 columns | 0 | 0 |
+  | **8 rows, k halves not unrolled** | **0** | **0** |
+
+  The last row is `ZZ-LOCAL-0010`: it keeps 32 columns, which the device-side MoE schedule requires
+  (`GGML_SYCL_FG_BN`, checked by `bn_ok`), so each dequantized weight row still serves 32 columns. The
+  cost is B reuse: a B tile now feeds 8 rows, not 16. 16 columns would also be spill-free but
+  dequantizes twice as often and is refused by the device-side schedule.
+- **DG2 has a 256-register mode.** Forcing it (`-ze-opt-large-register-file`) builds the old 16 x 32
+  tile with no spill, at half the threads per EU. The auto mode the build relies on never chose it on
+  `acm-g10` here, for these kernels or for C20/C21's ESIMD ones (which request 256 through `grf_size`;
+  AOT ignores that on ESIMD, JIT honours it, see the candidates README). The fix fits 128 registers so
+  it does not depend on that heuristic.
+- **Gate + up MMVQ (reorder, fused GLU):** row pairing doubles the registers and, at sub-group 16, a
+  value is two 32-byte registers on DG2 against one 64-byte register on Xe2. Every paired gate + up
+  kernel spills on DG2: q4_K at 2..4 columns 0.5 to 1.9 KB (stack default), q4_K at 5..8 2.3 to 3.6 KB
+  (C30 with C90 bit 16), q5_K at 3..5 1.1 to 3.5 KB (C90 bit 4), iq4_xs at 3..4 0.7 to 1 KB (C10). The
+  A-series now never pairs rows in that kernel; all one-row variants are spill-free except q4_K at 8
+  columns (64 B, as before). The plain MMVQ's pairing, one weight matrix, does not spill on DG2 (q4_K
+  2..8 columns, C30 included) and is unchanged.
+- **Left:** three decode kernels spill one or two registers (q3_K reorder one column 32 B, a single
+  reload per block-loop iteration; q6_K six columns 64 B; iq3_s reorder eight columns 32 B). The XMX
+  MMVQ kernels spill up to 12.8 KB on DG2 but are gated to Xe2 and never run there.
+- **Tests:** on the CPU OpenCL device `MUL_MAT_VEC_FUSION` q4_K passes 140/140 with the one-row path
+  forced on all widths (a scratch env override, not in the patch) and 140/140 with the default
+  pairing; `MUL_MAT` q4_K with the reorder 113/113; `MUL_MAT_VEC_FUSION` f8_e4m3 224/224 (`ZZ-LOCAL-0006`
+  coverage that part 2 had not run). The GEMM change cannot run on this device (no fp16 `joint_matrix`
+  shapes); it only changes two tile constants and an unroll count in a kernel templated on them.
+- **Not measured:** speed. On the A770 compare prompt processing of a dense IQ model and of a MoE
+  model before and after `ZZ-LOCAL-0010` (and against `GGML_SYCL_XMX_GATHER_TYPES=0`, the dequantize +
+  oneDNN route).
+
 ## Quant-type gap fill, part 2 (2026-11-02)
 
 Closes the gaps the first pass left open, again as local patches (`ZZ-LOCAL-0005` to `ZZ-LOCAL-0009`).
@@ -205,8 +255,7 @@ Closes the gaps the first pass left open, again as local patches (`ZZ-LOCAL-0005
   GET_ROWS, DMMV and CPY kernels. The fused XMX dequant GEMM spills on DG2 in every variant, the existing
   block-layout ones included (2.3 to 3.3 KB). The new SoA variants spill 64 B (IQ4_NL), 160 B (IQ3_XXS)
   and 512 B (IQ3_S) more than the block variant of the same type, as the existing Q4_K SoA variant does
-  (+256 B). Whether a spilling fused GEMM beats dequantize plus oneDNN for reordered IQ3 / IQ4_NL
-  prompt batches on the A770 is unmeasured.
+  (+256 B). `ZZ-LOCAL-0010` (section above) removes the spills from all of them.
 - **Apply.** The stack, the seven local patches, every candidate (plain `git apply`, no three-way) and
   the Vulkan stack apply and unapply back to a clean tree; `hooks.patch` still applies.
 - **Not verified:** speed on the A770, and the XMX / ESIMD paths, which need the GPU.
