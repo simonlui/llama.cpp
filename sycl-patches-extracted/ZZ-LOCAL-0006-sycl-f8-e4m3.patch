@@ -1,0 +1,345 @@
+Subject: [PATCH] sycl: F8_E4M3 weights (DMMV, GEMM, MUL_MAT_ID, GET_ROWS, CPY)
+
+Local gap fill. F8_E4M3 (OCP FP8, GGML_TYPE_F8_E4M3) had no SYCL support, so FP8 checkpoints ran
+their matmuls on the CPU; no other GPU backend in tree has it either (Metal only copies it).
+
+- One-token MUL_MAT: DMMV, the qk=1 kernel the F16 / BF16 weights use.
+- Batches: the f16 GEMM route. Every E4M3 value is exact in f16, so widening loses nothing.
+- MUL_MAT_ID: the per-expert loop, which takes the two paths above per expert.
+- GET_ROWS, and CPY / DUP to and from F32, F16 and BF16 (and F8 to F8).
+- The conversions are bit-exact with ggml_f8_e4m3_to_fp32 / ggml_fp32_to_f8_e4m3: saturation to
+  +-448, NaN as 0x7F, round to nearest even, subnormals. The special cases test bits: icpx compiles
+  ggml-sycl with its default -fp-model=fast, which may fold isnan / isinf away.
+
+diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
+index 2de3061f..15f71809 100644
+--- a/ggml/src/ggml-sycl/common.hpp
++++ b/ggml/src/ggml-sycl/common.hpp
+@@ -16,6 +16,7 @@
+ #include <cstddef>
+ #include <fstream>
+ #include <iostream>
++#include <limits>
+ #include <optional>
+ #include <string>
+ #include <type_traits>
+@@ -295,6 +296,67 @@ static inline bool ggml_sycl_supports_type(ggml_type type) {
+     }
+ }
+ 
++// OCP FP8 E4M3 (GGML_TYPE_F8_E4M3), bit-exact with ggml_f8_e4m3_to_fp32 / ggml_fp32_to_f8_e4m3 on the CPU:
++// no infinities, 0x7F and 0xFF are NaN, and conversion to FP8 saturates at +-448 and rounds to nearest even
++static __dpct_inline__ float ggml_sycl_f8_e4m3_to_f32(const uint8_t x) {
++    const uint32_t ax = x & 0x7F;
++    if (ax == 0x7F) {
++        return std::numeric_limits<float>::quiet_NaN();
++    }
++    const uint32_t e = ax >> 3;
++    const uint32_t m = ax & 7;
++    // subnormal M * 2^-9; normal (1 + M/8) * 2^(E-7), rebiased to float's exponent
++    const float    v = e == 0 ? (float) m * (1.0f / 512.0f) : sycl::bit_cast<float>(((e + 120u) << 23) | (m << 20));
++    return x & 0x80 ? -v : v;
++}
++
++static __dpct_inline__ uint8_t ggml_sycl_f32_to_f8_e4m3(const float xf) {
++    // the special cases test bits: icpx's default -fp-model=fast may fold isnan / isinf away
++    const uint32_t bits = sycl::bit_cast<uint32_t>(xf);
++    const uint8_t  sign = bits >> 31 ? 0x80 : 0;
++    const uint32_t ab   = bits & 0x7FFFFFFFu;
++    if (ab > 0x7F800000u) {  // NaN
++        return 0x7F;
++    }
++    if (ab == 0) {
++        return sign;
++    }
++    if (ab >= 0x43E00000u) {  // >= 448, infinity included: saturate
++        return sign | 0x7E;
++    }
++    if (ab < 0x3C800000u) {  // < 2^-6
++        // subnormal: M = round_to_nearest_even(x * 512); 8 becomes the smallest normal, 0x08
++        const float v = sycl::bit_cast<float>(ab) * 512.0f;
++        const float f = sycl::floor(v);
++        const float r = v - f;
++        const int   q = (int) f + ((r > 0.5f || (r == 0.5f && ((int) f & 1))) ? 1 : 0);
++        return sign | (uint8_t) q;
++    }
++    // normal: E = float exponent - 120, M = the top 3 mantissa bits rounded to nearest even
++    int            e   = (int) (ab >> 23) - 120;
++    const uint32_t man = ab & 0x7FFFFFu;
++    int            q   = (int) (man >> 20);
++    const uint32_t rem = man & 0xFFFFFu;
++    if (rem > 0x80000u || (rem == 0x80000u && (q & 1))) {
++        ++q;
++    }
++    if (q == 8) {
++        q = 0;
++        ++e;
++    }
++    if (e > 15 || (e == 15 && q > 6)) {
++        return sign | 0x7E;
++    }
++    return sign | (uint8_t) (e << 3) | (uint8_t) q;
++}
++
++// element type for the generic float converters and get_rows
++struct ggml_sycl_f8_e4m3 {
++    uint8_t bits;
++
++    operator float() const { return ggml_sycl_f8_e4m3_to_f32(bits); }
++};
++
+ // the ternary types only have weight kernels (dequantize, get_rows, mul_mat), no set_rows or cpy
+ static inline bool ggml_sycl_is_ternary_type(ggml_type type) {
+     return type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_PTQ1_0;
+diff --git a/ggml/src/ggml-sycl/convert.cpp b/ggml/src/ggml-sycl/convert.cpp
+index f0feb6d8..e38a175b 100644
+--- a/ggml/src/ggml-sycl/convert.cpp
++++ b/ggml/src/ggml-sycl/convert.cpp
+@@ -691,6 +691,8 @@ static to_t_sycl_t<dst_t> ggml_get_dequant_sycl(ggml_type type, ggml_tensor * ds
+                 return convert_unary_sycl<float>;
+             }
+             break;
++        case GGML_TYPE_F8_E4M3:
++            return convert_unary_sycl<ggml_sycl_f8_e4m3>;
+         case GGML_TYPE_F16:
+             if constexpr (std::is_same_v<dst_t, float>) {
+                 return convert_unary_sycl<sycl::half>;
+@@ -738,6 +740,8 @@ to_fp16_nc_sycl_t ggml_get_to_fp16_nc_sycl(ggml_type type) {
+         case GGML_TYPE_BF16:
+             return convert_unary_nc_sycl<sycl::ext::oneapi::bfloat16>;
+ #endif
++        case GGML_TYPE_F8_E4M3:
++            return convert_unary_nc_sycl<ggml_sycl_f8_e4m3>;
+         case GGML_TYPE_Q1_0:
+             return dequantize_block_nc_sycl<QK1_0, QR1_0, dequantize_q1_0>;
+         case GGML_TYPE_Q4_0:
+diff --git a/ggml/src/ggml-sycl/cpy.cpp b/ggml/src/ggml-sycl/cpy.cpp
+index b1118733..17f79170 100644
+--- a/ggml/src/ggml-sycl/cpy.cpp
++++ b/ggml/src/ggml-sycl/cpy.cpp
+@@ -101,6 +101,19 @@ static void cpy_1_bf16_f16(const char * cxi, char * cdsti) {
+ }
+ #endif
+ 
++// F8_E4M3 <-> F32 / F16 / BF16, through float
++template <typename src_t> static void cpy_1_to_f8_e4m3(const char * cxi, char * cdsti) {
++    *(uint8_t *) cdsti = ggml_sycl_f32_to_f8_e4m3(static_cast<float>(*(const src_t *) cxi));
++}
++
++template <typename dst_t> static void cpy_1_from_f8_e4m3(const char * cxi, char * cdsti) {
++    *(dst_t *) cdsti = static_cast<dst_t>(ggml_sycl_f8_e4m3_to_f32(*(const uint8_t *) cxi));
++}
++
++static void cpy_1_f8_e4m3_f8_e4m3(const char * cxi, char * cdsti) {
++    *cdsti = *cxi;
++}
++
+ template <cpy_kernel_t cpy_1>
+ static void cpy_f32_f16(const char * cx, char * cdst, const int ne, const int ne00, const int ne01, const int ne02,
+                         const int nb00, const int nb01, const int nb02, const int nb03, const int ne10, const int ne11,
+@@ -1203,6 +1216,53 @@ static void ggml_cpy_bf16_f16_sycl(const char * cx, char * cdst, const int ne, c
+ }
+ #endif
+ 
++template <cpy_kernel_t cpy_1>
++static void ggml_cpy_elementwise_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
++                                      const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
++                                      const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
++                                      const int nb12, const int nb13, queue_ptr stream) {
++    const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
++    stream->parallel_for(
++        sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
++                          sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
++        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++            cpy_f32_f16<cpy_1>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11,
++                               nb12, nb13, item_ct1);
++        });
++}
++
++// F8_E4M3 copies: to it from F32 / F16 / BF16 / itself, from it to F32 / F16 / BF16
++static bool ggml_sycl_cpy_f8_e4m3(const ggml_tensor * src0, const ggml_tensor * src1, const char * cx, char * cdst,
++                                  const int ne, queue_ptr stream) {
++    GGML_TENSOR_BINARY_OP_LOCALS01;
++#define GGML_SYCL_CPY_F8(kernel)                                                                                   \
++    ggml_cpy_elementwise_sycl<kernel>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, \
++                                      nb10, nb11, nb12, nb13, stream);                                            \
++    return true
++    if (src1->type == GGML_TYPE_F8_E4M3) {
++        switch (src0->type) {
++            case GGML_TYPE_F8_E4M3: GGML_SYCL_CPY_F8(cpy_1_f8_e4m3_f8_e4m3);
++            case GGML_TYPE_F32:     GGML_SYCL_CPY_F8(cpy_1_to_f8_e4m3<float>);
++            case GGML_TYPE_F16:     GGML_SYCL_CPY_F8(cpy_1_to_f8_e4m3<sycl::half>);
++#ifdef GGML_SYCL_HAS_BF16
++            case GGML_TYPE_BF16:    GGML_SYCL_CPY_F8(cpy_1_to_f8_e4m3<sycl::ext::oneapi::bfloat16>);
++#endif
++            default:                break;
++        }
++    } else if (src0->type == GGML_TYPE_F8_E4M3) {
++        switch (src1->type) {
++            case GGML_TYPE_F32:     GGML_SYCL_CPY_F8(cpy_1_from_f8_e4m3<float>);
++            case GGML_TYPE_F16:     GGML_SYCL_CPY_F8(cpy_1_from_f8_e4m3<sycl::half>);
++#ifdef GGML_SYCL_HAS_BF16
++            case GGML_TYPE_BF16:    GGML_SYCL_CPY_F8(cpy_1_from_f8_e4m3<sycl::ext::oneapi::bfloat16>);
++#endif
++            default:                break;
++        }
++    }
++#undef GGML_SYCL_CPY_F8
++    return false;
++}
++
+ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1) try {
+     // Unlike other operators ggml_sycl_cpy takes 2 distinct tensors instead of a dst ggml_tensor and rely on its src field
+     GGML_SYCL_DEBUG("ggml_sycl_cpy: src0->type=%s, src1->type=%s\n",
+@@ -1374,6 +1434,9 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, co
+         ggml_cpy_bf16_f16_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10,
+                               nb11, nb12, nb13, main_stream);
+ #endif
++    } else if ((src0->type == GGML_TYPE_F8_E4M3 || src1->type == GGML_TYPE_F8_E4M3) &&
++               ggml_sycl_cpy_f8_e4m3(src0, src1, src0_ddc, src1_ddc, ne, main_stream)) {
++        // done
+     } else {
+         GGML_LOG_ERROR("%s: unsupported type combination (%s to %s)\n", __func__, ggml_type_name(src0->type),
+                        ggml_type_name(src1->type));
+diff --git a/ggml/src/ggml-sycl/dmmv.cpp b/ggml/src/ggml-sycl/dmmv.cpp
+index 78ad855b..7d11095b 100644
+--- a/ggml/src/ggml-sycl/dmmv.cpp
++++ b/ggml/src/ggml-sycl/dmmv.cpp
+@@ -30,6 +30,14 @@ static void convert_bf16(const void * vx, const int64_t ib, const int iqs, dfloa
+ }
+ #endif
+ 
++static void convert_f8_e4m3(const void * vx, const int64_t ib, const int iqs, dfloat2 & v){
++    const uint8_t * x = (const uint8_t *) vx;
++
++    // every E4M3 value is exact in half and float
++    v.x() = ggml_sycl_f8_e4m3_to_f32(x[ib + iqs + 0]);
++    v.y() = ggml_sycl_f8_e4m3_to_f32(x[ib + iqs + 1]);
++}
++
+ static void convert_f32(const void * vx, const int64_t ib, const int iqs, dfloat2 & v){
+     const float * x = (const float *) vx;
+ 
+@@ -259,6 +267,19 @@ static void convert_mul_mat_vec_bf16_sycl(const void *vx, const dfloat *y,
+ }
+ #endif
+ 
++static void convert_mul_mat_vec_f8_e4m3_sycl(const void * vx, const dfloat * y, float * dst, const int ncols,
++                                             const int nrows, dpct::queue_ptr stream) {
++    // the qk=1 kernel iterates with stride 2*GGML_SYCL_DMMV_X
++    GGML_ASSERT(ncols % (2*GGML_SYCL_DMMV_X) == 0);
++    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
++    const sycl::range<3> block_nums(1, 1, block_num_y);
++    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
++    stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
++                         [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                             dequantize_mul_mat_vec<1, 1, convert_f8_e4m3>(vx, y, dst, ncols, nrows, item_ct1);
++                         });
++}
++
+ static void dequantize_mul_mat_vec_q2_k(const void *__restrict__ vx,
+                                         const float *__restrict__ yy,
+                                         float *__restrict__ dst,
+@@ -1947,7 +1968,7 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
+         src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1 ||
+         src0->type == GGML_TYPE_Q5_0 || src0->type == GGML_TYPE_Q5_1 ||
+         (src0->type == GGML_TYPE_Q8_0 && !q8_0_esimd) || src0->type == GGML_TYPE_F16 ||
+-        src0->type == GGML_TYPE_BF16;
++        src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F8_E4M3;
+ 
+     if (src1_convert_f16) {
+         scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
+@@ -2085,6 +2106,9 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
+         case GGML_TYPE_F16:
+             convert_mul_mat_vec_f16_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
+             break;
++        case GGML_TYPE_F8_E4M3:
++            convert_mul_mat_vec_f8_e4m3_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
++            break;
+ #ifdef GGML_SYCL_DMMV_HAS_BF16
+         case GGML_TYPE_BF16:
+             convert_mul_mat_vec_bf16_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
+diff --git a/ggml/src/ggml-sycl/getrows.cpp b/ggml/src/ggml-sycl/getrows.cpp
+index a1601b40..5216110e 100644
+--- a/ggml/src/ggml-sycl/getrows.cpp
++++ b/ggml/src/ggml-sycl/getrows.cpp
+@@ -526,6 +526,10 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+             get_rows_sycl_float(ctx, dst->src[0], dst->src[1], dst, (const int32_t *)dst->src[0]->data,
+             src1_i32, (int32_t *)dst->data, ctx.stream());
+             break;
++        case GGML_TYPE_F8_E4M3:
++            get_rows_sycl_float(ctx, dst->src[0], dst->src[1], dst, (const ggml_sycl_f8_e4m3 *) dst->src[0]->data,
++                                src1_i32, (float *) dst->data, ctx.stream());
++            break;
+         case GGML_TYPE_Q1_0:
+             get_rows_sycl<QK1_0, 1, dequantize_q1_0>(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,
+             src1_i32, (float *)dst->data, ctx.stream());
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index de4a2482..9cc600b4 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -3337,7 +3337,9 @@ inline void ggml_sycl_op_mul_mat_sycl(
+ 
+     // the f16 route converts src1 to f16 [TAG_GGML_PREC]
+     use_fp16 = use_fp16 && ggml_sycl_src1_f16_ok(dst);
+-    if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && use_fp16 && ggml_is_contiguous(src0) &&
++    // F8_E4M3 widens to f16 exactly
++    if ((src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_F8_E4M3 || ggml_is_quantized(src0->type)) &&
++        use_fp16 && ggml_is_contiguous(src0) &&
+         row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
+         ggml_sycl_pool_alloc<sycl::half> src1_as_f16(ctx.pool());
+         if (src1->type != GGML_TYPE_F16) {
+@@ -4493,6 +4495,7 @@ static bool ggml_sycl_supports_dmmv(enum ggml_type type) {
+         case GGML_TYPE_Q6_K:
+         case GGML_TYPE_F16:
+         case GGML_TYPE_BF16:
++        case GGML_TYPE_F8_E4M3:
+             return true;
+         default:
+             return false;
+@@ -5234,7 +5237,8 @@ static bool can_use_dequantize_mul_mat_vec(const ggml_tensor * src0, const ggml_
+     // The F16/BF16 qk=1 kernel iterates with stride 2*DMMV_X, requiring ne[0] to be
+     // a multiple of 2*DMMV_X. Quantized types use block-structured kernels that only
+     // need ne[0] % DMMV_X == 0.
+-    const int64_t dmmv_x_required = (src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16) ?
++    const int64_t dmmv_x_required = (src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16 ||
++                                     src0->type == GGML_TYPE_F8_E4M3) ?
+                                     2*GGML_SYCL_DMMV_X : GGML_SYCL_DMMV_X;
+     return ggml_sycl_supports_dmmv(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            src0->ne[0] % dmmv_x_required == 0 && src1->ne[1] == 1;
+@@ -7578,7 +7582,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
+                 }
+ 
+                 // the fallback path dequantizes src0, so it needs a type the SYCL converters implement
+-                if (!ggml_sycl_supports_type(src0_type) && !ggml_sycl_is_ternary_type(src0_type)) {
++                if (!ggml_sycl_supports_type(src0_type) && !ggml_sycl_is_ternary_type(src0_type) &&
++                    src0_type != GGML_TYPE_F8_E4M3) {
+                     return false;
+                 }
+ 
+@@ -7597,6 +7602,7 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
+                     case GGML_TYPE_F16:
+                     case GGML_TYPE_BF16:
+                     case GGML_TYPE_F32:
++                    case GGML_TYPE_F8_E4M3:
+                     case GGML_TYPE_Q1_0:
+                     case GGML_TYPE_MXFP4:
+                     case GGML_TYPE_NVFP4:
+@@ -7680,7 +7686,16 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
+                 const bool is_memcpy = src0_type == src1_type && ggml_is_contiguous(op->src[0]) &&
+                                        ggml_is_contiguous(op->src[1]);
+                 if (!is_memcpy && (!cpy_type_ok(src0_type) || !cpy_type_ok(src1_type))) {
+-                    return false;
++                    // F8_E4M3 converts to and from the float types (and copies to itself)
++                    const auto f8_peer_ok = [](ggml_type t) {
++                        return t == GGML_TYPE_F8_E4M3 || t == GGML_TYPE_F32 || t == GGML_TYPE_F16
++#ifdef GGML_SYCL_HAS_BF16
++                               || t == GGML_TYPE_BF16
++#endif
++                            ;
++                    };
++                    return (src0_type == GGML_TYPE_F8_E4M3 || src1_type == GGML_TYPE_F8_E4M3) &&
++                           f8_peer_ok(src0_type) && f8_peer_ok(src1_type);
+                 }
+                 // I16/I32 cross-type conversions only exist for F32<->I32; the rest have no kernels
+                 const bool involves_i16_i32 = (src0_type == GGML_TYPE_I16 || src0_type == GGML_TYPE_I32) ||

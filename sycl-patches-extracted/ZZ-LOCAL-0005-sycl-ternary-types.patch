@@ -1,0 +1,419 @@
+Subject: [PATCH] sycl: kernels for the ternary weight types TQ1_0, TQ2_0 and PTQ1_0
+
+Local gap fill. The SYCL backend had no kernel for TQ1_0 / TQ2_0 (fork patch 0017 gates them out of
+supports_op) or PTQ1_0 (carried PR 29672 adds the type, PR 31460's whitelist leaves it out), so
+ternary models ran their matmuls on the CPU. CUDA PR 29676 has PTQ1_0 only; TQ1_0 and TQ2_0 have no
+GPU port in tree, so all three follow the CPU codec.
+
+- Dequantize (f16, f32, non-contiguous f16) and GET_ROWS through per-weight pair functions:
+  dequantize_block_sycl / get_rows_sycl with qr = 1. Prompt batches then use the GEMM route.
+- MMVQ, 1..8 columns, and the fused MoE MMVQ: one call covers the 32 weights of one q8_1 block,
+  expanded to signed bytes for dp4a. Base-3 digit n of a packed byte is read as the CPU does
+  (multiply by 3^n mod 256, then (q * 3) >> 8), four bytes at a time in 16-bit lanes. TQ1_0's
+  dot selects its source bytes and digit per step instead of branching per q8_1 block: the branchy
+  form passed one column and miscompiled in the multi-column kernel on the CPU OpenCL device.
+- 0017's central gate admits these types only as the weight operand of MUL_MAT, MUL_MAT_ID and
+  GET_ROWS. SET_ROWS, CPY, DUP / CONT and the other ops still fall back to the CPU; DUP and CONT
+  check no types at all, and PTQ1_0 is now caught by the same gate.
+
+diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
+index dd599e5a..2de3061f 100644
+--- a/ggml/src/ggml-sycl/common.hpp
++++ b/ggml/src/ggml-sycl/common.hpp
+@@ -295,6 +295,11 @@ static inline bool ggml_sycl_supports_type(ggml_type type) {
+     }
+ }
+ 
++// the ternary types only have weight kernels (dequantize, get_rows, mul_mat), no set_rows or cpy
++static inline bool ggml_sycl_is_ternary_type(ggml_type type) {
++    return type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_PTQ1_0;
++}
++
+ static inline bool ggml_sycl_xmx_supports_type(ggml_type type) {
+     switch (type) {
+         case GGML_TYPE_Q2_K:
+diff --git a/ggml/src/ggml-sycl/convert.cpp b/ggml/src/ggml-sycl/convert.cpp
+index 2daa49cb..f0feb6d8 100644
+--- a/ggml/src/ggml-sycl/convert.cpp
++++ b/ggml/src/ggml-sycl/convert.cpp
+@@ -593,6 +593,12 @@ static to_t_sycl_t<dst_t> ggml_get_dequant_sycl(ggml_type type, ggml_tensor * ds
+             return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0, dst_t>;
+         case GGML_TYPE_Q2_0:
+             return dequantize_block_sycl<QK2_0, QR2_0, dequantize_q2_0, dst_t>;
++        case GGML_TYPE_TQ1_0:
++            return dequantize_block_sycl<QK_K, 1, dequantize_tq1_0, dst_t>;
++        case GGML_TYPE_TQ2_0:
++            return dequantize_block_sycl<QK_K, 1, dequantize_tq2_0, dst_t>;
++        case GGML_TYPE_PTQ1_0:
++            return dequantize_block_sycl<QK_PTQ1_0, 1, dequantize_ptq1_0, dst_t>;
+         case GGML_TYPE_Q4_0:
+             if (is_reordered_src0(dst)) {
+                 return dequantize_row_q4_0_sycl_reorder;
+@@ -744,6 +750,12 @@ to_fp16_nc_sycl_t ggml_get_to_fp16_nc_sycl(ggml_type type) {
+             return dequantize_block_nc_sycl<QK5_1, QR5_1, dequantize_q5_1>;
+         case GGML_TYPE_Q8_0:
+             return dequantize_block_nc_sycl<QK8_0, QR8_0, dequantize_q8_0>;
++        case GGML_TYPE_TQ1_0:
++            return dequantize_block_nc_sycl<QK_K, 1, dequantize_tq1_0>;
++        case GGML_TYPE_TQ2_0:
++            return dequantize_block_nc_sycl<QK_K, 1, dequantize_tq2_0>;
++        case GGML_TYPE_PTQ1_0:
++            return dequantize_block_nc_sycl<QK_PTQ1_0, 1, dequantize_ptq1_0>;
+         default:
+             return nullptr;
+     }
+diff --git a/ggml/src/ggml-sycl/dequantize.hpp b/ggml/src/ggml-sycl/dequantize.hpp
+index eb94771d..f33e9bf2 100644
+--- a/ggml/src/ggml-sycl/dequantize.hpp
++++ b/ggml/src/ggml-sycl/dequantize.hpp
+@@ -47,6 +47,66 @@ static __dpct_inline__ void dequantize_q2_0(const void *vx, const int64_t ib,
+ #endif // GGML_SYCL_F16
+ }
+ 
++// Ternary types: iqs is the weight index within the block (qr == 1). Digit n of a packed byte is
++// read as in the CPU codec: multiply by 3^n mod 256, then (q * 3) >> 8.
++static __dpct_inline__ int ternary_digit(const uint8_t b, const int n) {
++    const uint32_t p = n == 0 ? 1 : n == 1 ? 3 : n == 2 ? 9 : n == 3 ? 27 : 81;
++    return (int) ((((b * p) & 0xFFu) * 3) >> 8);
++}
++
++static __dpct_inline__ void dequantize_tq1_0(const void * vx, const int64_t ib, const int iqs, dfloat2 & v) {
++    const block_tq1_0 * x = (const block_tq1_0 *) vx + ib;
++
++    // weights 0..159: digit w/32 of qs[w%32]; 160..239: digit (w-160)/16 of qs[32 + (w-160)%16];
++    // 240..255: digit (w-240)/4 of qh[(w-240)%4]
++    auto one = [x](const int w) -> float {
++        if (w < 160) {
++            return (float) (ternary_digit(x->qs[w % 32], w / 32) - 1);
++        }
++        if (w < 240) {
++            return (float) (ternary_digit(x->qs[32 + (w - 160) % 16], (w - 160) / 16) - 1);
++        }
++        return (float) (ternary_digit(x->qh[(w - 240) % 4], (w - 240) / 4) - 1);
++    };
++
++    const float d = x->d;
++    v.x()         = one(iqs + 0) * d;
++    v.y()         = one(iqs + 1) * d;
++}
++
++static __dpct_inline__ void dequantize_tq2_0(const void * vx, const int64_t ib, const int iqs, dfloat2 & v) {
++    const block_tq2_0 * x = (const block_tq2_0 *) vx + ib;
++
++    // weight w: bits 2*((w%128)/32) of qs[32*(w/128) + w%32]
++    auto one = [x](const int w) -> float {
++        return (float) (((x->qs[32 * (w / 128) + w % 32] >> (2 * ((w % 128) / 32))) & 3) - 1);
++    };
++
++    const float d = x->d;
++    v.x()         = one(iqs + 0) * d;
++    v.y()         = one(iqs + 1) * d;
++}
++
++static __dpct_inline__ void dequantize_ptq1_0(const void * vx, const int64_t ib, const int iqs, dfloat2 & v) {
++    const block_ptq1_0 * x = (const block_ptq1_0 *) vx + ib;
++
++    // weights 0..79: digit w/16 of qs[w%16]; 80..119: digit (w-80)/8 of qs[16 + (w-80)%8];
++    // 120..127: digit (w-120)/2 of qh[(w-120)%2]
++    auto one = [x](const int w) -> float {
++        if (w < 80) {
++            return (float) (ternary_digit(x->qs[w % 16], w / 16) - 1);
++        }
++        if (w < 120) {
++            return (float) (ternary_digit(x->qs[16 + (w - 80) % 8], (w - 80) / 8) - 1);
++        }
++        return (float) (ternary_digit(x->qh[(w - 120) % 2], (w - 120) / 2) - 1);
++    };
++
++    const float d = x->d;
++    v.x()         = one(iqs + 0) * d;
++    v.y()         = one(iqs + 1) * d;
++}
++
+ static __dpct_inline__ void dequantize_q4_0(const void *vx, const int64_t ib,
+                                             const int iqs, dfloat2 &v) {
+     const block_q4_0 * x = (const block_q4_0 *) vx;
+diff --git a/ggml/src/ggml-sycl/getrows.cpp b/ggml/src/ggml-sycl/getrows.cpp
+index 60903216..a1601b40 100644
+--- a/ggml/src/ggml-sycl/getrows.cpp
++++ b/ggml/src/ggml-sycl/getrows.cpp
+@@ -538,6 +538,18 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+             get_rows_sycl<QK_NVFP4, 1, dequantize_nvfp4>(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,
+             src1_i32, (float *)dst->data, ctx.stream());
+             break;
++        case GGML_TYPE_TQ1_0:
++            get_rows_sycl<QK_K, 1, dequantize_tq1_0>(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,
++            src1_i32, (float *)dst->data, ctx.stream());
++            break;
++        case GGML_TYPE_TQ2_0:
++            get_rows_sycl<QK_K, 1, dequantize_tq2_0>(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,
++            src1_i32, (float *)dst->data, ctx.stream());
++            break;
++        case GGML_TYPE_PTQ1_0:
++            get_rows_sycl<QK_PTQ1_0, 1, dequantize_ptq1_0>(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,
++            src1_i32, (float *)dst->data, ctx.stream());
++            break;
+         case GGML_TYPE_IQ2_XXS:
+             get_rows_sycl<QK_K, 1, dequantize_iq2_xxs>(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,
+             src1_i32, (float *)dst->data, ctx.stream());
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 7f83181b..de4a2482 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -7455,13 +7455,12 @@ static ggml_backend_buffer_t ggml_backend_sycl_device_buffer_from_host_ptr(ggml_
+ }
+ 
+ static bool ggml_sycl_type_has_no_kernels(ggml_type type) {
+-    // The SYCL backend implements no kernel for the ternary types anywhere:
+-    // set_rows.cpp, cpy.cpp and mmvq.cpp all reach a hard abort when one shows
+-    // up (test-backend-ops exercises TQ2_0 through its all_types list). The
+-    // per-op gates below only check operand types, so catch these centrally and
+-    // let the scheduler fall back to CPU. Drop a type from here when real
+-    // kernels land for it.
+-    return type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0;
++    // The ternary types only have weight kernels (dequantize, get_rows, MMVQ);
++    // set_rows.cpp, cpy.cpp and the other ops reach a hard abort when one shows
++    // up, and some per-op gates (DUP, CONT) check no types at all. Catch them
++    // centrally and let the scheduler fall back to CPU; the weight operand of
++    // MUL_MAT, MUL_MAT_ID and GET_ROWS is let through below.
++    return ggml_sycl_is_ternary_type(type);
+ }
+ 
+ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+@@ -7482,7 +7481,9 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
+                 return false;
+             }
+             for (int i = 0; i < GGML_MAX_SRC; ++i) {
+-                if (op->src[i] && ggml_sycl_type_has_no_kernels(op->src[i]->type)) {
++                const bool weight = i == 0 && (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID ||
++                                               op->op == GGML_OP_GET_ROWS);
++                if (op->src[i] && !weight && ggml_sycl_type_has_no_kernels(op->src[i]->type)) {
+                     return false;
+                 }
+             }
+@@ -7577,7 +7578,7 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
+                 }
+ 
+                 // the fallback path dequantizes src0, so it needs a type the SYCL converters implement
+-                if (!ggml_sycl_supports_type(src0_type)) {
++                if (!ggml_sycl_supports_type(src0_type) && !ggml_sycl_is_ternary_type(src0_type)) {
+                     return false;
+                 }
+ 
+@@ -7599,6 +7600,9 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
+                     case GGML_TYPE_Q1_0:
+                     case GGML_TYPE_MXFP4:
+                     case GGML_TYPE_NVFP4:
++                    case GGML_TYPE_TQ1_0:
++                    case GGML_TYPE_TQ2_0:
++                    case GGML_TYPE_PTQ1_0:
+                     case GGML_TYPE_IQ2_XXS:
+                     case GGML_TYPE_IQ2_XS:
+                     case GGML_TYPE_IQ2_S:
+diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+index be534812..fd6400aa 100644
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -1983,6 +1983,29 @@ static void mul_mat_vec_iq4_nl_q8_1_sycl(const void *vx, const void *vy,
+     }
+ }
+ 
++// Ternary types (TQ1_0, TQ2_0, PTQ1_0): one q8_1 block per lane and call, 1..8 columns.
++static void mul_mat_vec_ternary_q8_1_sycl(const ggml_type type, const void * vx, const void * vy, float * dst,
++                                          const int ncols, const int nrows, const int ncols_dst,
++                                          const int stride_col_y, const int stride_col_dst, dpct::queue_ptr stream) {
++    switch (type) {
++        case GGML_TYPE_TQ1_0:
++            launch_mul_mat_vec_q<QK_K, QI_TQ1_0, block_tq1_0, VDR_TQ1_0_Q8_1_MMVQ, vec_dot_tq1_0_q8_1, QK_K>(
++                vx, vy, dst, ncols, nrows, ncols_dst, stride_col_y, stride_col_dst, stream);
++            break;
++        case GGML_TYPE_TQ2_0:
++            launch_mul_mat_vec_q<QK_K, QI_TQ2_0, block_tq2_0, VDR_TQ2_0_Q8_1_MMVQ, vec_dot_tq2_0_q8_1, QK_K>(
++                vx, vy, dst, ncols, nrows, ncols_dst, stride_col_y, stride_col_dst, stream);
++            break;
++        case GGML_TYPE_PTQ1_0:
++            launch_mul_mat_vec_q<QK_PTQ1_0, QI_PTQ1_0, block_ptq1_0, VDR_PTQ1_0_Q8_1_MMVQ, vec_dot_ptq1_0_q8_1,
++                                 QK_PTQ1_0>(vx, vy, dst, ncols, nrows, ncols_dst, stride_col_y, stride_col_dst,
++                                            stream);
++            break;
++        default:
++            GGML_ABORT("%s: unsupported type %s", __func__, ggml_type_name(type));
++    }
++}
++
+ // 2..8 destination columns for the i-quants whose MMVQ only had a one-column kernel (speculative-decoding
+ // verify, small batches): each weight block is read once for all columns. qi / vdr and the vec_dot are those of
+ // the one-column kernel, and each column accumulates in the same order, so every column matches a one-column run.
+@@ -2659,6 +2682,18 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
+                     mul_mat_vec_iq4_xs_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                 }
+                 break;
++            case GGML_TYPE_TQ1_0:
++            case GGML_TYPE_TQ2_0:
++            case GGML_TYPE_PTQ1_0:
++                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
++                    GGML_SYCL_DEBUG("Calling ternary multi-col MMVQ ncols=%d\n", (int) src1_ncols);
++                    mul_mat_vec_ternary_q8_1_sycl(src0->type, src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
++                                                  src1_ncols, src1_padded_col_size / QK8_1, dst->ne[0], stream);
++                    return;
++                }
++                mul_mat_vec_ternary_q8_1_sycl(src0->type, src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, 1,
++                                              0, 0, stream);
++                break;
+             case GGML_TYPE_MXFP4:
+                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
+                     ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+@@ -2813,6 +2848,9 @@ bool ggml_sycl_mul_mat_vec_q_id_supports_type(enum ggml_type src0_type) {
+         case GGML_TYPE_IQ1_M:
+         case GGML_TYPE_IQ4_NL:
+         case GGML_TYPE_IQ4_XS:
++        case GGML_TYPE_TQ1_0:
++        case GGML_TYPE_TQ2_0:
++        case GGML_TYPE_PTQ1_0:
+             return true;
+         default:
+             return false;
+@@ -2962,6 +3000,21 @@ bool ggml_sycl_mul_mat_vec_q_id(
+                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+             return true;
++        case GGML_TYPE_TQ1_0:
++            launch_mul_mat_vec_q_moe<QK_K, QI_TQ1_0, block_tq1_0, VDR_TQ1_0_Q8_1_MMVQ, vec_dot_tq1_0_q8_1>(
++                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
++                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
++            return true;
++        case GGML_TYPE_TQ2_0:
++            launch_mul_mat_vec_q_moe<QK_K, QI_TQ2_0, block_tq2_0, VDR_TQ2_0_Q8_1_MMVQ, vec_dot_tq2_0_q8_1>(
++                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
++                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
++            return true;
++        case GGML_TYPE_PTQ1_0:
++            launch_mul_mat_vec_q_moe<QK_PTQ1_0, QI_PTQ1_0, block_ptq1_0, VDR_PTQ1_0_Q8_1_MMVQ, vec_dot_ptq1_0_q8_1>(
++                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
++                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
++            return true;
+         default:
+             return false;
+     }
+diff --git a/ggml/src/ggml-sycl/vecdotq.hpp b/ggml/src/ggml-sycl/vecdotq.hpp
+index f547b20e..801b2d17 100644
+--- a/ggml/src/ggml-sycl/vecdotq.hpp
++++ b/ggml/src/ggml-sycl/vecdotq.hpp
+@@ -1149,6 +1149,117 @@ vec_dot_q2_0_q8_1(const void *__restrict__ vbq,
+     return sum0 + sum1;
+ }
+ 
++// Ternary types (TQ1_0, TQ2_0, PTQ1_0). One call covers the 32 weights of one q8_1 block: iqs is that
++// q8_1 block's index within the weight block. The trits are expanded to signed bytes for dp4a.
++#define QI_TQ1_0 (QK_K / 32)
++#define QI_TQ2_0 (QK_K / 32)
++#define VDR_TQ1_0_Q8_1_MMVQ  1
++#define VDR_TQ2_0_Q8_1_MMVQ  1
++#define VDR_PTQ1_0_Q8_1_MMVQ 1
++
++// base-3 digit n (0..4) of each packed byte of v, as packed bytes 0..2. Matches the CPU codec:
++// multiplying by 3^n mod 256 brings digit n to the top and (q * 3) >> 8 reads it. The bytes are
++// worked on in 16-bit lanes so the products do not carry into the next byte.
++static __dpct_inline__ uint32_t ternary_digits4(const uint32_t v, const int n) {
++    const uint32_t p  = n == 0 ? 1 : n == 1 ? 3 : n == 2 ? 9 : n == 3 ? 27 : 81;
++    uint32_t       lo = ((v & 0x00FF00FFu) * p) & 0x00FF00FFu;
++    uint32_t       hi = (((v >> 8) & 0x00FF00FFu) * p) & 0x00FF00FFu;
++    lo                = ((lo * 3) >> 8) & 0x00FF00FFu;
++    hi                = ((hi * 3) >> 8) & 0x00FF00FFu;
++    return lo | (hi << 8);
++}
++
++// packed digits {0, 1, 2} -> signed bytes {-1, 0, 1}; setting each byte's top bit first keeps the
++// subtraction from borrowing across bytes
++static __dpct_inline__ int ternary_to_signed4(const uint32_t t) {
++    return (int) (((t | 0x80808080u) - 0x01010101u) ^ 0x80808080u);
++}
++
++static __dpct_inline__ int ternary_dot4(const uint32_t t, const int8_t * q8, const int i32, const int sumi) {
++    return dpct::dp4a(ternary_to_signed4(t), get_int_from_int8_aligned(q8, i32), sumi);
++}
++
++// TQ2_0: q8_1 block g holds bits 2*(g%4) of qs[32*(g/4) .. 32*(g/4) + 31]
++static __dpct_inline__ float vec_dot_tq2_0_q8_1(const void * __restrict__ vbq,
++                                                const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
++    const block_tq2_0 * bq    = (const block_tq2_0 *) vbq;
++    const block_q8_1 *  b8    = bq8_1 + iqs;
++    const uint8_t *     qs    = bq->qs + 32 * (iqs / 4);
++    const int           shift = 2 * (iqs % 4);
++
++    int sumi = 0;
++#pragma unroll
++    for (int k = 0; k < 8; ++k) {
++        sumi = ternary_dot4(((uint32_t) get_int_from_uint8(qs, k) >> shift) & 0x03030303u, b8->qs, k, sumi);
++    }
++    return (float) bq->d * (float) b8->ds[0] * (float) sumi;
++}
++
++// TQ1_0: weights 0..159 are digit w/32 of qs[w%32]; 160..239 are digit (w-160)/16 of qs[32 + (w-160)%16];
++// 240..255 are digit (w-240)/4 of qh[(w-240)%4]. So q8_1 block g < 5 is digit g of qs[0..31]; blocks 5 and 6
++// are digits 2(g-5) and 2(g-5)+1 of qs[32..47]; block 7 is digit 4 of qs[32..47], then digits 0..3 of qh.
++// Every lane runs the same 8 steps: the source bytes and the digit are selected, not branched on.
++static __dpct_inline__ float vec_dot_tq1_0_q8_1(const void * __restrict__ vbq,
++                                                const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
++    const block_tq1_0 * bq = (const block_tq1_0 *) vbq;
++    const block_q8_1 *  b8 = bq8_1 + iqs;
++    const uint8_t *     x  = (const uint8_t *) bq;
++    static_assert(offsetof(block_tq1_0, qh) == 48, "qh follows the 48 qs bytes");
++
++    int sumi = 0;
++#pragma unroll
++    for (int k = 0; k < 8; ++k) {
++        const bool low = iqs < 5;
++        const bool qh  = iqs == 7 && k >= 4;
++        const int  off = low ? 4 * k : qh ? 48 : 32 + 4 * (k % 4);
++        const int  n   = low ? iqs : qh ? k - 4 : 2 * (iqs - 5) + k / 4;
++        sumi           = ternary_dot4(ternary_digits4(get_int_from_uint8(x + off, 0), n), b8->qs, k, sumi);
++    }
++    return (float) bq->d * (float) b8->ds[0] * (float) sumi;
++}
++
++// PTQ1_0: weights 0..79 are digit w/16 of qs[w%16]; 80..119 are digit (w-80)/8 of qs[16 + (w-80)%8];
++// 120..127 are digit (w-120)/2 of qh[(w-120)%2]
++static __dpct_inline__ float vec_dot_ptq1_0_q8_1(const void * __restrict__ vbq,
++                                                 const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
++    const block_ptq1_0 * bq = (const block_ptq1_0 *) vbq;
++    const block_q8_1 *   b8 = bq8_1 + iqs;
++
++    int sumi = 0;
++    if (iqs < 2) {
++#pragma unroll
++        for (int k = 0; k < 4; ++k) {
++            const uint32_t v = get_int_from_uint8(bq->qs, k);
++            sumi             = ternary_dot4(ternary_digits4(v, 2 * iqs + 0), b8->qs, k, sumi);
++            sumi             = ternary_dot4(ternary_digits4(v, 2 * iqs + 1), b8->qs, 4 + k, sumi);
++        }
++    } else if (iqs == 2) {
++#pragma unroll
++        for (int k = 0; k < 4; ++k) {
++            sumi = ternary_dot4(ternary_digits4(get_int_from_uint8(bq->qs, k), 4), b8->qs, k, sumi);
++        }
++#pragma unroll
++        for (int k = 0; k < 2; ++k) {
++            const uint32_t v = get_int_from_uint8(bq->qs, 4 + k);
++            sumi             = ternary_dot4(ternary_digits4(v, 0), b8->qs, 4 + k, sumi);
++            sumi             = ternary_dot4(ternary_digits4(v, 1), b8->qs, 6 + k, sumi);
++        }
++    } else {
++#pragma unroll
++        for (int k = 0; k < 2; ++k) {
++            const uint32_t v = get_int_from_uint8(bq->qs, 4 + k);
++            sumi             = ternary_dot4(ternary_digits4(v, 2), b8->qs, 0 + k, sumi);
++            sumi             = ternary_dot4(ternary_digits4(v, 3), b8->qs, 2 + k, sumi);
++            sumi             = ternary_dot4(ternary_digits4(v, 4), b8->qs, 4 + k, sumi);
++        }
++        // weights 120..127 interleave the two qh bytes: (qh0, qh1) digit 0, digit 1, digit 2, digit 3
++        const uint32_t vh = (uint32_t) bq->qh[0] | ((uint32_t) bq->qh[1] << 8);
++        sumi = ternary_dot4(ternary_digits4(vh, 0) | (ternary_digits4(vh, 1) << 16), b8->qs, 6, sumi);
++        sumi = ternary_dot4(ternary_digits4(vh, 2) | (ternary_digits4(vh, 3) << 16), b8->qs, 7, sumi);
++    }
++    return (float) bq->d * (float) b8->ds[0] * (float) sumi;
++}
++
+ static __dpct_inline__ float
+ vec_dot_q4_1_q8_1(const void *__restrict__ vbq,
+                   const block_q8_1 *__restrict__ bq8_1, const int &iqs) {

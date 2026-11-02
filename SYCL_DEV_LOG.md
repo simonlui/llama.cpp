@@ -153,6 +153,64 @@ oneAPI came from conda-forge into `/opt/oneapi` on a GPU-less cloud box:
   floating point exception, likely from GPU-only device properties. The only
   numeric test of SYCL kernels here is C60's standalone emulation above.
 
+## Quant-type gap fill, part 2 (2026-11-02)
+
+Closes the gaps the first pass left open, again as local patches (`ZZ-LOCAL-0005` to `ZZ-LOCAL-0009`).
+
+- **`ZZ-LOCAL-0005`, ternary types.** TQ1_0, TQ2_0 and PTQ1_0 get dequantize, GET_ROWS, 1..8-column
+  MMVQ and the fused MoE MMVQ. CUDA PR 29676 covers only PTQ1_0 and no GPU backend in tree has TQ1_0 /
+  TQ2_0, so all three follow the CPU codec (`dequantize_row_tq1_0` and friends): base-3 digit n of a
+  packed byte is `((q * 3^n mod 256) * 3) >> 8`, done four bytes at a time in 16-bit lanes, and each
+  32-weight q8_1 group is expanded to signed bytes for `dp4a`. A host harness against
+  `quantize_row_*_ref` / `dequantize_row_*` matched all three bit for bit before the SYCL build.
+  0017's central gate now admits these types only as the weight operand of MUL_MAT, MUL_MAT_ID and
+  GET_ROWS (PTQ1_0 is caught by it too now; DUP / CONT check no types and would have aborted).
+- **`ZZ-LOCAL-0006`, F8_E4M3.** DMMV for one token, exact f16 widening plus the GEMM for batches,
+  MUL_MAT_ID through the per-expert loop, GET_ROWS, CPY to and from F32 / F16 / BF16. No GPU backend in
+  tree runs FP8 weights (Metal only copies them). The conversions were checked bit-exact against the
+  CPU's on all 256 codes, every tie, and 4M random floats; they test bits instead of calling `isnan`,
+  because icpx's default `-fp-model=fast` folds `isnan` (the same harness built with `-ffast-math`
+  breaks the CPU's own `ggml_fp32_to_f8_e4m3` on -0 and NaN, not the SYCL one).
+- **`ZZ-LOCAL-0007`, IQ4_NL reorder (2D and MoE).** IQ4_NL's block is Q4_0's, so it takes Q4_0's
+  `[qs][d]` layout with a codebook variant of the reorder vec_dot. All readers of a reordered weight
+  are covered: 1..8-column MMVQ, the MoE reorder MMVQ, dequantize, GET_ROWS, and a SoA stage of the
+  fused / grouped XMX dequant GEMM. Candidate C20 already reads the layout. The new lines were moved off
+  candidate C10's context (it edits the same type lists for IQ4_XS).
+- **`ZZ-LOCAL-0008`, IQ3 MoE reorder.** The grouped XMX dequant GEMM gets SoA stages for IQ3_XXS and
+  IQ3_S, sharing one decode with the block stages, so MoE experts can now take the per-slice 2D IQ3
+  layout without moving MoE prompt batches off the grouped GEMM. Dense IQ3 weights gain the same: once
+  the existing 2D reorder is installed, their prompt batches keep the fused GEMM instead of dequantize
+  plus oneDNN. A host harness checked the IQ4_NL and both IQ3 SoA stages against the block stages,
+  bit for bit, on random blocks; the XMX GEMM itself cannot run on the CPU device.
+- **`ZZ-LOCAL-0009`, Q2_0 GET_ROWS.** Q2_0 had a dequantizer but was missing from GET_ROWS.
+- **Verification (CPU OpenCL device, `tools/cpu-device-test/`), all against the CPU backend:**
+  - Ternary: MUL_MAT tq1_0 13/13, tq2_0 48/48, ptq1_0 14/14; MUL_MAT_ID 5/5, 3/3, 3/3; GET_ROWS 8/8
+    each. TQ1_0's first dot product branched per q8_1 block; it passed one column but gave ERR ~0.9
+    in the 2..8-column kernel (and the MoE kernel) on this device, though the same function matched
+    the CPU on the host. The rewrite selects the source bytes and digit per step instead and passes.
+  - F8_E4M3: MUL_MAT 60/60, MUL_MAT_ID 73/73, GET_ROWS 8/8, CPY 29/29 without the BF16 cases; every
+    non-BF16 CPY case 379/379. The CPU OpenCL compiler crashes building any BF16 conversion kernel,
+    upstream's F16 to BF16 copy included, so F8 to and from BF16 is untested here.
+  - Reorder, with and without `GGML_SYCL_TEST_FORCE_REORDER=1`: MUL_MAT / MUL_MAT_ID iq4_nl 56/56 and
+    12/12, iq3_xxs 49/49 and 4/4, iq3_s 49/49 and 21/21. GET_ROWS, every type but BF16, reorder on:
+    224/224 (8 of them the new Q2_0). Upstream's reuse tests (`test_get_rows_after_mul_mat`,
+    `test_mul_mat_reorder_then_big_batch`, now with IQ4_NL): 10/10. The new `reorder-reuse` tool,
+    which installs the reorder and then reads it through a 32-token MUL_MAT, GET_ROWS and a 32-token
+    MUL_MAT_ID: 47/47 over Q4_0, Q8_0, Q2_K..Q6_K, IQ3_XXS, IQ3_S, IQ4_NL (Q2_K / Q4_K / Q5_K GET_ROWS
+    skipped, gated by 0014). The device-program cache shows `reorder_qw_planar_moe` built for IQ4_NL,
+    IQ3_XXS and IQ3_S, so the MoE cases ran on the new layout.
+- **DG2 AOT (`acm-g10`, `-ze-opt-enable-auto-large-GRF-mode`).** `mmvq.cpp`, `fused-gemm.cpp`,
+  `convert.cpp`, `getrows.cpp`, `dmmv.cpp` and `cpy.cpp` build. None of the 38 new MMVQ kernels spills
+  (27 ternary, 9 IQ4_NL reorder, 2 IQ3 MoE reorder; all at 128 GRF), nor do the 36 new dequantize,
+  GET_ROWS, DMMV and CPY kernels. The fused XMX dequant GEMM spills on DG2 in every variant, the existing
+  block-layout ones included (2.3 to 3.3 KB). The new SoA variants spill 64 B (IQ4_NL), 160 B (IQ3_XXS)
+  and 512 B (IQ3_S) more than the block variant of the same type, as the existing Q4_K SoA variant does
+  (+256 B). Whether a spilling fused GEMM beats dequantize plus oneDNN for reordered IQ3 / IQ4_NL
+  prompt batches on the A770 is unmeasured.
+- **Apply.** The stack, the seven local patches, every candidate (plain `git apply`, no three-way) and
+  the Vulkan stack apply and unapply back to a clean tree; `hooks.patch` still applies.
+- **Not verified:** speed on the A770, and the XMX / ESIMD paths, which need the GPU.
+
 ## Quant-type gap fill (2026-11-01)
 
 Audit of which kernel each quant type reaches with the stack applied, against what the carried PRs
@@ -190,7 +248,7 @@ cover. Two gaps were filled as local patches; the rest are listed with the reaso
   `ggml_sycl_supports_mmq()` returns false for every type ("accuracy issues in MMQ"), so
   `-DGGML_SYCL_MMQ_XMX=ON` changes nothing. That, not the oneMKL routing, is why the ON / OFF numbers
   in `sycl-patches-extracted/README.md` match.
-- **Left open:**
+- **Left open** (the first three closed by part 2, above):
   - IQ4_NL 2D reorder: its block matches Q4_0's, but the grouped GEMM has no SoA stage for it and
     candidate C20 has its own IQ4_NL SoA reader, so a new layout would need both kept in step.
   - IQ3_XXS / IQ3_S MoE reorder: the grouped GEMM has no SoA stage for them, so MoE prefill would

@@ -17,8 +17,9 @@ extractable as idiomatic backend code and is intentionally excluded — see
 Local work on top of the stack goes in the separate `ZZ-LOCAL-*` group in this
 directory: repairs the current upstream tree needs, and gap fills for quant types
 the carried PRs leave out. They are not folded into the numbered extracted
-history and remain independently reversible. Two are active: `ZZ-LOCAL-0003` and
-`ZZ-LOCAL-0004` (see the patch index).
+history and remain independently reversible. Seven are active, `ZZ-LOCAL-0003` to
+`ZZ-LOCAL-0009` (see the patch index). They apply in number order, and every candidate in
+`../sycl-patches-candidates/` applies on top of them with plain `git apply`.
 
 ## Patch index
 
@@ -27,7 +28,12 @@ history and remain independently reversible. Two are active: `ZZ-LOCAL-0003` and
 | 0015 | `0015-sycl-softmax-reduce-over-group.patch` | Replaces the block max/sum barrier+SLM reductions in `softmax.cpp` with `sycl::reduce_over_group`. Reduction-only; **keeps upstream exp semantics** (`sycl::native::exp` + the `-80.0f` clamp). | cleanup |
 | 0016 | `0016-sycl-mmq-xmx.patch` | Experimental XMX (Intel Xe Matrix eXtensions / `joint_matrix`) Int8 MMQ path, gated behind the `GGML_SYCL_MMQ_XMX` CMake option (default OFF). Reshaped from the fork's `mmq_xmx.*`. | perf (build-flag gated) |
 | ZZ-LOCAL-0003 | `ZZ-LOCAL-0003-sycl-mmvq-multi-col-iq.patch` | 2..8-column MMVQ for IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ4_NL and non-reordered IQ3_XXS, the only quantized types that reread their weights per column in a speculative-decoding verify or small batch. Generic `mul_mat_vec_q_ncols` with each type's one-column qi / vdr / vec_dot. | perf (gap fill) |
-| ZZ-LOCAL-0004 | `ZZ-LOCAL-0004-sycl-moe-reorder-q4_0-q2_k-q3_k.patch` | Reorders Q4_0, Q2_K and Q3_K MoE expert weights per expert slice (the 2D reorder layout, one shared tail writer per type) and runs them through the generic MoE reorder MMVQ. Before, only Q8_0, Q4_K, Q5_K, Q6_K and MXFP4 experts were reordered. IQ3 is left out because the grouped GEMM has no SoA stage for it. | perf (gap fill) |
+| ZZ-LOCAL-0004 | `ZZ-LOCAL-0004-sycl-moe-reorder-q4_0-q2_k-q3_k.patch` | Reorders Q4_0, Q2_K and Q3_K MoE expert weights per expert slice (the 2D reorder layout, one shared tail writer per type) and runs them through the generic MoE reorder MMVQ. Before, only Q8_0, Q4_K, Q5_K, Q6_K and MXFP4 experts were reordered. IQ3 is left out here; `ZZ-LOCAL-0008` adds it with the grouped GEMM's SoA stage it needs. | perf (gap fill) |
+| ZZ-LOCAL-0005 | `ZZ-LOCAL-0005-sycl-ternary-types.patch` | SYCL kernels for the ternary weight types TQ1_0, TQ2_0 and PTQ1_0 (PTQ1_0 from carried PR 29672), which ran on the CPU before. Dequantize to f16 / f32 (prompt batches go through the GEMM), GET_ROWS, MMVQ for 1..8 columns, and the fused MoE MMVQ. The dot product expands each 32-weight group to signed bytes for `dp4a` with the CPU codec's base-3 digit extraction (multiply by 3^n mod 256, then `(q * 3) >> 8`), on packed bytes. Fork patch 0017's central gate now admits these types only as the weight operand of MUL_MAT, MUL_MAT_ID and GET_ROWS; SET_ROWS, CPY and every other op still fall back to the CPU. | feature (gap fill) |
+| ZZ-LOCAL-0006 | `ZZ-LOCAL-0006-sycl-f8-e4m3.patch` | F8_E4M3 (OCP FP8) weights, which ran on the CPU before: DMMV for one-token MUL_MAT, exact widening to f16 plus the GEMM for batches, MUL_MAT_ID through the per-expert loop, GET_ROWS, and CPY to and from F32, F16 and BF16. The conversions are bit-exact with the CPU's `ggml_fp32_to_f8_e4m3` / `ggml_f8_e4m3_to_fp32`, and they test bits rather than calling `isnan`, so icpx's default `-fp-model=fast` cannot fold the NaN and saturation cases away. | feature (gap fill) |
+| ZZ-LOCAL-0007 | `ZZ-LOCAL-0007-sycl-reorder-iq4_nl.patch` | IQ4_NL in the reorder (SoA) layout, dense and per MoE expert. The layout is Q4_0's `[qs][d]` (the blocks are identical), read by a codebook variant of Q4_0's reorder vec_dot for 1..8 columns and by the MoE reorder MMVQ. Dequantize and GET_ROWS (tied embeddings) read the layout too, and the fused / grouped XMX dequant GEMM gets a SoA stage, so a reordered weight keeps that GEMM for prompt batches. Candidate C20's ESIMD MoE GEMM already reads this layout. | perf (gap fill) |
+| ZZ-LOCAL-0008 | `ZZ-LOCAL-0008-sycl-moe-reorder-iq3.patch` | Reorders IQ3_XXS and IQ3_S MoE experts per slice (the existing 2D IQ3 layout) for the MoE reorder MMVQ, and adds SoA stages for both types to the fused / grouped XMX dequant GEMM; the block and SoA stages share one decode. MoE prompt batches therefore keep the grouped GEMM after the reorder. The same stages let dense IQ3 weights keep the fused GEMM once the existing 2D reorder is installed; before, those fell back to dequantize plus oneDNN. Candidates C20 / C21 read the same layout. | perf (gap fill) |
+| ZZ-LOCAL-0009 | `ZZ-LOCAL-0009-sycl-getrows-q2_0.patch` | Q2_0 in GET_ROWS, through the generic `get_rows_sycl` and the existing `dequantize_q2_0`. Q2_0 had a dequantizer and MMVQ but fell back to the CPU for row lookups. | feature (gap fill) |
 
 The former `ZZ-LOCAL-0001` made direct SYCL `CONV_2D` index input, kernel, and
 output by their real strides. It was retired on 2026-11-01 as superseded by
@@ -107,6 +113,12 @@ is gone, so runtime behavior/perf differs from the research tree.
   `tools/cpu-device-test/`, with and without the reorder forced on: every MUL_MAT and MUL_MAT_ID case
   of the affected types passes against the CPU backend. Speed on the A770 is not measured. Details
   in `SYCL_DEV_LOG.md` ("Quant-type gap fill").
+- **`ZZ-LOCAL-0005` to `ZZ-LOCAL-0009` (2026-11-02):** built with `icpx` 2026.2 and tested on the CPU
+  OpenCL device: every MUL_MAT, MUL_MAT_ID, GET_ROWS and (non-BF16) CPY case of the new types passes,
+  as do the reorder types with the reorder forced on, upstream's reuse tests and the new
+  `tools/cpu-device-test/reorder-reuse.cpp`. The new ternary and FP8 conversions and the SoA GEMM stages
+  were also checked bit for bit on the host. The six touched files build for `acm-g10` (AOT); the new MMVQ, dequantize, GET_ROWS, DMMV and CPY kernels do not spill. Not verified: speed on the A770 and the
+  XMX / ESIMD paths. Details in `SYCL_DEV_LOG.md` ("Quant-type gap fill, part 2").
 - The scripts snapshot pre-existing untracked paths in the worktree's Git
   administrative directory. Files introduced by an apply are removed on
   unapply, while paths present before apply are protected. The state file is

@@ -1,0 +1,248 @@
+Subject: [PATCH] sycl: reorder IQ3_XXS / IQ3_S MoE experts, SoA stages in the XMX dequant GEMM
+
+Local gap fill. IQ3_XXS and IQ3_S have a 2D reorder layout, but MoE experts stayed in the block
+layout: the grouped dequant GEMM had no SoA stage for them, so reordering would have moved MoE
+prompt batches off it.
+
+- fg_soa<block_iq3_xxs> / fg_soa<block_iq3_s>: the A stages for the reorder layout. The block and
+  SoA stages share one decode (fg_decode_iq3_xxs / fg_decode_iq3_s), split out of the existing
+  block stages.
+- MoE experts are reordered per slice into the 2D layout (reorder_qw_planar_moe, the IQ3_S tail
+  writer shared with the 2D reorder) and run through the MoE reorder MMVQ, whose dot products the
+  2D reorder already has. Slices that are not 16-byte aligned stay in the block layout.
+- Side effect on dense weights: once the existing 2D reorder is installed, an IQ3 prompt batch now
+  keeps the fused XMX dequant GEMM instead of falling back to dequantize plus oneDNN.
+
+Candidates C20 / C21 read this per-expert layout ([qs][d] for IQ3_XXS, [qs][qh][signs][d, scales]
+for IQ3_S). reorder_qw_iq3_xxs keeps its body so candidate C10's context still matches.
+
+diff --git a/ggml/src/ggml-sycl/fused-gemm.cpp b/ggml/src/ggml-sycl/fused-gemm.cpp
+index 0e45d1ec..a9a6f841 100644
+--- a/ggml/src/ggml-sycl/fused-gemm.cpp
++++ b/ggml/src/ggml-sycl/fused-gemm.cpp
+@@ -371,19 +371,15 @@ static __dpct_inline__ void fg_stage_a(const block_iq4_nl * __restrict__ xrow, c
+ // iq3_s: k step kb is sub-block kb % 8 of superblock kb / 8. The superblock is 110 bytes, so read
+ // only the fields of that sub-block instead of copying the block. Same decode as
+ // dequantize_block_iq3_s: grid entries are taken as dwords and the sign bit is a plain shift.
++// qs: the sub-block's 8 grid bytes, qh its high-bit byte, signs4 its 4 sign bytes, d the scaled d.
+ template <typename E>
+-static __dpct_inline__ void fg_stage_a(const block_iq3_s * __restrict__ xrow, const int kb, typename E::pair * a) {
+-    static_assert(QK_K == 256, "the iq3_s A stage assumes 8 sub-blocks per superblock");
+-    const block_iq3_s * blk = xrow + kb / (QK_K / 32);
+-    const int           ib8 = kb % (QK_K / 32);
+-    const uint8_t *     qs  = blk->qs + 8 * ib8;
+-    const int           qh  = blk->qh[ib8];
+-    const float         d   = (float) blk->d * (1 + 2 * ((blk->scales[ib8 / 2] >> (4 * (ib8 % 2))) & 0xf));
++static __dpct_inline__ void fg_decode_iq3_s(const uint8_t * __restrict__ qs, const int qh,
++                                            const uint8_t * __restrict__ signs4, const float d, typename E::pair * a) {
+ #pragma unroll
+     for (int il = 0; il < 4; ++il) {
+         const uint32_t grid1 = iq3s_grid[qs[2 * il + 0] | ((qh << (8 - 2 * il)) & 256)];
+         const uint32_t grid2 = iq3s_grid[qs[2 * il + 1] | ((qh << (7 - 2 * il)) & 256)];
+-        const int      signs = blk->signs[4 * ib8 + il];
++        const int      signs = signs4[il];
+ #pragma unroll
+         for (int j = 0; j < 2; ++j) {
+             const float g1a = (float) ((grid1 >> (16 * j + 0)) & 0xff);
+@@ -399,6 +395,15 @@ static __dpct_inline__ void fg_stage_a(const block_iq3_s * __restrict__ xrow, co
+     }
+ }
+ 
++template <typename E>
++static __dpct_inline__ void fg_stage_a(const block_iq3_s * __restrict__ xrow, const int kb, typename E::pair * a) {
++    static_assert(QK_K == 256, "the iq3_s A stage assumes 8 sub-blocks per superblock");
++    const block_iq3_s * blk = xrow + kb / (QK_K / 32);
++    const int           ib8 = kb % (QK_K / 32);
++    const float         d   = (float) blk->d * (1 + 2 * ((blk->scales[ib8 / 2] >> (4 * (ib8 % 2))) & 0xf));
++    fg_decode_iq3_s<E>(blk->qs + 8 * ib8, blk->qh[ib8], blk->signs + 4 * ib8, d, a);
++}
++
+ // values per stored block, so a row of K values is K/qk blocks
+ template <typename block_q_t> struct fg_block_traits;
+ template <> struct fg_block_traits<block_iq4_nl> { static constexpr int qk = QK4_NL; };
+@@ -449,13 +454,14 @@ static __dpct_inline__ void fg_stage_a(const block_iq4_xs * __restrict__ xrow, c
+     }
+ }
+ 
++// qs: the superblock's QK_K/4 grid indices then its QK_K/8 bytes of scales and signs; ib the sub-block
+ template <typename E>
+-static __dpct_inline__ void fg_stage_a(const block_iq3_xxs * __restrict__ xrow, const int kb, typename E::pair * a) {
+-    FG_SUPERBLOCK(block_iq3_xxs);
+-    const uint8_t *  q3    = blk->qs + 8 * ib;
+-    const uint16_t * gas   = (const uint16_t *) (blk->qs + QK_K / 4) + 2 * ib;
++static __dpct_inline__ void fg_decode_iq3_xxs(const uint8_t * __restrict__ qs, const float d_blk, const int ib,
++                                              typename E::pair * a) {
++    const uint8_t *  q3    = qs + 8 * ib;
++    const uint16_t * gas   = (const uint16_t *) (qs + QK_K / 4) + 2 * ib;
+     const uint32_t   aux32 = gas[0] | (gas[1] << 16);
+-    const float      d     = (float) blk->d * (0.5f + (aux32 >> 28)) * 0.5f;
++    const float      d     = d_blk * (0.5f + (aux32 >> 28)) * 0.5f;
+ #pragma unroll
+     for (int il = 0; il < 4; ++il) {
+         const uint8_t * grid1 = (const uint8_t *) (iq3xxs_grid + q3[2 * il + 0]);
+@@ -471,6 +477,12 @@ static __dpct_inline__ void fg_stage_a(const block_iq3_xxs * __restrict__ xrow,
+     }
+ }
+ 
++template <typename E>
++static __dpct_inline__ void fg_stage_a(const block_iq3_xxs * __restrict__ xrow, const int kb, typename E::pair * a) {
++    FG_SUPERBLOCK(block_iq3_xxs);
++    fg_decode_iq3_xxs<E>(blk->qs, (float) blk->d, ib, a);
++}
++
+ template <typename E>
+ static __dpct_inline__ void fg_stage_a(const block_iq2_xxs * __restrict__ xrow, const int kb, typename E::pair * a) {
+     FG_SUPERBLOCK(block_iq2_xxs);
+@@ -747,6 +759,34 @@ template <> struct fg_soa<block_iq4_nl> {
+     }
+ };
+ 
++template <> struct fg_soa<block_iq3_xxs> {
++    static constexpr bool supported = true;
++    // [qs (grid indices, scales and signs)][d]
++    template <typename E>
++    static __dpct_inline__ void stage(const uint8_t * x, const size_t nblocks, const size_t ib, const int kb,
++                                      typename E::pair * a) {
++        const float d = (float) ((const sycl::half *) (x + nblocks * (3 * QK_K / 8)))[ib];
++        fg_decode_iq3_xxs<E>(x + ib * (3 * QK_K / 8), d, kb % (QK_K / 32), a);
++    }
++};
++
++template <> struct fg_soa<block_iq3_s> {
++    static constexpr bool supported = true;
++    // [qs][qh][signs][d, scales]
++    template <typename E>
++    static __dpct_inline__ void stage(const uint8_t * x, const size_t nblocks, const size_t ib, const int kb,
++                                      typename E::pair * a) {
++        const int       ib8   = kb % (QK_K / 32);
++        const uint8_t * qh    = x + nblocks * (QK_K / 4);
++        const uint8_t * signs = qh + nblocks * (QK_K / 32);
++        const uint8_t * meta  = signs + nblocks * (QK_K / 8) + ib * (sizeof(ggml_half) + IQ3S_N_SCALE);
++        const float     d     = (float) *(const sycl::half *) meta *
++                            (1 + 2 * ((meta[sizeof(ggml_half) + ib8 / 2] >> (4 * (ib8 % 2))) & 0xf));
++        fg_decode_iq3_s<E>(x + ib * (QK_K / 4) + 8 * ib8, qh[ib * (QK_K / 32) + ib8],
++                           signs + ib * (QK_K / 8) + 4 * ib8, d, a);
++    }
++};
++
+ template <> struct fg_soa<block_q8_0> {
+     static constexpr bool supported = true;
+     // [qs][d]
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index a1087d25..d1ed0e28 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -5081,23 +5081,35 @@ static bool reorder_qw_q6_k(uint8_t * data_device, size_t size, size_t offset, d
+         }, stream);
+ }
+ 
++// IQ3_S: [qs][qh][signs][d, scales]; shared with the per-expert MoE reorder
++struct reorder_tail_iq3_s {
++    void operator()(const block_iq3_s & x, int64_t ib, uint8_t * tail, int64_t nblocks) const {
++        uint8_t * qh       = tail;
++        uint8_t * signs    = qh + (QK_K / 32) * nblocks;
++        uint8_t * metadata = signs + (QK_K / 8) * nblocks + ib * (sizeof(ggml_half) + IQ3S_N_SCALE);
++        for (int j = 0; j < QK_K / 32; ++j) {
++            qh[ib * (QK_K / 32) + j] = x.qh[j];
++        }
++        for (int j = 0; j < QK_K / 8; ++j) {
++            signs[ib * (QK_K / 8) + j] = x.signs[j];
++        }
++        *reinterpret_cast<ggml_half *>(metadata) = x.d;
++        for (int j = 0; j < IQ3S_N_SCALE; ++j) {
++            metadata[sizeof(ggml_half) + j] = x.scales[j];
++        }
++    }
++};
++
++// IQ3_XXS: [qs (grid indices, scales and signs)][d], as reorder_qw_iq3_xxs writes it
++struct reorder_tail_iq3_xxs {
++    void operator()(const block_iq3_xxs & x, int64_t ib, uint8_t * tail, int64_t) const {
++        reinterpret_cast<ggml_half *>(tail)[ib] = x.d;
++    }
++};
++
+ static bool reorder_qw_iq3_s(uint8_t * data_device, size_t size, dpct::queue_ptr stream) {
+     return reorder_qw_planar<block_iq3_s>(__func__, data_device, size, offsetof(block_iq3_s, qs), QK_K / 4,
+-        [](const block_iq3_s & x, int64_t ib, uint8_t * tail, int64_t nblocks) {
+-            uint8_t * qh       = tail;
+-            uint8_t * signs    = qh + (QK_K / 32) * nblocks;
+-            uint8_t * metadata = signs + (QK_K / 8) * nblocks + ib * (sizeof(ggml_half) + IQ3S_N_SCALE);
+-            for (int j = 0; j < QK_K / 32; ++j) {
+-                qh[ib * (QK_K / 32) + j] = x.qh[j];
+-            }
+-            for (int j = 0; j < QK_K / 8; ++j) {
+-                signs[ib * (QK_K / 8) + j] = x.signs[j];
+-            }
+-            *reinterpret_cast<ggml_half *>(metadata) = x.d;
+-            for (int j = 0; j < IQ3S_N_SCALE; ++j) {
+-                metadata[sizeof(ggml_half) + j] = x.scales[j];
+-            }
+-        }, stream);
++                                          reorder_tail_iq3_s{}, stream);
+ }
+ 
+ static bool reorder_qw_iq3_xxs(uint8_t * data_device, size_t size, dpct::queue_ptr stream) {
+@@ -5144,6 +5156,14 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
+                 return reorder_qw_planar_moe<block_iq4_nl>("reorder_qw_iq4_nl_moe", data_device, src0->nb[2],
+                                                            src0->ne[2], offsetof(block_iq4_nl, qs), QK4_NL / 2,
+                                                            reorder_tail_iq4_nl{}, stream);
++            case GGML_TYPE_IQ3_XXS:
++                return reorder_qw_planar_moe<block_iq3_xxs>("reorder_qw_iq3_xxs_moe", data_device, src0->nb[2],
++                                                            src0->ne[2], offsetof(block_iq3_xxs, qs), 3 * QK_K / 8,
++                                                            reorder_tail_iq3_xxs{}, stream);
++            case GGML_TYPE_IQ3_S:
++                return reorder_qw_planar_moe<block_iq3_s>("reorder_qw_iq3_s_moe", data_device, src0->nb[2],
++                                                          src0->ne[2], offsetof(block_iq3_s, qs), QK_K / 4,
++                                                          reorder_tail_iq3_s{}, stream);
+             default:
+                 return false;
+         }
+@@ -5227,13 +5247,13 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
+     if (src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_Q4_K &&
+         src0->type != GGML_TYPE_Q5_K && src0->type != GGML_TYPE_Q6_K && src0->type != GGML_TYPE_MXFP4 &&
+         src0->type != GGML_TYPE_Q4_0 && src0->type != GGML_TYPE_Q2_K && src0->type != GGML_TYPE_Q3_K &&
+-        src0->type != GGML_TYPE_IQ4_NL) {
++        src0->type != GGML_TYPE_IQ4_NL && src0->type != GGML_TYPE_IQ3_XXS && src0->type != GGML_TYPE_IQ3_S) {
+         return;
+     }
+-    // Q4_0 / Q2_K / Q3_K / IQ4_NL experts take the 2D readers per slice, some with vector loads sized for a 2D
+-    // tensor's aligned start: keep every slice 16-byte aligned, else stay in the block layout
++    // Q4_0 / Q2_K / Q3_K / IQ4_NL / IQ3 experts take the 2D readers per slice, some with vector loads sized for a
++    // 2D tensor's aligned start: keep every slice 16-byte aligned, else stay in the block layout
+     if ((src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q3_K ||
+-         src0->type == GGML_TYPE_IQ4_NL) &&
++         src0->type == GGML_TYPE_IQ4_NL || src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ3_S) &&
+         (src0->nb[2] % 16 != 0 || (uintptr_t) src0->data % 16 != 0)) {
+         return;
+     }
+diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+index c0cd3a8c..4afe61b6 100644
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -2883,6 +2883,8 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(enum ggml_type src0_type)
+         case GGML_TYPE_Q6_K:
+         case GGML_TYPE_MXFP4:
+         case GGML_TYPE_IQ4_NL:
++        case GGML_TYPE_IQ3_XXS:
++        case GGML_TYPE_IQ3_S:
+             return true;
+         default:
+             return false;
+@@ -3202,6 +3204,16 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder(
+                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+             return true;
++        case GGML_TYPE_IQ3_XXS:
++            launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_IQ3_XXS>>(
++                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
++                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
++            return true;
++        case GGML_TYPE_IQ3_S:
++            launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_IQ3_S>>(
++                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
++                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
++            return true;
+         default:
+             return false;
+     }
