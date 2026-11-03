@@ -25,7 +25,7 @@ the main stack, re-running `apply.sh` on an applied tree is not supported.
 | C50 | Frostbite1536/A770 `0a31dc7`, p11c F | TILE FA flushes its FP16 V accumulator to FP32 once per KV tile | Probable long-context accuracy fix: NMSE up to 2.3 at 16k keys per block, CPU OpenCL device only | none |
 | C51 | Frostbite1536/A770, patch 0005 | 16 biased-V FA test cases with an FP32 CPU reference | Tests C50; CPU FA changes only under the test reference flag | none |
 | C60 | local port of upstream PR 31125 | Upstream's DPAS flash attention for q4_0 / q8_0 KV (1-31 query tokens), with the DPAS width as a template parameter: sub-group 16 as upstream, sub-group 8 for Xe-HPG, picked per device at run time | Upstream measured tg128 at 16K 31.3 -> 54.2 t/s on a B580 (q4_0 KV), but gates it to Xe2. On DG2 it replaces VEC for quantized-KV decode and small batches, and it is the only candidate that covers q4_0 KV. With C40 applied, C40 still takes q8_0 decode at 1-8 tokens and D 64/128/256 | `GGML_SYCL_FA_DPAS=0` |
-| C62 | PR 31574 (draft) | Lifts upstream's Alchemist (DG2) block on oneDNN fused SDPA at head_dim 64 | gpt-oss and other head-dim-64 models get oneDNN's fused attention for prompts. The author on Windows: Qwen2.5-0.5B pp2048 +49%, pp4096 +106%, `FLASH_ATTN_EXT hsk=64` 1818/1818. The block guarded against wrong results that the PR traces to a Linux IGC regression fixed in IGC 2.40, so older IGC still computes garbage here. The PR names its card `dg2_g11` (the ACM-G11 die of the A380/A310); an A770 is ACM-G10, so only your own run counts | `GGML_SYCL_FA_ONEDNN=0` (all oneDNN FA) |
+| C62 | PR 31574 (draft) | Lifts upstream's Alchemist (DG2) block on oneDNN fused SDPA at head_dim 64 | gpt-oss and other head-dim-64 models get oneDNN's fused attention for prompts. The author on Windows: Qwen2.5-0.5B pp2048 +49%, pp4096 +106%, `FLASH_ATTN_EXT hsk=64` 1818/1818. The block guarded against wrong results that the PR traces to a Linux IGC regression fixed in IGC 2.40, so older IGC still computes garbage here. The PR's validation line reads "Arc A770 / dg2_g11", but `dg2_g11` is the ACM-G11 die of the A380/A310 and an A770 is ACM-G10, so the card name or the label is wrong; only your own run counts | `GGML_SYCL_FA_ONEDNN=0` (all oneDNN FA) |
 | C70 | PR 31379 (draft), re-anchored on carried PR 31355 and local 0015 | The gated delta net reads its recurrent state through the GET_ROWS ids instead of from a gathered copy | Qwen3.5 / Qwen3-Next decode: one state copy fewer per delta-net layer per token. Single-sequence batches only | `GGML_SYCL_GDN_STATE_GATHER=0` |
 | C75 | PR 31313 (draft, "WIP K1"), without its fused-gemm.cpp dedup | Vector and joint_matrix kernels for the lightning indexer | DeepSeek-V3.2-style sparse attention, decode (vector kernel) and batches of 8+ (XMX, sub-group-8 8x8x16 on DG2). Off by default | `GGML_SYCL_LIGHTNING_INDEXER=1` turns it on |
 | C76 | local, on C75 | 256 registers for C75's vector kernel on ACM-G10/G11/G12 | At 128 that kernel spills 1.6-1.8 KB per thread on DG2; at 256 it does not | none (only with C75 on) |
@@ -102,9 +102,10 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build_sycl/bin/test-backend-ops -b SYCL0 -
 ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_LIGHTNING_INDEXER=1 ./build_sycl/bin/test-backend-ops -b SYCL0 -o LIGHTNING_INDEXER
 ```
 
-On Linux, check the IGC version before trusting C62 (`GGML_SYCL_FA_ONEDNN=0` is the old
-behaviour). Then speed: C62 on prompts of a head-dim-64 model, C70 on decode of a Qwen3.5
-or Qwen3-Next model:
+On Linux, check the driver before trusting C62 (`GGML_SYCL_FA_ONEDNN=0` is the old behaviour).
+`sycl-ls` prints the Level Zero driver version in brackets; the PR calls 1.15.38646 bad and
+1.14.37435 good, with the fix in IGC 2.40 (`dpkg -l | grep -i igc` on Debian / Ubuntu). Then
+speed: C62 on prompts of a head-dim-64 model, C70 on decode of a Qwen3.5 or Qwen3-Next model:
 
 ```bash
 for o in 0 1; do GGML_SYCL_FA_ONEDNN=$o ./build_sycl/bin/llama-bench -m HD64_MODEL -fa 1 -p 2048,4096 -n 0 -r 3; done
@@ -113,6 +114,28 @@ for g in 0 1; do GGML_SYCL_GDN_STATE_GATHER=$g ./build_sycl/bin/llama-bench -m Q
 
 Promote a candidate when its tests pass and it wins at the depths you use. A tuning bit that
 wins can become a plain DG2 entry in that gate.
+
+## Draft PR check (2026-11-03)
+
+The four draft PRs behind C20, C62, C70 and C75 are still open drafts and their heads have not moved
+since they were captured: 31574 `ef2a0391`, 31379 `7f72c2a5`, 31313 `5f1ba52e` (merge of master over
+`11e34732`), 31428 `acfa9400`. C21 is the head of cwriter's `grouped-xmx-moe-v2-with-8x8` branch
+(`36b50381`). Each PR's diff against its merge base was compared line by line with the candidate
+file (plus the carried PR it sits on):
+
+| PR | Covered by | Lines of the PR not in the candidate |
+|----|------------|--------------------------------------|
+| 31574 | C62 | none |
+| 31379 | PR-31355 + C70 | none (`graph_optimize` and the whole-graph perf mode come from PR-31355) |
+| 31313 | C75 | the `fused-gemm.cpp` dedup and its two doc lines, as the C75 header says |
+| 31428 | PR-30156 + C20 | none |
+
+From the PR threads: arthw, who reviews the SYCL backend, measured 31428 on an A770 with no gain,
+which is expected because C20 alone runs only the sub-group-16 shape; cwriter answered with the
+8x8 branch that C21 carries. arthw's A770 run of 31313 used a 27B model, which has no lightning
+indexer, so it measured nothing; cwriter suggests
+`test-backend-ops perf -o LIGHTNING_INDEXER -b SYCL0` with the switch at 0 and 1. 31574 has no
+review yet.
 
 ## Build status of this group (2026-11-01)
 

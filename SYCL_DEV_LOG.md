@@ -197,9 +197,12 @@ Findings from the refresh:
   `xmx_pick_combo`) was dropped with it.
 - **C70 and 31355 share scaffolding.** Both are cwriter's; 31379 repeats 31355's `graph_optimize` hook and
   test-backend-ops whole-graph perf mode line for line, so C70 adds only its own parts.
-- **C62's evidence is from another die.** The PR's validation names `dg2_g11` (ACM-G11, the A380 / A310);
-  the A770 is ACM-G10. The block it lifts guarded against wrong results that the PR traces to a Linux IGC
-  regression fixed in IGC 2.40.
+- **C62's test card is unclear.** The PR's validation line reads "Arc A770 / dg2_g11", but `dg2_g11` is
+  ACM-G11 (the A380 / A310) and the A770 is ACM-G10, so the card name or the label is wrong. The block it
+  lifts guarded against wrong results that the PR traces to a Linux IGC regression fixed in IGC 2.40.
+- **Draft check:** all four draft heads (31574, 31379, 31313, 31428) were re-fetched unchanged and still
+  open drafts; a line-by-line comparison of each PR diff with its candidate found nothing missing beyond
+  the documented C75 dedup (candidates README, "Draft PR check").
 
 Verification so far:
 
