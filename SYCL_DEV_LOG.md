@@ -205,13 +205,33 @@ Verification so far:
 
 - **Apply / unapply:** on a clean `fac3a894` worktree the stack (40 patches), the candidates and the
   Vulkan stack apply in script order with plain `git apply`, no three-way fallback, 57 patches in all.
-  Vulkan, candidates and stack `unapply.sh` return the tracked and untracked tree to upstream (run before
-  C76 was added; C76 reverses on its own).
+  Vulkan, candidates and stack `unapply.sh` reverse all 57 and return the tracked and untracked tree to
+  upstream (the build directory aside).
+- **Vulkan build:** GCC 13 build of the same applied tree with `GGML_VULKAN=ON` and tests: 792 targets, no
+  warnings; `ctest -L main -LE model` 16/18, the two failures being `test-download-model` (no network)
+  and `test-thread-safety`, which depends on it. No Vulkan device here, so no Vulkan op ran.
 - **`acm-g10` AOT** (real device flags, `-fsycl-device-code-split=per_kernel`): `lightning-indexer.cpp`
   (C75 + C76) 198 DPAS, no spill; `gated_delta_net.cpp` (C70) 20 kernels, no spill; `fattn-mkl.cpp`
   (31536, 31542) 11 kernels, no spill; `dmmv.cpp` (0002, 0008 re-anchored) 53 kernels, no spill.
-- **CPU OpenCL device:** the `icpx` build of the stack with the test hooks and the candidates that do not
-  touch CMake (all but C20 / C21) was still linking at this commit; results follow in the next entry.
+- **CPU OpenCL device** (`icpx` 2026.2 build of the stack, the test hooks, and every candidate but C20 / C21,
+  whose CMake change conflicts with the hooks; `tools/cpu-device-test/run.sh`):
+
+  | Check | Result |
+  |---|---|
+  | `FLASH_ATTN_EXT` mask broadcast over heads and batches (31536) | 4/4; `GGML_SYCL_MKL_FA_DEBUG=1` shows all four on the oneMKL kernel |
+  | `FLASH_ATTN_EXT` gpt-oss / Flint sinks, f16 and q8_0 KV, kv 1024 / 16384, 32 / 512 queries (31542) | 16/16; the kv 1024 cases dispatch to oneMKL FA |
+  | `GATED_DELTA_NET` | 43/43 |
+  | `GATED_DELTA_NET_GATHER` (C70), gather on / `GGML_SYCL_GDN_STATE_GATHER=0` | 19/19 / 19/19 |
+  | `LIGHTNING_INDEXER` (C75 vector kernel, `GGML_SYCL_LIGHTNING_INDEXER=1`, XMX types off), f32 and f16 keys | 70/70 (4-64 heads, 1-512 tokens, key tails, 1-4 streams, aligned strided views) |
+  | `MUL_MAT` one column, DMMV types with `GGML_SYCL_PRIORITIZE_DMMV=1` (0002, 0008) | 177/209; the 32 failures are the known f16 `k_v` batched cases (see "Quant-type gap fill, part 2"), which take `ggml_sycl_mul_mat_batched_sycl` |
+  | the same with the reorder forced on | 65/65 |
+  | `SSM_CONV` (31355) | 60/60 |
+  | `SET_ROWS`, no bf16 | 471/471 |
+
+  Two crashes are in the CPU OpenCL runtime's own compiler, not in these patches: upstream's unchanged
+  `lightning_indexer_f32_sycl` (the default indexer, and C75's fallback for bf16 and quantized keys and
+  unaligned views) dies in the JIT on its first launch, and so does the D=64 TILE FA kernel at 32 queries,
+  with or without sinks or GQA (`GGML_SYCL_ENABLE_MKL_FA=0`). bf16 kernels crash the CPU device as before.
 
 ### Measuring on the A770 (not done here: no Intel GPU)
 

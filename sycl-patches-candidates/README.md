@@ -165,6 +165,9 @@ Added 2026-11-03, `acm-g10` AOT with the real device flags (`-fsycl-device-code-
   vector kernel spilled 1632-1760 B per thread at 128 registers; with C76 it gets 256 on ACM and does
   not spill (`numGRF=256`).
 - C70 `gated_delta_net.cpp`: 20 kernels, none spill. C62 changes only a host-side gate.
+- On the CPU OpenCL device (`../sycl-patches-extracted/tools/cpu-device-test/`, every candidate but
+  C20 / C21): `GATED_DELTA_NET_GATHER` 19/19 with C70's gather on and off, and C75's vector kernel
+  70/70 on f32 / f16 keys. C75's XMX kernels and C62's oneDNN path cannot run there.
 
 What was not checked: any number on real hardware. Apart from C60's emulation,
 no kernel here ran: the backend does not run on the CPU OpenCL device (see

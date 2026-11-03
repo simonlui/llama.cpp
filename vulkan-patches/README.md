@@ -130,6 +130,16 @@ The pre-refresh snapshot and retired patches are under
 `../patch-backups/upstream-refresh-20261010/` and
 `../patch-backups/upstream-refresh-20261003/`.
 
+### Refresh apply/unapply and build check (2026-11-03)
+
+At upstream `fac3a894`, with the refreshed PR 29357, the Vulkan stack applied
+with plain `git apply` on top of the SYCL stack and its candidates (57 patches
+in all) and reversed first; the tree returned exactly to upstream. GCC 13,
+`GGML_VULKAN=ON`, tests on: 792 targets built without warnings, and
+`ctest -L main -LE model` passed 16/18 (`test-download-model` has no network,
+`test-thread-safety` depends on it). No Vulkan device was available, so the
+Xe FA path is still unexercised here.
+
 ### Refresh apply/unapply and build check (2026-11-01)
 
 The Vulkan stack (PR 29357 plus three local patches) applied with plain
