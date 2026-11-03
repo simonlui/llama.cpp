@@ -27,7 +27,9 @@ bash sycl-patches-extracted/tools/cpu-device-test/run.sh build-cpu -o MUL_MAT -p
 26 minutes for the first build on 4 cores). `run.sh` turns off the ESIMD, DPAS, oneDNN and
 `joint_matrix` paths, which the CPU device cannot build. Set `GGML_SYCL_TEST_FORCE_REORDER=1` to test
 the reorder layouts. `hooks.patch` applies on the stack (local patches included) without the
-candidates, whose CMake change it conflicts with. Revert it before unapplying the stack.
+candidates, whose CMake change it conflicts with. Besides the reorder switch it sets the device's
+`nsm` to 1 when it would be 0 (upstream divides the compute-unit count by 16, and the FA launcher divides
+by `nsm`), so TILE flash attention runs on a CPU with fewer than 16 compute units. Revert it before unapplying the stack.
 
 `test-backend-ops` builds fresh weights for every case, so it only sees a reorder on the call that
 installs it. `reorder-reuse.cpp` covers the later readers of a reordered weight. Per type, a one-token

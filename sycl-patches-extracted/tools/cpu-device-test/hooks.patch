@@ -40,10 +40,14 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 index 5a32b657..7f83181b 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -255,7 +255,8 @@ static ggml_sycl_device_info ggml_sycl_init() {
+@@ -255,7 +255,12 @@ static ggml_sycl_device_info ggml_sycl_init() {
          info.devices[i].cc =
              100 * prop.get_major_version() + 10 * prop.get_minor_version();
          info.devices[i].nsm = prop.get_max_compute_units() / 16; //16: Number of Xe Cores
++        if (info.devices[i].nsm == 0 && getenv("GGML_SYCL_TEST_CPU_DEVICE") != nullptr) {
++            // scratch CPU-device test hook: under 16 compute units nsm is 0 and the FA launcher divides by it
++            info.devices[i].nsm = 1;
++        }
 -        info.devices[i].opt_feature.reorder = device.ext_oneapi_architecture_is(syclex::arch_category::intel_gpu);
 +        info.devices[i].opt_feature.reorder = device.ext_oneapi_architecture_is(syclex::arch_category::intel_gpu) ||
 +            getenv("GGML_SYCL_TEST_FORCE_REORDER") != nullptr; // scratch CPU-device test hook

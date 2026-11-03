@@ -228,10 +228,17 @@ Verification so far:
   | `SSM_CONV` (31355) | 60/60 |
   | `SET_ROWS`, no bf16 | 471/471 |
 
-  Two crashes are in the CPU OpenCL runtime's own compiler, not in these patches: upstream's unchanged
-  `lightning_indexer_f32_sycl` (the default indexer, and C75's fallback for bf16 and quantized keys and
-  unaligned views) dies in the JIT on its first launch, and so does the D=64 TILE FA kernel at 32 queries,
-  with or without sinks or GQA (`GGML_SYCL_ENABLE_MKL_FA=0`). bf16 kernels crash the CPU device as before.
+  Two crashes come from upstream code on this test device, not from these patches (the CPU runtime's
+  "PLEASE submit a bug report" banner is its signal handler, printed for any fatal signal):
+  - TILE flash attention (`GGML_SYCL_ENABLE_MKL_FA=0`, or any shape oneMKL FA does not take) stopped with
+    SIGFPE in `launch_fattn`: upstream sets `nsm = max_compute_units / 16`, which is 0 on this 4-unit CPU
+    device (32 on an A770), and the stream-k setup takes `ntiles_total % 0`. `hooks.patch` now sets `nsm`
+    to 1 under `GGML_SYCL_TEST_CPU_DEVICE`, so TILE runs here.
+  - Upstream's unchanged `lightning_indexer_f32_sycl` (the default indexer, and C75's fallback for bf16
+    and quantized keys and unaligned views) segfaults on its first launch when run normally, with or
+    without ASLR, and passes 5/5 under gdb: timing-dependent inside the CPU runtime. Not chased further.
+
+  bf16 kernels crash the CPU device as before.
 
 ### Measuring on the A770 (not done here: no Intel GPU)
 
