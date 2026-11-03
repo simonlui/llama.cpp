@@ -89,7 +89,9 @@ oneAPI came from conda-forge into `/opt/oneapi` on a GPU-less cloud box:
     (`GGML_SYCL_MMID_ESIMD=1`, K split 1) does not spill. Only the bit-exact
     mode 2 (K split 4) spills 3-4 KB.
   - An AOT build with `-ze-opt-enable-auto-large-GRF-mode` (what C20's CMake
-    passes) gets 128 GRF for every DG2 kernel and spills 3.7-9 KB. A JIT build
+    passes) gets 128 GRF for every DG2 kernel and spills 3.7-9 KB. Plain
+    `-device acm-g10` does the same: the AOT path drops `grf_size` on ESIMD
+    kernels (SPMD kernels keep it; see the GRF audit below). A JIT build
     should honor the property (per C20's notes; unverified without a GPU), so
     measure C21 with a JIT build.
 - `__SYCL_TARGET_INTEL_GPU_ACM_G10__` is not defined under `spir64_gen
@@ -153,6 +155,142 @@ oneAPI came from conda-forge into `/opt/oneapi` on a GPU-less cloud box:
   floating point exception, likely from GPU-only device properties. The only
   numeric test of SYCL kernels here is C60's standalone emulation above.
 
+## Remaining fusions, MMVQ add epilogue and the register-file audit (2026-11-03, `ZZ-LOCAL-0015` to `ZZ-LOCAL-0017`)
+
+The rest of the survey's list, ported where it pays on an A770 and declined where it does not.
+
+| Item | Outcome | Why |
+|---|---|---|
+| Logit softcap (SCALE + TANH + SCALE), squared ReLU (RELU + SQR) | 0015 | final-logit softcap (Gemma 2, Grok) saves 2 launches; relu² (Nemotron, Nemotron-H, Arcee, PLM, Jais2) 1 per FFN |
+| Snake activation (MUL, SIN, SQR, MUL, ADD) | 0015 | the TTS audio decoders in mtmd (Qwen3-TTS): 4 launches per use |
+| SCALE + SIGMOID + SCALE into DSV4_HC_POST | 0015 | qwen4exp's hc_combine (CUDA's pattern): the hc_post kernel applies the gate, 3 launches saved per block |
+| SSM_SCAN + snapshot CPY into the cache | 0015 | mamba-2 / hybrid models: one copy of the full state per layer and token |
+| topk-moe sqrt(softplus) gating and expert groups | 0015 | DeepSeek-V4's gate and DeepSeek-V3's group masking (14 more ops) left the whole router unfused |
+| MUL_MAT + ADD in the one-column MMVQ store | 0016 | i-quants, MXFP4 and the reorder types without DMMV still paid an in-place ADD after 0013 |
+| 256-register XMX dequant GEMM tiles | 0017, opt-in | answers whether 0010's 128-register tile is the right side of the trade; see below |
+| Shared-expert fusion | not ported | CUDA's matcher needs the shared expert at the routed experts' type and shape; Qwen2-MoE and DeepSeek-V2-Lite size it differently, a quant mix can give it another type, and it saves one launch |
+| MoE gate + up of different types | not ported | CUDA does not fuse it either; the MoE MMVQ is templated on one type and a mixed pair would need a second weight stream through every launcher |
+| XMX int8 MMQ for prompt batches | not reachable | extracted 0016's MMQ reads the plain block layout, and the reorder (on by default) leaves the weights in SoA; enabling it would misread reordered weights. Needs SoA stages first |
+| Fused dequant GEMM for dense k-quant / q8_0 batches | not enabled | the dense kernel decodes A again for every 32 columns; PR 30156 keeps these types on dequantize + oneDNN for that reason (`fg_plain_ok`) |
+| Multi-stream Q / K / V concurrency | not ported | opt-in on CUDA (`GGML_CUDA_GRAPH_OPT`), needs per-stream pools and events in the SYCL graph path; nothing here can measure the gain |
+
+How the new pieces work:
+
+- **0015 elementwise:** `fused-elementwise.cpp` holds the softcap (F32), relu² (F32, F16) and snake (F32, F16,
+  BF16 activations, F32 a and 1/b) kernels, one work-item per element. The snake matcher is CUDA's: x [T, C],
+  a and 1/b broadcast per channel. The softcap folds both scales; relu² is one `max(x, 0)^2`.
+- **0015 hc_post gate:** `dsv4_hc_post_f32_sycl<has_comb, gated>` computes `gate_out * sigmoid(gate_in * post)`
+  where it read `post`, so the scaled sigmoid never exists as a tensor. The matcher checks the edges (the
+  sigmoid feeds DSV4_HC_POST's post operand, the scales have no bias, F32, same shape).
+- **0015 SSM_SCAN cache:** CUDA's predicate (one sequence, d_state 128 / 256, contiguous A, the CPY's
+  destination a view of the cache with the scan's own snapshot layout). The scan writes the final state and
+  the rollback snapshots at `cache + slot * slot_stride` instead of its dst tail, and the CPY is skipped.
+- **0015 topk-moe:** `topk_moe_cuda`'s sqrt(softplus) gate and group masking: each group's score is the sum
+  of its best two experts (sub-group shuffles), the `n_group_used` best groups survive, the others are masked
+  to -inf before the expert argmax, on the biased selection weights when there is a bias. Up to `WARP_SIZE`
+  groups, as on CUDA. The 14-op group pattern is CUDA's table. The scoring is one pass over a lane's experts
+  (a group is whole elements or an aligned block of lanes, since the counts are powers of two), and the
+  masking is a template parameter of the kernel, so routers without groups run the old instantiations. The
+  grouped ones at 256 / 512 experts take the 256-register file on Intel GPUs with XMX (see the audit).
+- **0016:** the one-column MMVQ launchers are specializations of two kernels (`mul_mat_vec_q` and
+  `mul_mat_vec_q_reorder`); both take an optional addend now. With an ADD to fold, the one-column dispatch
+  launches them directly with each type's parameters and reports the ADD done; types with their own tuned
+  launcher (reorder q4_K / q5_K, the q8_0 wide dot product, the XMX MMVQ) keep 0013's in-place ADD.
+- **0017:** see "When the 256-register file pays" below.
+
+Verification (CPU OpenCL device, `tools/cpu-device-test`, icpx 2026.2, `GGML_SYCL_DEBUG=1` to see each fusion run):
+
+| Test | Result |
+|---|---|
+| `SOFTCAP` / `RELU_SQR` / `SNAKE_FUSE` (no bf16) | 1/1, 4/4, 16/16; fused 1, 4 and 10 times |
+| `DSV4_HC_POST` | 9/9; the 3 gated cases fused |
+| `SSM_SCAN_CACHE_FUSION`, `SSM_SCAN` | 7/7 (all fused), 12/12 |
+| `TOPK_MOE`, power-of-two expert counts | 384/384 on the final build, 278 fused, 96 of them with expert groups: sqrt(softplus) and the 4 / 8 / 16-group cases all fuse (sqrt(softplus) with groups too); 32 groups is above `WARP_SIZE` and runs unfused. An earlier run failed one unfused 32-group case, the tie-break flake seen with 0011; it passed 8 reruns |
+| `MUL_MAT_VEC_FUSION` | 1818/1818 (the upstream cases plus 64 scratch MUL_MAT + ADD cases for q5_0 / q5_1, the k-quants, IQ1..IQ4 and MXFP4 at 32 / 48 rows, k = 256 / 768, in the test tree only); 86 ADDs folded into the store. Every IQ1 / IQ2 / IQ3 / IQ4, q5_0 / q5_1 and MXFP4 scratch case folds; the k-quants take the CPU device's non-ESIMD DMMV, which keeps the in-place ADD (the A770's ESIMD DMMV folds them since 0013) |
+| `MUL_MAT_VEC_FUSION`, reorder forced | 1818/1818, 84 folds: the reorder q2_K / q3_K / q6_K, IQ3 and IQ4_NL weights now fold through the reorder kernel; reorder q4_K / q5_K and q8_0 (wide dot product) keep the in-place ADD by design |
+| `MUL_MAT`, one column, no bf16 | 448/480 with and without the reorder; the 32 failures are the f16 `k_v` cases listed under 0011 to 0014, unchanged |
+
+`acm-g10` AOT, the stack's flags and its per-kernel device-code split (the earlier checks in this log linked
+the whole file as one module, which gave the same register allocation for `mmvq.cpp` and `fused-gemm.cpp`
+but more spills in `topk-moe.cpp`): `fused-elementwise.cpp` (10 kernels), `dsv4-hc.cpp` (11) and `ssm_scan.cpp` (7)
+do not spill. `mmvq.cpp` goes from 649 to 678 kernels; the 29 new add-epilogue kernels do not spill and the
+file's spill total is unchanged (the ESIMD XMX MMVQ and the paired gate + up variants 0010 keeps off on DG2).
+`topk-moe.cpp`: the instantiations without groups are no worse than the old file (512 experts: 0 / 96 B
+without / with a bias, before 352 / 288 B). The expert-group instantiations spill at 128 registers: 1.4 / 2.4 KB
+with / without a bias at 256 experts, 7.9 / 9.1 KB at 512. Rewriting the group scoring as one pass did not
+change that, so the masking got its own instantiation instead of taxing every router, and those
+instantiations take 256 registers on Intel GPUs with XMX: no spill at 256 experts, 1.0 / 1.2 KB at 512.
+`fused-gemm.cpp`: 178 kernels, none spills, the 72 large-register ones at 256. Every new or changed kernel
+is `numGRF=128` except those that ask for 256.
+
+The patches apply in order with plain `git apply`, all candidates apply on top (their `fused-gemm.cpp`,
+`mmvq.cpp`, `ggml-sycl.cpp` and `fattn-gqa-dec.cpp` pass host and device syntax checks), and the round trip
+with the Vulkan stack returns a clean tree. Not verified: speed on the A770, and the large-register kernels
+(0017's tile, the grouped router's 256-register variant, C40's) at run time: none runs on the CPU device.
+
+### When the 256-register file pays (Xe-HPG)
+
+An Xe-HPG EU holds 8 hardware threads of 128 32-byte registers (4 KB each). The 256-register mode gives a
+thread 8 KB and the EU 4 threads; the register file and the EU's ALU and XMX rate do not change. What 128
+registers buy is latency hiding: while one thread waits on a load the EU issues from another, so 8 threads
+cover memory latency that 4 cannot unless each thread keeps more loads in flight itself.
+
+So 256 registers win in two cases:
+
+1. The kernel spills at 128 values that stay live across its main loop (accumulators, a register tile,
+   a row slice). Each fill is then a scratch read per iteration, memory traffic on top of the kernel's
+   own, which costs more than the latency hiding the lost threads would have bought.
+2. The kernel is compute-bound and more registers buy a bigger register tile. A larger GEMM / attention
+   tile reuses each loaded A or B fragment across more DPAS, raising arithmetic intensity, and 4 threads
+   with that much independent DPAS work keep the XMX busy.
+
+128 registers win everywhere else, which is every decode kernel: a one-token mat-vec reads each weight
+once, its intensity is fixed by the format, and its speed is the number of loads in flight. Elementwise,
+norm and rope kernels are the same. The exception the other way is a kernel too small to fill the EUs:
+with no occupancy to lose, it takes 256 registers whenever that saves a spill (0015's grouped router).
+
+Audit of the stack against that rule (acm-g10 AOT with the stack's flags, IGC dumps):
+
+| Kernels | Registers | Verdict |
+|---|---|---|
+| MMVQ / DMMV / MoE MMVQ (the SPMD kernels of `mmvq.cpp`), elementwise, rope, norm, topk-moe without groups | 128; no spills except 0010's paired gate + up variants, which DG2 does not run | right: memory-bound |
+| 0015: topk-moe with expert groups, 256 / 512 experts | 256 on Intel GPUs with XMX; no spill at 256 experts, 1.0 / 1.2 KB at 512 (7.9 / 9.1 KB at 128) | right: a router runs one sub-group per token, so there is no occupancy to lose, and its spills sat in its only work |
+| 0010: reorder gate + up row pairing on DG2 | off, 128, no spills | right: pairing only added registers to a memory-bound kernel |
+| 0010: XMX dequant GEMM at sub-group 8 (prompt batches) | 128, 8-row tile, no spills | defensible, unmeasured: a compute-bound kernel where 256 registers would let the 16-row tile halve the B loads per DPAS. 0017 builds that tile spill-free at 256 as an opt-in, so the A770 can decide |
+| fattn-vec, D >= 512 | `grf_size_automatic` | upstream's choice, not checked here |
+| candidate C60 fattn-dpas (SPMD) | `grf_size<256>`, honoured in AOT | right: prefill attention is compute-bound |
+| candidate C40 D = 256 SPMD decode kernels | were 128 with 0.7 to 1.7 KB of spills; now 256 on Intel GPUs with XMX, no spills | fixed here: a lane's q, accumulator and K / V slices (about 128 registers at D = 256) stay live across the KV loop, so whatever spills is reloaded per KV row |
+| candidate C21 ESIMD MoE GEMM, upstream ESIMD XMX MMVQ (Xe2 gate) | ask for 256, get 128 in AOT, spill 3.7 to 12.7 KB | wrong in an AOT build, through no fault of the request |
+
+The last row is a toolchain finding. oneAPI 2026.2's AOT path keeps `grf_size<256>` for SPMD kernels (a
+minimal kernel gets `numGRF=256`) and drops it for ESIMD ones: the same minimal kernel in ESIMD gets 128
+registers and spills 4.9 KB, and the VC back end receives only `-vc-codegen`.
+`-ftarget-register-alloc-mode` would work but applies to every kernel of the target, decode included, so it
+is the wrong tool. Build C21 (and C40's ESIMD path) with JIT to measure them; the XMX MMVQ is not selected
+on DG2.
+
+A request for 256 registers is not free of side effects either: the runtime turns `grf_size<256>` into the
+IGC option `-ze-opt-large-register-file`, and the CPU OpenCL device fails the whole build on it
+("Unrecognized build options"). That device also reports `ext_intel_matrix` (AMX), so C40 and 0015's
+grouped router gate their 256-register kernels on `is_gpu() && ext_intel_matrix`, two kernel types chosen
+at run time (one lambda launched with two property sets is two kernels of one name, which the compiler
+rejects). The stack's other
+256-register kernels (0017's tile, fattn-dpas, C60) never run on the CPU device.
+
+0017 makes the GEMM decision measurable instead of argued. `GGML_SYCL_XMX_GRF256=1` switches the
+sub-group-8 combinations (f16 and bf16 8x8x16) to the 16-row tile with both k halves unrolled and
+`grf_size<256>`; the shape bit, the B packing and C20 / C21's ESIMD remap are unchanged. On an i-quant or
+MoE model (the types that take the dequant GEMM):
+
+```bash
+GGML_SYCL_XMX_GRF256=1 ./build/bin/llama-bench -m MODEL -p 512 -n 0 -r 3
+```
+```bash
+./build/bin/llama-bench -m MODEL -p 512 -n 0 -r 3
+```
+
+If the first wins, make it the default; if it loses, 0010's trade was right and 0017 can be dropped.
+
 ## Fusions ported from CUDA, Vulkan and Metal (2026-11-03, `ZZ-LOCAL-0011` to `ZZ-LOCAL-0014`)
 
 A survey of the CUDA, Vulkan and Metal backends against the patched SYCL backend found the gap was graph
@@ -186,7 +324,7 @@ How each one works:
   `graph_optimize` keeps the expert results, router weights and scales alive until the sum, so the
   allocator cannot place the sum over them. The topk-moe bias path is `topk_moe_cuda<has_bias>`: selection
   on probs + bias, weights from the probs. CUDA's expert-group masking and sqrt(softplus) gating are not
-  ported; those graphs do not match and run unfused.
+  ported here; those graphs ran unfused until `ZZ-LOCAL-0015`.
 - **0012:** one `ggml_sycl_moe_mmvq_ext` threads three options through both MoE kernels: a token
   dimension in the grid (strides for the q8_1 rows, the dst rows and the ids), a gate weight with a GLU
   epilogue (SWIGLU, GEGLU, SWIGLU_OAI, SWIGLU_CLAMP, the formulas of the standalone GLU kernels), and
@@ -237,8 +375,9 @@ four patches passes a device-side syntax check (`-fsycl-device-only -fsyntax-onl
 returns a clean tree.
 
 Not covered: the MoE gate + up fusion for gate and up of different types; the MUL_MAT + ADD epilogue in
-the MMVQ kernels (i-quants, 2..8 columns), whose many per-type launchers would need it one by one;
-CUDA's shared-expert fusion; the opt-in multi-stream Q/K/V concurrency (`GGML_CUDA_GRAPH_OPT=1`).
+the MMVQ kernels (i-quants, 2..8 columns), whose many per-type launchers would need it one by one
+(`ZZ-LOCAL-0016` adds it for one column); CUDA's shared-expert fusion; the opt-in multi-stream Q/K/V
+concurrency (`GGML_CUDA_GRAPH_OPT=1`). The section above settles each of these.
 Prompt processing is unchanged. Dense k-quant / q8_0 batches still dequantize every weight to f16 before
 oneDNN, since `ggml_sycl_supports_mmq()` keeps 0016's int8 XMX MMQ unreachable and the fused dequant GEMM
 stops at 64 columns.
@@ -259,8 +398,9 @@ MUL_MAT_VEC_FUSION` on the card, since the ESIMD epilogue only runs there.
 ## DG2 register spills (2026-11-02, `ZZ-LOCAL-0010`)
 
 The part-2 AOT check below found spills on `acm-g10` in kernels the A770 runs. Every number here is
-from `acm-g10` AOT builds (oneAPI 2026.2's IGC, `-ze-opt-enable-auto-large-GRF-mode` as in the CMake
-AOT path) with IGC shader dumps, `//.spill size` per kernel.
+from `acm-g10` AOT builds (oneAPI 2026.2's IGC, with C20's `-ze-opt-enable-auto-large-GRF-mode`; the
+stack's own `-device acm-g10` gives the same register allocation, re-checked 2026-11-03) with IGC
+shader dumps, `//.spill size` per kernel.
 
 - **XMX dequant GEMM** (fused for dense i-quant prompt batches, grouped for MoE): all 72 kernels
   spilled, 1.9 to 3.5 KB per thread, the block and SoA layouts alike (191 KB in total). The sub-group-8
@@ -352,7 +492,7 @@ Closes the gaps the first pass left open, again as local patches (`ZZ-LOCAL-0005
     MUL_MAT_ID: 47/47 over Q4_0, Q8_0, Q2_K..Q6_K, IQ3_XXS, IQ3_S, IQ4_NL (Q2_K / Q4_K / Q5_K GET_ROWS
     skipped, gated by 0014). The device-program cache shows `reorder_qw_planar_moe` built for IQ4_NL,
     IQ3_XXS and IQ3_S, so the MoE cases ran on the new layout.
-- **DG2 AOT (`acm-g10`, `-ze-opt-enable-auto-large-GRF-mode`).** `mmvq.cpp`, `fused-gemm.cpp`,
+- **DG2 AOT (`acm-g10`, with and without `-ze-opt-enable-auto-large-GRF-mode`).** `mmvq.cpp`, `fused-gemm.cpp`,
   `convert.cpp`, `getrows.cpp`, `dmmv.cpp` and `cpy.cpp` build. None of the 38 new MMVQ kernels spills
   (27 ternary, 9 IQ4_NL reorder, 2 IQ3 MoE reorder; all at 128 GRF), nor do the 36 new dequantize,
   GET_ROWS, DMMV and CPY kernels. The fused XMX dequant GEMM spills on DG2 in every variant, the existing

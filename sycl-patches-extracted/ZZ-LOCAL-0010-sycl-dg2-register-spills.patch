@@ -6,10 +6,11 @@ Local fix. An acm-g10 AOT build showed register spills in kernels the A770 runs:
   and q8_0 MoE): all 72 kernels, 1.9 to 3.5 KB per thread, the block and the reorder layout alike.
   Xe-HPG's sub-group-8 tiles are 8x8x16; a sub-group owned 16 rows x 32 columns, i.e. 8 f32
   accumulator tiles (64 of its 128 32-byte registers) plus four B tiles (32) and the A tile (8),
-  before any addressing or dequantization. IGC's auto large-GRF mode (the AOT build's
-  -ze-opt-enable-auto-large-GRF-mode) does not move these kernels to 256 registers on acm-g10;
-  forcing it (-ze-opt-large-register-file) does make the old tile spill-free, at half the threads
-  per EU, which also halves the hiding of the A and B load latency. Two changes, both for
+  before any addressing or dequantization. Neither the stack's AOT build (-device acm-g10) nor IGC's
+  auto large-GRF mode (-ze-opt-enable-auto-large-GRF-mode, which C20's CMake adds) moves these
+  kernels to 256 registers on acm-g10; forcing it (-ze-opt-large-register-file) does make the old
+  tile spill-free, at half the threads per EU, which also halves the hiding of the A and B load
+  latency (ZZ-LOCAL-0017 brings that tile back as an opt-in, grf_size<256>). Two changes, both for
   sub-group 8 only: a sub-group owns 8 rows (4 accumulator tiles), and the loop over the two k
   halves of a step is not unrolled, since unrolled IGC loads both halves' B tiles up front. Either
   alone still spilled (8 rows unrolled: 68 KB in total; 16 rows not unrolled: 121 KB). Together

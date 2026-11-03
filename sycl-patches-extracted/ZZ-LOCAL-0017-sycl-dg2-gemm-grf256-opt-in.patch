@@ -1,0 +1,139 @@
+Subject: [PATCH] sycl: opt-in 256-register tile for the DG2 XMX dequant GEMM
+
+ZZ-LOCAL-0010 fit the sub-group-8 GEMM tile into 128 registers by giving a sub-group 8 rows instead of
+16 and not unrolling the two k halves. That keeps 8 threads per EU but issues twice the B-tile loads
+per DPAS. The other side of the trade is the 16-row tile with the 256-register file, 4 threads per EU.
+GGML_SYCL_XMX_GRF256=1 selects it: the sub-group-8 combinations (f16 and bf16 8x8x16) then launch the
+16-row, unrolled tile with grf_size<256>. The shape, the combination's bit in
+GGML_SYCL_XMX_GATHER_SHAPES and the B packing are unchanged, so C20 / C21's ESIMD remap sees the same
+combination either way. An acm-g10 AOT build gives all 72 of these kernels 256 registers (the property
+is honoured for SPMD kernels; ESIMD kernels lose it in AOT) and none spills. Off by default: nothing
+changes unless the variable is set, and an A770 A/B decides which side wins.
+
+diff --git a/ggml/src/ggml-sycl/fused-gemm.cpp b/ggml/src/ggml-sycl/fused-gemm.cpp
+index ce5b818a..44927783 100644
+--- a/ggml/src/ggml-sycl/fused-gemm.cpp
++++ b/ggml/src/ggml-sycl/fused-gemm.cpp
+@@ -84,10 +84,13 @@ template <> struct fg_elem<mx::precision::tf32> {
+ // the tiling built on it. A sub-group owns SG_ROWS rows of A (at least 16, 8 at sub-group 8) and BN
+ // (at least 32) columns of B. A and B may differ: the device lists the pairs it supports.
+ // Sub-group 8 is Xe-HPG (Arc A-series). IGC builds these kernels with 128 registers of 32 bytes there
+-// (auto large-GRF mode does not switch them, and 256 would halve the threads per EU), and 16 x 32
+-// tiles of 8x8 f32 accumulators, their B tiles and the A stage needed more: every kernel spilled 1.9
+-// to 3.5 KB per thread. 8 rows keep BN, so each dequantized A row still serves 32 columns.
+-template <typename TA, typename TB, int TM_, int TN_, int TK_, int SG_> struct fg_combo {
++// unless a kernel asks for 256 (which halves the threads per EU), and 16 x 32 tiles of 8x8 f32
++// accumulators, their B tiles and the A stage needed more: every kernel spilled 1.9 to 3.5 KB per
++// thread. 8 rows keep BN, so each dequantized A row still serves 32 columns. LG_ is the other trade:
++// the 16-row tile with the 256-register file requested (grf_size<256>, which AOT builds honor for these
++// SPMD kernels), twice the B reuse at half the threads. GGML_SYCL_XMX_GRF256=1 selects it for the
++// sub-group-8 combinations (fg_call_combo) until the A770 shows which is faster.
++template <typename TA, typename TB, int TM_, int TN_, int TK_, int SG_, bool LG_ = false> struct fg_combo {
+     using ta  = TA;
+     using tb  = TB;
+     using EA  = fg_elem<TA>;
+@@ -98,8 +101,9 @@ template <typename TA, typename TB, int TM_, int TN_, int TK_, int SG_> struct f
+     static constexpr int TN = TN_;
+     static constexpr int TK = TK_;
+     static constexpr int SG = SG_;
++    static constexpr bool LG = LG_;                   // 256 registers per thread requested
+     static constexpr int VNNI    = 4 / sizeof(tsb);  // K rows of B packed in one 32-bit word
+-    static constexpr int SG_ROWS = TM > 16 ? TM : (SG == 8 ? 8 : 16);
++    static constexpr int SG_ROWS = TM > 16 ? TM : (SG == 8 && !LG ? 8 : 16);
+     static constexpr int RPL     = SG_ROWS / SG;     // A rows one lane decodes per k step
+     static constexpr int MT      = SG_ROWS / TM;
+     static constexpr int BN      = TN > 32 ? TN : 32;
+@@ -132,8 +136,28 @@ template <int SG> static constexpr bool fg_listed() {
+ #endif
+ }
+ 
++// GGML_SYCL_XMX_GRF256=1: the sub-group-8 combinations run their 16-row tile with the 256-register file
++// (fg_combo's LG) instead of the 8-row tile at 128 registers. Same shape, so the combination's bit, the
++// B packing and the device's matrix_combinations entry are unchanged.
++static bool fg_grf256() {
++    static const bool on = [] {
++        const bool v = ggml_sycl_get_env("GGML_SYCL_XMX_GRF256", 0) != 0;
++        if (v) {
++            GGML_LOG_INFO("%s: sub-group-8 XMX dequant GEMM uses the 16-row tile with 256 registers\n", __func__);
++        }
++        return v;
++    }();
++    return on;
++}
++
+ template <typename S, typename F> static void fg_call_combo(F && f) {
+     if constexpr (fg_listed<S::SG>()) {
++        if constexpr (S::SG == 8 && !S::LG) {
++            if (fg_grf256()) {
++                f(fg_combo<typename S::ta, typename S::tb, S::TM, S::TN, S::TK, S::SG, true>{});
++                return;
++            }
++        }
+         f(S{});
+     }
+ }
+@@ -214,7 +238,7 @@ static std::string fg_combo_name(int idx) {
+         using S = decltype(s);
+         name = std::string(fg_type_name<typename S::ta>()) + "x" + fg_type_name<typename S::tb>() + " " +
+                std::to_string(S::TM) + "x" + std::to_string(S::TN) + "x" + std::to_string(S::TK) + " sg" +
+-               std::to_string(S::SG);
++               std::to_string(S::SG) + (S::LG ? " grf256" : "");
+     });
+     return name;
+ }
+@@ -947,7 +971,7 @@ static void fused_dequant_gemm_tile(
+ 
+             // at sub-group 8, unrolling the two k halves has IGC load both halves' B tiles up front,
+             // which spills even the 8-row tile
+-#pragma unroll(S::SG == 8 ? 1 : FG_BK / S::TK)
++#pragma unroll(S::SG == 8 && !S::LG ? 1 : FG_BK / S::TK)
+             for (int kt = 0; kt < FG_BK / S::TK; ++kt) {
+                 const int kq0 = (kb * FG_BK + kt * S::TK) / S::VNNI;
+                 mx::joint_matrix<sycl::sub_group, TB, mx::use::b, S::TK, S::TN, S::b_layout> sub_b[S::NT];
+@@ -1006,6 +1030,28 @@ static void fused_dequant_gemm_tile(
+     }
+ }
+ 
++// a tile kernel launch, asking for the 256-register file for the combinations that want it. The request is a
++// kernel property, so the sub-group size goes with it as one: a kernel takes attributes or properties.
++template <typename S, typename K> struct fg_lg_kernel {
++    K k;
++
++    void operator()(sycl::nd_item<2> item) const { k(item); }
++
++    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
++        return sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256>,
++                                                            sycl::ext::oneapi::experimental::sub_group_size<S::SG> };
++    }
++};
++
++template <typename S, typename K>
++static void fg_parallel_for(sycl::handler & cgh, const sycl::nd_range<2> & range, K && kernel) {
++    if constexpr (S::LG) {
++        cgh.parallel_for(range, fg_lg_kernel<S, std::decay_t<K>>{ kernel });
++    } else {
++        cgh.parallel_for(range, kernel);
++    }
++}
++
+ template <typename S, typename block_q_t, bool reordered = false>
+ static void fused_dequant_gemm_launch(const void * src0, const typename S::tsb * packed, float * dst, const int M,
+                                       const int N, const int Npad, const int K, const int ldd,
+@@ -1013,7 +1059,7 @@ static void fused_dequant_gemm_launch(const void * src0, const typename S::tsb *
+     stream->submit([&](sycl::handler & cgh) {
+         sycl::local_accessor<typename S::tsa, 1> tile_a(FG_KSPLIT * S::SG_ROWS * FG_BK, cgh);
+         sycl::local_accessor<float, 1>          tile_c(FG_KSPLIT * S::SG_ROWS * S::BN, cgh);
+-        cgh.parallel_for(
++        fg_parallel_for<S>(cgh,
+             sycl::nd_range<2>(sycl::range<2>(groups_n, groups_m * S::WG_SIZE), sycl::range<2>(1, S::WG_SIZE)),
+             [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(S::SG)]] {
+                 const int n0 = item.get_group(0) * S::BN;
+@@ -1032,7 +1078,7 @@ static void grouped_dequant_gemm_launch(const char * src0_dd, const size_t exper
+     stream->submit([&](sycl::handler & cgh) {
+         sycl::local_accessor<typename S::tsa, 1> tile_a(FG_KSPLIT * S::SG_ROWS * FG_BK, cgh);
+         sycl::local_accessor<float, 1>          tile_c(FG_KSPLIT * S::SG_ROWS * S::BN, cgh);
+-        cgh.parallel_for(
++        fg_parallel_for<S>(cgh,
+             sycl::nd_range<2>(sycl::range<2>(n_tiles, groups_m * S::WG_SIZE), sycl::range<2>(1, S::WG_SIZE)),
+             [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(S::SG)]] {
+                 const int               t    = item.get_group(0);

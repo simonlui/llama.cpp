@@ -1,0 +1,177 @@
+Subject: [PATCH] sycl: fold the residual / bias ADD into the one-column MMVQ store
+
+Extends ZZ-LOCAL-0013's MUL_MAT + ADD fusion to the MMVQ path, which one-token decode of the i-quants,
+MXFP4 and the reordered types without a DMMV kernel takes. The per-type one-column launchers specialize
+two generic kernels (the i-quant ones are the generic kernel written out with each type's qi / vdr);
+those two take the addend now, and with an ADD to fold the one-column dispatch launches them directly
+for the plain types (q4_0 .. q6_K, q8_0, mxfp4, the IQ1 / IQ2 / IQ3 / IQ4 types) and the reorder types
+(q4_0, q8_0, mxfp4, q2_K, q3_K, q6_K, IQ3, IQ4_NL). The tuned reorder q4_K / q5_K launchers, the q8_0
+wide dot product, the XMX MMVQ and 2..8 columns keep the separate in-place ADD.
+
+diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+index 807de72e..381ce9b2 100644
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -63,7 +63,8 @@ static constexpr int Q4_K_MMVQ_ROW_PAIR_MIN_NROWS = 6272;
+ 
+ template <typename reorder_vec_dot_q_sycl>
+ static void mul_mat_vec_q_reorder(const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+-                                  const int ncols, const int nrows, const sycl::nd_item<3> & nd_item) {
++                                  const int ncols, const int nrows, const sycl::nd_item<3> & nd_item,
++                                  const float * __restrict__ add = nullptr) {
+     using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
+     using block_traits = typename block_type::traits;
+ 
+@@ -108,7 +109,7 @@ static void mul_mat_vec_q_reorder(const void * __restrict__ vx, const void * __r
+     auto sum = sycl::reduce_over_group(nd_item.get_sub_group(), partial_sum, std::plus<>());
+ 
+     if (sg.leader()) {
+-        dst[row] = sum;
++        dst[row] = add ? sum + add[row] : sum;  // a fused ADD (ggml_sycl_mul_mat_add_fused)
+     }
+ }
+ 
+@@ -263,7 +264,8 @@ static void mul_mat_vec_q_reorder_ncols(const void * __restrict__ vx, const void
+ 
+ template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl>
+ static void mul_mat_vec_q(const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+-                          const int ncols, const int nrows, const sycl::nd_item<3> & item_ct1) {
++                          const int ncols, const int nrows, const sycl::nd_item<3> & item_ct1,
++                          const float * __restrict__ add = nullptr) {
+     const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
+ 
+     if (row >= nrows) {
+@@ -301,7 +303,8 @@ static void mul_mat_vec_q(const void * __restrict__ vx, const void * __restrict_
+     }
+ 
+     if (item_ct1.get_local_id(2) == 0) {
+-        dst[row] = tmp;
++        // a fused residual / bias ADD (ggml_sycl_mul_mat_add_fused)
++        dst[row] = add ? tmp + add[row] : tmp;
+     }
+ }
+ 
+@@ -2220,6 +2223,105 @@ static bool ggml_sycl_mul_mat_vec_q_xmx(int                 device,
+ }
+ #endif // GGML_SYCL_MMVQ_HAS_XMX
+ 
++// One-column MMVQ with the MUL_MAT + ADD epilogue (ggml_sycl_mul_mat_add_fused): the generic kernels the per-type
++// one-column launchers specialize (the i-quant kernels are the generic one written out), with dst = sum + add[row].
++// The reorder q4_K / q5_K launchers and the q8_0 wide dot product are tuned variants and keep the separate ADD.
++template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl>
++static void launch_mul_mat_vec_q_add(const void * vx, const void * vy, float * dst, const float * add,
++                                     const int ncols, const int nrows, dpct::queue_ptr stream) {
++    GGML_ASSERT(ncols % qk == 0);
++    const int            block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
++    const sycl::range<3> block_nums(1, 1, block_num_y);
++    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
++    stream->submit([&](sycl::handler & cgh) {
++        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
++                         [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                             mul_mat_vec_q<qk, qi, block_q_t, vdr, vec_dot_q_sycl>(vx, vy, dst, ncols, nrows, item_ct1,
++                                                                                    add);
++                         });
++    });
++}
++
++template <ggml_type type>
++static void launch_mul_mat_vec_q_reorder_add(const void * vx, const void * vy, float * dst, const float * add,
++                                             const int ncols, const int nrows, dpct::queue_ptr stream) {
++    // the launch shape of the reorder one-column launchers
++    constexpr size_t     num_subgroups = WARP_SIZE;
++    const int            block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
++    const sycl::range<3> block_nums(1, 1, block_num_y);
++    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
++    stream->submit([&](sycl::handler & cgh) {
++        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
++                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                             mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<type>>(vx, vy, dst, ncols, nrows, nd_item,
++                                                                                 add);
++                         });
++    });
++}
++
++static bool ggml_sycl_mul_mat_vec_q_one_col_add(ggml_type type, bool reordered, const void * vx, const void * vy,
++                                                float * dst, const float * add, const int ncols, const int nrows,
++                                                dpct::queue_ptr stream) {
++    if (reordered) {
++        switch (type) {
++#define GGML_SYCL_MMVQ_ADD_R(T)                                                         \
++    case T:                                                                             \
++        launch_mul_mat_vec_q_reorder_add<T>(vx, vy, dst, add, ncols, nrows, stream);    \
++        return true;
++            GGML_SYCL_MMVQ_ADD_R(GGML_TYPE_Q4_0)
++            GGML_SYCL_MMVQ_ADD_R(GGML_TYPE_MXFP4)
++            GGML_SYCL_MMVQ_ADD_R(GGML_TYPE_Q2_K)
++            GGML_SYCL_MMVQ_ADD_R(GGML_TYPE_Q3_K)
++            GGML_SYCL_MMVQ_ADD_R(GGML_TYPE_Q6_K)
++            GGML_SYCL_MMVQ_ADD_R(GGML_TYPE_IQ3_XXS)
++            GGML_SYCL_MMVQ_ADD_R(GGML_TYPE_IQ3_S)
++            GGML_SYCL_MMVQ_ADD_R(GGML_TYPE_IQ4_NL)
++#undef GGML_SYCL_MMVQ_ADD_R
++            case GGML_TYPE_Q8_0:
++                if (g_ggml_sycl_mmvq_wide) {
++                    return false;
++                }
++                launch_mul_mat_vec_q_reorder_add<GGML_TYPE_Q8_0>(vx, vy, dst, add, ncols, nrows, stream);
++                return true;
++            default:
++                return false;
++        }
++    }
++    switch (type) {
++#define GGML_SYCL_MMVQ_ADD_P(T, ...)                                                    \
++    case T:                                                                             \
++        launch_mul_mat_vec_q_add<__VA_ARGS__>(vx, vy, dst, add, ncols, nrows, stream);  \
++        return true;
++        GGML_SYCL_MMVQ_ADD_P(GGML_TYPE_Q4_0, QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1)
++        GGML_SYCL_MMVQ_ADD_P(GGML_TYPE_Q4_1, QK4_1, QI4_1, block_q4_1, VDR_Q4_1_Q8_1_MMVQ, vec_dot_q4_1_q8_1)
++        GGML_SYCL_MMVQ_ADD_P(GGML_TYPE_Q5_0, QK5_0, QI5_0, block_q5_0, VDR_Q5_0_Q8_1_MMVQ, vec_dot_q5_0_q8_1)
++        GGML_SYCL_MMVQ_ADD_P(GGML_TYPE_Q5_1, QK5_1, QI5_1, block_q5_1, VDR_Q5_1_Q8_1_MMVQ, vec_dot_q5_1_q8_1)
++        GGML_SYCL_MMVQ_ADD_P(GGML_TYPE_Q8_0, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1)
++        GGML_SYCL_MMVQ_ADD_P(GGML_TYPE_Q2_K, QK_K, QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1)
++        GGML_SYCL_MMVQ_ADD_P(GGML_TYPE_Q3_K, QK_K, QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1)
++        GGML_SYCL_MMVQ_ADD_P(GGML_TYPE_Q4_K, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1)
++        GGML_SYCL_MMVQ_ADD_P(GGML_TYPE_Q5_K, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1)
++        GGML_SYCL_MMVQ_ADD_P(GGML_TYPE_Q6_K, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1)
++        GGML_SYCL_MMVQ_ADD_P(GGML_TYPE_MXFP4, QK_MXFP4, QI_MXFP4, block_mxfp4, VDR_MXFP4_Q8_1_MMVQ, vec_dot_mxfp4_q8_1)
++        GGML_SYCL_MMVQ_ADD_P(GGML_TYPE_IQ2_XXS, QK_K, QI2_XXS / 2, block_iq2_xxs, VDR_IQ2_XXS_Q8_1_MMVQ,
++                             vec_dot_iq2_xxs_q8_1_moe)
++        GGML_SYCL_MMVQ_ADD_P(GGML_TYPE_IQ2_XS, QK_K, QI2_XS / 2, block_iq2_xs, VDR_IQ2_XS_Q8_1_MMVQ,
++                             vec_dot_iq2_xs_q8_1_moe)
++        GGML_SYCL_MMVQ_ADD_P(GGML_TYPE_IQ2_S, QK_K, QI2_S / 2, block_iq2_s, VDR_IQ2_S_Q8_1_MMVQ, vec_dot_iq2_s_q8_1)
++        GGML_SYCL_MMVQ_ADD_P(GGML_TYPE_IQ3_XXS, QK_K, QI3_XXS / 2, block_iq3_xxs, VDR_IQ3_XXS_Q8_1_MMVQ,
++                             vec_dot_iq3_xxs_q8_1_moe)
++        GGML_SYCL_MMVQ_ADD_P(GGML_TYPE_IQ3_S, QK_K, QI3_S / 2, block_iq3_s, VDR_IQ3_S_Q8_1_MMVQ,
++                             vec_dot_iq3_s_q8_1_adapter)
++        GGML_SYCL_MMVQ_ADD_P(GGML_TYPE_IQ1_S, QK_K, QI1_S, block_iq1_s, VDR_IQ1_S_Q8_1_MMVQ, vec_dot_iq1_s_q8_1_moe)
++        GGML_SYCL_MMVQ_ADD_P(GGML_TYPE_IQ1_M, QK_K, QI1_S, block_iq1_m, VDR_IQ1_M_Q8_1_MMVQ, vec_dot_iq1_m_q8_1)
++        GGML_SYCL_MMVQ_ADD_P(GGML_TYPE_IQ4_NL, QK4_NL, QI4_NL, block_iq4_nl, VDR_IQ4_NL_Q8_1_MMVQ, vec_dot_iq4_nl_q8_1)
++        GGML_SYCL_MMVQ_ADD_P(GGML_TYPE_IQ4_XS, QK_K, QI4_XS / 4, block_iq4_xs, VDR_IQ4_XS_Q8_1_MMVQ, vec_dot_iq4_xs_q8_1)
++#undef GGML_SYCL_MMVQ_ADD_P
++        default:
++            return false;
++    }
++}
++
+ bool ggml_sycl_mul_mat_vec_q_glu_xmx(int              device,
+                                      enum ggml_type   src0_type,
+                                      enum ggml_glu_op glu_op,
+@@ -2279,6 +2381,17 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
+     }
+ #endif // GGML_SYCL_MMVQ_HAS_XMX
+ 
++    // a fused ADD (ggml_sycl_mul_mat_add_fused) on one column: the generic kernels add it in their store
++    if (ctx.mmv_add != nullptr && src1_ncols == 1) {
++        const auto * extra     = (const ggml_tensor_extra_gpu *) dst->src[0]->extra;
++        const bool   reordered = extra && extra->optimized_feature.reorder;
++        if (ggml_sycl_mul_mat_vec_q_one_col_add(src0->type, reordered, src0_dd_i, src1_ddq_i, dst_dd_i,
++                                                ctx.mmv_add + row_low, (int) ne00, (int) row_diff, stream)) {
++            ctx.mmv_add_applied = true;
++            return;
++        }
++    }
++
+     int id;
+     SYCL_CHECK(CHECK_TRY_ERROR(id = get_current_device_id()));
+     const size_t q8_1_ts = sizeof(block_q8_1);

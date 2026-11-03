@@ -102,7 +102,11 @@ the A770 compiles at JIT time) and its DG2 assembly read from IGC dumps:
 - C20/C21 `fused-gemm-esimd.cpp`: builds; every DPAS is `dpas.8x8 (8|M0)`. The
   default 8-wide path is spill-free at 256 GRF, which the kernel requests. A
   `GGML_SYCL_DEVICE_ARCH=acm-g10` build gets 128 GRF and spills 3.7-9 KB per
-  kernel, so measure with a JIT build.
+  kernel, so measure with a JIT build. (2026-11-03: oneAPI 2026.2's AOT path drops
+  `grf_size` for every ESIMD kernel and keeps it for SPMD ones; a minimal ESIMD
+  kernel shows the same. `ZZ-LOCAL-0017`'s `GGML_SYCL_XMX_GRF256=1` switches the
+  joint_matrix tile C21 falls back to; the ESIMD remap sees the same combination
+  either way.)
 - C10/C30 `mmvq.cpp`: builds. Upstream's Xe2-only XMX MMVQ kernels in the same
   file also compile for DG2, as 8-wide DPAS with spills; they stay gated off.
 - Since local patch `ZZ-LOCAL-0010` (2026-11-02), the stack's own `joint_matrix` grouped
@@ -120,7 +124,10 @@ the A770 compiles at JIT time) and its DG2 assembly read from IGC dumps:
   in-kernel `mask` null test made IGC 2.43 emit a 64-bit shift that DG2 cannot
   execute, and that failed every ESIMD kernel in the file. C40 now tests `mask`
   on the host; all 37 kernels build. At the 128 GRF of an AOT build, the D=256
-  SPMD and ESIMD variants spill (0.7-12 KB).
+  SPMD and ESIMD variants spill (0.7-12 KB). Since 2026-11-03 the D=256 SPMD
+  kernels ask for `grf_size<256>` on Intel GPUs with XMX and no longer spill
+  (AOT honours the request for SPMD kernels); the ESIMD ones still lose it in
+  AOT (see below), so measure C40's ESIMD path with a JIT build.
 - C50 TILE FA instance: builds.
 - C60 `fattn-dpas.cpp`: builds for `acm-g10` (42 kernels, all 782 DPAS `dpas.8x8 (8|M0)`,
   none spill) and `bmg-g21` (the same 604 DPAS as upstream, instruction counts within 1%,

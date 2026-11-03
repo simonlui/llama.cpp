@@ -17,8 +17,9 @@ extractable as idiomatic backend code and is intentionally excluded — see
 Local work on top of the stack goes in the separate `ZZ-LOCAL-*` group in this
 directory: repairs the current upstream tree needs, and gap fills for quant types
 the carried PRs leave out. They are not folded into the numbered extracted
-history and remain independently reversible. Twelve are active, `ZZ-LOCAL-0003` to
-`ZZ-LOCAL-0014` (see the patch index); 0011 to 0014 port graph fusions from the CUDA, Vulkan and Metal backends. They apply in number order, and every candidate in
+history and remain independently reversible. Fifteen are active, `ZZ-LOCAL-0003` to
+`ZZ-LOCAL-0017` (see the patch index); 0011 to 0016 port graph fusions from the CUDA, Vulkan and Metal
+backends, and 0017 adds an opt-in 256-register GEMM tile for DG2. They apply in number order, and every candidate in
 `../sycl-patches-candidates/` applies on top of them with plain `git apply`.
 
 ## Patch index
@@ -39,6 +40,9 @@ history and remain independently reversible. Twelve are active, `ZZ-LOCAL-0003` 
 | ZZ-LOCAL-0012 | `ZZ-LOCAL-0012-sycl-moe-mmvq-tokens-glu-bias.patch` | The MoE MMVQ (plain and reorder layout) takes 2..8 tokens (per-type cap, CUDA's RDNA3 table, `GGML_SYCL_MMID_MMVQ_MAX_TOKENS` overrides), runs MUL_MAT_ID gate + MUL_MAT_ID up + GLU in one launch (SWIGLU, GEGLU, SWIGLU_OAI, SWIGLU_CLAMP; with the ADD_ID bias of each lane for gpt-oss), and adds a lone MUL_MAT_ID's ADD_ID bias in its store. Ported from CUDA's `mul_mat_vec_q` with ids and fusion args. | perf (port) |
 | ZZ-LOCAL-0013 | `ZZ-LOCAL-0013-sycl-fuse-mul-mat-add.patch` | MUL_MAT (one activation column) + ADD of a same-shape tensor, i.e. the residual after the attention output and the FFN down projection, or a bias: the mat-vec writes the ADD's memory and the DMMV kernels add the addend in their store (the A770's ESIMD kernels for q2_K..q6_K and q8_0, the generic kernels for q4_0, q4_1, q5_0, q5_1, q8_0, q1_0). Kernels without the epilogue fall back to one in-place ADD. CUDA, Vulkan and Metal all run this fusion. | perf (port) |
 | ZZ-LOCAL-0014 | `ZZ-LOCAL-0014-sycl-reuse-converted-activation.patch` | Sibling mat-muls of one activation (Q, K, V) share its q8_1 (MMVQ) or f16 (DMMV) copy within a graph instead of converting it once each; Vulkan's `prealloc_y` cache. Dropped when a node writes the activation and at the end of every graph. | perf (port) |
+| ZZ-LOCAL-0015 | `ZZ-LOCAL-0015-sycl-fuse-model-specific.patch` | The rest of CUDA's model-specific fusions: logit softcap (SCALE + TANH + SCALE) and squared ReLU as one kernel each, the snake activation of the TTS audio decoders (MUL, SIN, SQR, MUL, ADD), SCALE + SIGMOID + SCALE folded into DSV4_HC_POST's post weights, SSM_SCAN writing its state snapshots straight into the cache (skipping the CPY), and topk-moe with sqrt(softplus) gating and DeepSeek-V3 expert-group masking (up to `WARP_SIZE` groups). Shared-expert fusion and multi-stream concurrency are not ported (see `SYCL_DEV_LOG.md`). | perf (port) |
+| ZZ-LOCAL-0016 | `ZZ-LOCAL-0016-sycl-mmvq-add-epilogue.patch` | 0013's MUL_MAT + ADD epilogue in the one-column MMVQ store: the generic plain kernel (q4_0 .. q6_K, q8_0, mxfp4, IQ1 / IQ2 / IQ3 / IQ4) and the generic reorder kernel (q4_0, q8_0, mxfp4, q2_K, q3_K, q6_K, IQ3, IQ4_NL) take the addend. The tuned reorder q4_K / q5_K launchers, the q8_0 wide dot product, the XMX MMVQ and 2..8 columns keep the in-place ADD. | perf (port) |
+| ZZ-LOCAL-0017 | `ZZ-LOCAL-0017-sycl-dg2-gemm-grf256-opt-in.patch` | `GGML_SYCL_XMX_GRF256=1` runs the sub-group-8 XMX dequant GEMM (f16 and bf16 8x8x16) with the 16-row, unrolled tile and `grf_size<256>` instead of 0010's 8-row tile at 128 registers: 4 threads per EU and twice the B reuse against 8 threads and twice the B loads. Same shape bit and B packing. An `acm-g10` AOT build gives all 72 kernels 256 registers and none spills. Off by default, for an A770 A/B. | perf (DG2, opt-in) |
 
 The former `ZZ-LOCAL-0001` made direct SYCL `CONV_2D` index input, kernel, and
 output by their real strides. It was retired on 2026-11-01 as superseded by
@@ -140,6 +144,19 @@ is gone, so runtime behavior/perf differs from the research tree.
   stack returns a clean tree. Not verified: speed on the A770 and the ESIMD epilogue at run time
   (ESIMD does not run on the CPU device). Details in `SYCL_DEV_LOG.md` ("Fusions ported from CUDA, Vulkan
   and Metal").
+- **`ZZ-LOCAL-0015` to `ZZ-LOCAL-0017` (2026-11-03):** built with `icpx` 2026.2 and tested on the CPU OpenCL
+  device: `SOFTCAP` 1/1, `RELU_SQR` 4/4, `SNAKE_FUSE` 16/16, `DSV4_HC_POST` 9/9, `SSM_SCAN_CACHE_FUSION` 7/7,
+  `SSM_SCAN` 12/12, `TOPK_MOE` 384/384 on the power-of-two expert counts (sqrt(softplus) and up to 16 expert
+  groups fused; one earlier run hit the unfused 32-group flake seen with 0011, which passed 8 reruns), and
+  `MUL_MAT_VEC_FUSION` 1818/1818 with and without the reorder forced, 64 of those scratch MUL_MAT + ADD cases
+  covering the types 0016 adds (IQ1..IQ4, q5_0 / q5_1, MXFP4, the reorder k-quants). The SYCL debug log
+  shows each fusion running. `acm-g10` AOT with the per-kernel device-code split: no new kernel spills except
+  topk-moe's expert-group instantiations at 512 experts (1.0-1.2 KB, with the 256 registers they take on XMX
+  GPUs; 7.9-9.1 KB at 128); 0017's 72 tiles get 256 registers and do not spill. Applies in order with plain `git apply`, every
+  candidate applies on top (C40 now also asks for 256 registers in its D=256 SPMD kernels), and the round trip
+  with the Vulkan stack is clean. Not verified: speed on the A770, and the 256-register kernels at run time.
+  Details and the register-file audit in `SYCL_DEV_LOG.md` ("Remaining fusions, MMVQ add epilogue and the
+  register-file audit").
 - The scripts snapshot pre-existing untracked paths in the worktree's Git
   administrative directory. Files introduced by an apply are removed on
   unapply, while paths present before apply are protected. The state file is

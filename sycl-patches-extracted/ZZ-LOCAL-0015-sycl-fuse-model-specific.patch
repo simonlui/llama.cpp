@@ -1,0 +1,1090 @@
+Subject: [PATCH] sycl: port CUDA's model-specific fusions and topk-moe expert groups
+
+Local port of the rest of the CUDA graph fusions that apply to models an Arc card runs:
+
+- SCALE -> TANH -> SCALE (logit softcap) and RELU -> SQR (squared ReLU) as single elementwise kernels.
+- MUL -> SIN -> SQR -> MUL -> ADD, the snake activation of audio decoders, x [T, C] with per-channel
+  a and 1/b (CUDA's snake fusion; F32, F16 and BF16 activations).
+- SCALE -> SIGMOID -> SCALE feeding DSV4_HC_POST's post weights (qwen4exp's hc_combine): the hc_post
+  kernel computes gate_out * sigmoid(gate_in * post) itself.
+- SSM_SCAN + the CPY that scatters its state snapshots into the cache: the mamba-2 group scan writes
+  the final state and the rollback snapshots straight into the cache view and skips its snapshot tail
+  (CUDA's ggml_cuda_try_ssm_scan_cache_fusion; one sequence, d_state 128 / 256 as the SYCL kernel).
+- topk-moe: sqrt(softplus) gating (DeepSeek-V4) and DeepSeek-V3's expert-group masking (keep the
+  n_group_used groups with the best sum of their top two experts), up to WARP_SIZE groups, ported from
+  CUDA's topk_moe_cuda and its group pattern matcher. The masking is its own kernel instantiation, so
+  routers without groups keep their registers. At 256 / 512 experts it spilled 1.4-9.1 KB per thread at
+  128 registers on acm-g10; a router runs one sub-group per token and has no occupancy to lose, so there
+  it takes the 256-register file on Intel GPUs with XMX (no spill at 256 experts, 1.0-1.2 KB at 512).
+
+Not ported: CUDA's shared-expert fusion, which only fires when the shared expert has the routed
+experts' type and shape (Qwen2-MoE and DeepSeek-V2-Lite size it differently, and a quant mix can give
+it another type) and saves one launch, and the opt-in multi-stream Q/K/V concurrency (GGML_CUDA_GRAPH_OPT).
+
+diff --git a/ggml/src/ggml-sycl/dsv4-hc.cpp b/ggml/src/ggml-sycl/dsv4-hc.cpp
+index 337f4af4..110d22dc 100644
+--- a/ggml/src/ggml-sycl/dsv4-hc.cpp
++++ b/ggml/src/ggml-sycl/dsv4-hc.cpp
+@@ -157,7 +157,9 @@ static constexpr int dsv4_hc_post_block_size = 256;
+ 
+ // comb == nullptr is identity mixing: each destination stream keeps its own residual
+ // instead of summing across the streams.
+-template <bool has_comb>
++// gated: post = gate_out * sigmoid(gate_in * post), the fused SCALE -> SIGMOID -> SCALE chain of qwen4exp's
++// hc_combine (ported from CUDA's dsv4_hc_post_f32<has_comb, gated>)
++template <bool has_comb, bool gated = false>
+ static void dsv4_hc_post_f32_sycl(
+         const float * x, const float * residual, const float * post, const float * comb, float * dst,
+         int64_t n_embd, int64_t hc, int64_t n_tokens,
+@@ -166,7 +168,7 @@ static void dsv4_hc_post_f32_sycl(
+         int64_t sp0, int64_t sp1,
+         int64_t sc0, int64_t sc1, int64_t sc2,
+         int64_t sd0, int64_t sd1, int64_t sd2,
+-        queue_ptr stream) {
++        queue_ptr stream, float gate_in = 1.0f, float gate_out = 1.0f) {
+     const int64_t nr = n_embd * hc * n_tokens;
+     const int64_t block_size = dsv4_hc_post_block_size;
+     const int64_t num_blocks = (nr + block_size - 1) / block_size;
+@@ -183,7 +185,11 @@ static void dsv4_hc_post_f32_sycl(
+             const int64_t idst = (ir / n_embd) % hc;
+             const int64_t it   = ir / (n_embd * hc);
+ 
+-            float sum = x[i0*sx0 + it*sx1] * post[idst*sp0 + it*sp1];
++            float p = post[idst*sp0 + it*sp1];
++            if constexpr (gated) {
++                p = gate_out * (1.0f / (1.0f + sycl::exp(-(gate_in * p))));
++            }
++            float sum = x[i0*sx0 + it*sx1] * p;
+             if constexpr (has_comb) {
+                 for (int64_t isrc = 0; isrc < hc; ++isrc) {
+                     sum += residual[i0*sr0 + isrc*sr1 + it*sr2] * comb[idst*sc0 + isrc*sc1 + it*sc2];
+@@ -285,11 +291,21 @@ void ggml_sycl_op_dsv4_hc_comb(ggml_backend_sycl_context & ctx, ggml_tensor * ds
+ }
+ 
+ void ggml_sycl_op_dsv4_hc_post(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+-    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/4);
++    ggml_sycl_op_dsv4_hc_post_gated(ctx, dst, nullptr, nullptr);
++}
++
++void ggml_sycl_op_dsv4_hc_post_gated(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
++                                     const ggml_tensor * gate_scale_in, const ggml_tensor * gate_scale_out) {
++    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/4,
++                                         gate_scale_in ? " : fused with scale + sigmoid + scale" : "");
+     const ggml_tensor * x        = dst->src[0];
+     const ggml_tensor * residual = dst->src[1];
+-    const ggml_tensor * post     = dst->src[2];
+     const ggml_tensor * comb     = dst->src[3];
++    // when fused, read the raw post weights from before the SCALE -> SIGMOID -> SCALE chain
++    const bool          gated    = gate_scale_in != nullptr;
++    const ggml_tensor * post     = gated ? gate_scale_in->src[0] : dst->src[2];
++    const float         gate_in  = gated ? ggml_get_op_params_f32(gate_scale_in, 0) : 1.0f;
++    const float         gate_out = gated ? ggml_get_op_params_f32(gate_scale_out, 0) : 1.0f;
+ 
+     GGML_ASSERT(x->type == GGML_TYPE_F32);
+     GGML_ASSERT(residual->type == GGML_TYPE_F32);
+@@ -317,8 +333,8 @@ void ggml_sycl_op_dsv4_hc_post(ggml_backend_sycl_context & ctx, ggml_tensor * ds
+ 
+     queue_ptr stream = ctx.stream();
+ 
+-    const auto launch = [&](auto has_comb) {
+-        dsv4_hc_post_f32_sycl<decltype(has_comb)::value>(
++    const auto launch = [&](auto has_comb, auto is_gated) {
++        dsv4_hc_post_f32_sycl<decltype(has_comb)::value, decltype(is_gated)::value>(
+             (const float *) x->data, (const float *) residual->data,
+             (const float *) post->data, comb ? (const float *) comb->data : nullptr, (float *) dst->data,
+             n_embd, hc, n_tokens,
+@@ -327,12 +343,12 @@ void ggml_sycl_op_dsv4_hc_post(ggml_backend_sycl_context & ctx, ggml_tensor * ds
+             nbp0 / sizeof(float), nbp1 / sizeof(float),
+             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
+             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
+-            stream);
++            stream, gate_in, gate_out);
+     };
+ 
+     if (comb) {
+-        launch(std::true_type{});
++        gated ? launch(std::true_type{}, std::true_type{}) : launch(std::true_type{}, std::false_type{});
+     } else {
+-        launch(std::false_type{});
++        gated ? launch(std::false_type{}, std::true_type{}) : launch(std::false_type{}, std::false_type{});
+     }
+ }
+diff --git a/ggml/src/ggml-sycl/dsv4-hc.hpp b/ggml/src/ggml-sycl/dsv4-hc.hpp
+index 330518d8..cb9831e0 100644
+--- a/ggml/src/ggml-sycl/dsv4-hc.hpp
++++ b/ggml/src/ggml-sycl/dsv4-hc.hpp
+@@ -6,5 +6,9 @@
+ void ggml_sycl_op_dsv4_hc_pre(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
+ void ggml_sycl_op_dsv4_hc_comb(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
+ void ggml_sycl_op_dsv4_hc_post(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
++// the same with its post weights computed as gate_out * sigmoid(gate_in * post) from the SCALE -> SIGMOID -> SCALE
++// chain that feeds src[2] (gate_scale_in / gate_scale_out are its two SCALE nodes)
++void ggml_sycl_op_dsv4_hc_post_gated(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
++                                     const ggml_tensor * gate_scale_in, const ggml_tensor * gate_scale_out);
+ 
+ #endif // GGML_SYCL_DSV4_HC_HPP
+diff --git a/ggml/src/ggml-sycl/fused-elementwise.cpp b/ggml/src/ggml-sycl/fused-elementwise.cpp
+new file mode 100644
+index 00000000..3a4bb37b
+--- /dev/null
++++ b/ggml/src/ggml-sycl/fused-elementwise.cpp
+@@ -0,0 +1,99 @@
++#include "fused-elementwise.hpp"
++
++static constexpr int GGML_SYCL_FUSED_EW_BLOCK = 256;
++
++static sycl::nd_range<1> fused_ew_range(int64_t n) {
++    const int64_t n_blocks = (n + GGML_SYCL_FUSED_EW_BLOCK - 1) / GGML_SYCL_FUSED_EW_BLOCK;
++    return sycl::nd_range<1>(sycl::range<1>(n_blocks * GGML_SYCL_FUSED_EW_BLOCK),
++                             sycl::range<1>(GGML_SYCL_FUSED_EW_BLOCK));
++}
++
++void ggml_sycl_op_softcap(ggml_backend_sycl_context & ctx, ggml_tensor * dst, const ggml_tensor * scale_in) {
++    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/0, " : fused scale + tanh + scale");
++    const ggml_tensor * src = scale_in->src[0];
++    GGML_ASSERT(src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++
++    const float   scale   = ggml_get_op_params_f32(scale_in, 0);
++    const float   softcap = ggml_get_op_params_f32(dst, 0);
++    const float * x       = (const float *) src->data;
++    float *       y       = (float *) dst->data;
++    const int64_t n       = ggml_nelements(src);
++
++    dpct::queue_ptr stream = ctx.stream();
++    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
++    stream->parallel_for(fused_ew_range(n), [=](sycl::nd_item<1> it) {
++        const int64_t i = it.get_global_id(0);
++        if (i < n) {
++            y[i] = sycl::tanh(scale * x[i]) * softcap;
++        }
++    });
++}
++
++template <typename T>
++static void relu_sqr_sycl(const T * x, T * y, const int64_t n, dpct::queue_ptr stream) {
++    stream->parallel_for(fused_ew_range(n), [=](sycl::nd_item<1> it) {
++        const int64_t i = it.get_global_id(0);
++        if (i < n) {
++            const float r = sycl::fmax((float) x[i], 0.0f);
++            y[i]          = (T) (r * r);
++        }
++    });
++}
++
++void ggml_sycl_op_relu_sqr(ggml_backend_sycl_context & ctx, const ggml_tensor * relu, ggml_tensor * sqr) {
++    scope_op_debug_print scope_dbg_print(__func__, sqr, /*num_src=*/0, " : fused relu + sqr");
++    const ggml_tensor * src = relu->src[0];
++    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(sqr) && src->type == sqr->type);
++
++    dpct::queue_ptr stream = ctx.stream();
++    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
++    if (src->type == GGML_TYPE_F16) {
++        relu_sqr_sycl((const sycl::half *) src->data, (sycl::half *) sqr->data, ggml_nelements(src), stream);
++    } else {
++        GGML_ASSERT(src->type == GGML_TYPE_F32);
++        relu_sqr_sycl((const float *) src->data, (float *) sqr->data, ggml_nelements(src), stream);
++    }
++}
++
++template <typename T>
++static void snake_sycl(const T * x, const float * a, const float * inv_b, T * dst, const int64_t T_len,
++                       const int64_t total, dpct::queue_ptr stream) {
++    stream->parallel_for(fused_ew_range(total), [=](sycl::nd_item<1> it) {
++        const int64_t idx = it.get_global_id(0);
++        if (idx >= total) {
++            return;
++        }
++        const int64_t c  = idx / T_len;
++        const float   xi = (float) x[idx];
++        const float   s  = sycl::sin(a[c] * xi);
++        dst[idx]         = (T) (xi + s * s * inv_b[c]);
++    });
++}
++
++void ggml_sycl_op_snake(ggml_backend_sycl_context & ctx, const ggml_tensor * x, const ggml_tensor * a,
++                        const ggml_tensor * inv_b, ggml_tensor * dst) {
++    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/0, " : fused snake activation");
++    const int64_t T     = x->ne[0];
++    const int64_t total = T * x->ne[1];
++    const float * a_d   = (const float *) a->data;
++    const float * b_d   = (const float *) inv_b->data;
++
++    dpct::queue_ptr stream = ctx.stream();
++    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
++    switch (x->type) {
++        case GGML_TYPE_F32:
++            snake_sycl((const float *) x->data, a_d, b_d, (float *) dst->data, T, total, stream);
++            break;
++        case GGML_TYPE_F16:
++            snake_sycl((const sycl::half *) x->data, a_d, b_d, (sycl::half *) dst->data, T, total, stream);
++            break;
++#ifdef GGML_SYCL_HAS_BF16
++        case GGML_TYPE_BF16:
++            snake_sycl((const sycl::ext::oneapi::bfloat16 *) x->data, a_d, b_d,
++                       (sycl::ext::oneapi::bfloat16 *) dst->data, T, total, stream);
++            break;
++#endif
++        default:
++            GGML_ABORT("snake: unsupported type");
++    }
++}
+diff --git a/ggml/src/ggml-sycl/fused-elementwise.hpp b/ggml/src/ggml-sycl/fused-elementwise.hpp
+new file mode 100644
+index 00000000..66f51c8c
+--- /dev/null
++++ b/ggml/src/ggml-sycl/fused-elementwise.hpp
+@@ -0,0 +1,17 @@
++#ifndef GGML_SYCL_FUSED_ELEMENTWISE_HPP
++#define GGML_SYCL_FUSED_ELEMENTWISE_HPP
++
++#include "common.hpp"
++
++// SCALE(s) -> TANH -> SCALE(c): the logit softcap, dst = c * tanh(s * x) (ported from ggml_cuda_op_softcap)
++void ggml_sycl_op_softcap(ggml_backend_sycl_context & ctx, ggml_tensor * dst, const ggml_tensor * scale_in);
++
++// RELU -> SQR: dst = max(x, 0)^2 (ported from ggml_cuda_op_relu_sqr)
++void ggml_sycl_op_relu_sqr(ggml_backend_sycl_context & ctx, const ggml_tensor * relu, ggml_tensor * sqr);
++
++// MUL -> SIN -> SQR -> MUL -> ADD: the snake activation dst = x + sin(a * x)^2 * inv_b, x [T, C], a and inv_b [1, C]
++// (ported from ggml_cuda_op_snake_fused)
++void ggml_sycl_op_snake(ggml_backend_sycl_context & ctx, const ggml_tensor * x, const ggml_tensor * a,
++                        const ggml_tensor * inv_b, ggml_tensor * dst);
++
++#endif  // GGML_SYCL_FUSED_ELEMENTWISE_HPP
+diff --git a/ggml/src/ggml-sycl/fusion.cpp b/ggml/src/ggml-sycl/fusion.cpp
+index c398da04..7e070f51 100644
+--- a/ggml/src/ggml-sycl/fusion.cpp
++++ b/ggml/src/ggml-sycl/fusion.cpp
+@@ -460,6 +460,45 @@ bool ggml_sycl_match_mul_mat_add(const ggml_cgraph * cgraph, int i) {
+            ggml_are_same_shape(addend, add);
+ }
+ 
++// MUL -> SIN -> SQR -> MUL -> ADD, the snake activation y = x + sin(a * x)^2 * inv_b as frontends emit it (ported
++// from the CUDA snake fusion): x [T, C], a and inv_b [1, C] F32
++bool ggml_sycl_match_snake(const ggml_cgraph * cgraph, int i, const ggml_tensor *& x_out, const ggml_tensor *& a_out,
++                           const ggml_tensor *& inv_b_out) {
++    if (!g_ggml_sycl_enable_fusion || i + 4 >= cgraph->n_nodes ||
++        !ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_SIN, GGML_OP_SQR, GGML_OP_MUL, GGML_OP_ADD },
++                                { i + 4 })) {
++        return false;
++    }
++    const ggml_tensor * mul0 = cgraph->nodes[i];
++    const ggml_tensor * sin1 = cgraph->nodes[i + 1];
++    const ggml_tensor * sqr  = cgraph->nodes[i + 2];
++    const ggml_tensor * mul1 = cgraph->nodes[i + 3];
++    const ggml_tensor * add  = cgraph->nodes[i + 4];
++
++    // x carries the full activation shape, a is the broadcast operand; mul1 reads sqr and inv_b in either order
++    const ggml_tensor * x        = ggml_are_same_shape(mul0, mul0->src[0]) ? mul0->src[0] : mul0->src[1];
++    const ggml_tensor * a        = x == mul0->src[0] ? mul0->src[1] : mul0->src[0];
++    const ggml_tensor * inv_b    = mul1->src[0] == sqr ? mul1->src[1] : mul1->src[0];
++    const ggml_tensor * x_in_add = add->src[0] == mul1 ? add->src[1] : add->src[0];
++
++    const bool dim_ok = x->ne[2] == 1 && x->ne[3] == 1 && add->ne[2] == 1 && add->ne[3] == 1 && a->ne[2] == 1 &&
++                        a->ne[3] == 1;
++    const bool shape_ok = ggml_are_same_shape(a, inv_b) && a->ne[0] == 1 && a->ne[1] == x->ne[1];
++    const bool types_ok = (x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16 || x->type == GGML_TYPE_BF16) &&
++                          a->type == GGML_TYPE_F32 && inv_b->type == GGML_TYPE_F32 && mul0->type == x->type &&
++                          sin1->type == x->type && sqr->type == x->type && mul1->type == x->type &&
++                          add->type == x->type;
++    const bool contig_ok = ggml_is_contiguous(x) && ggml_is_contiguous(add) && ggml_is_contiguous(a) &&
++                           ggml_is_contiguous(inv_b);
++    if (!(dim_ok && shape_ok && types_ok && contig_ok && x_in_add == x)) {
++        return false;
++    }
++    x_out     = x;
++    a_out     = a;
++    inv_b_out = inv_b;
++    return true;
++}
++
+ // the unary ops the fused unary chains in element_wise.cpp have a functor for
+ static bool ggml_sycl_fused_unary_has_kernel(ggml_unary_op unary_op) {
+     return unary_op == GGML_UNARY_OP_SILU || unary_op == GGML_UNARY_OP_SIGMOID ||
+@@ -510,6 +549,23 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
+                ggml_sycl_fusion_ranges_ok(cgraph, node_idx, 5, out, 1);
+     }
+ 
++    // SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST (src[2]): qwen4exp's gated hc_combine weights
++    if (ops.size() == 4 && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY &&
++        ops.begin()[2] == GGML_OP_SCALE && ops.begin()[3] == GGML_OP_DSV4_HC_POST) {
++        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 3 }) ||
++            !ggml_check_edges(cgraph, node_idx, { { 1, 0, 0 }, { 2, 0, 1 }, { 3, 2, 2 } })) {
++            return false;
++        }
++        const ggml_tensor * scale_in  = cgraph->nodes[node_idx];
++        const ggml_tensor * sigmoid   = cgraph->nodes[node_idx + 1];
++        const ggml_tensor * scale_out = cgraph->nodes[node_idx + 2];
++        // a bias on either scale is not handled
++        return ggml_get_unary_op(sigmoid) == GGML_UNARY_OP_SIGMOID &&
++               ggml_get_op_params_f32(scale_in, 1) == 0.0f && ggml_get_op_params_f32(scale_out, 1) == 0.0f &&
++               scale_in->src[0]->type == GGML_TYPE_F32 && scale_out->type == GGML_TYPE_F32 &&
++               ggml_are_same_shape(scale_in->src[0], scale_out);
++    }
++
+     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ROPE && ops.begin()[1] == GGML_OP_VIEW &&
+         ops.begin()[2] == GGML_OP_SET_ROWS) {
+         const int out[] = { node_idx + 2 };
+@@ -523,6 +579,28 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
+         return false;
+     }
+ 
++    // RELU -> SQR (ported from the CUDA relu_sqr fusion)
++    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_SQR) {
++        const ggml_tensor * unary = cgraph->nodes[node_idx];
++        const ggml_tensor * sqr   = cgraph->nodes[node_idx + 1];
++        return ggml_get_unary_op(unary) == GGML_UNARY_OP_RELU &&
++               (unary->type == GGML_TYPE_F32 || unary->type == GGML_TYPE_F16) && unary->type == sqr->type &&
++               unary->src[0]->type == unary->type && ggml_is_contiguous(unary->src[0]) && ggml_is_contiguous(sqr);
++    }
++
++    // SCALE -> TANH -> SCALE: the logit softcap (ported from the CUDA softcap fusion)
++    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY &&
++        ops.begin()[2] == GGML_OP_SCALE) {
++        const ggml_tensor * scale  = cgraph->nodes[node_idx];
++        const ggml_tensor * tanh   = cgraph->nodes[node_idx + 1];
++        const ggml_tensor * scale2 = cgraph->nodes[node_idx + 2];
++        // the kernel reads and writes F32 densely; a bias on either scale is not handled
++        return ggml_get_unary_op(tanh) == GGML_UNARY_OP_TANH && scale->src[0]->type == GGML_TYPE_F32 &&
++               scale->type == GGML_TYPE_F32 && scale2->type == GGML_TYPE_F32 &&
++               ggml_is_contiguous(scale->src[0]) && ggml_is_contiguous(scale2) &&
++               ggml_get_op_params_f32(scale, 1) == 0.0f && ggml_get_op_params_f32(scale2, 1) == 0.0f;
++    }
++
+     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL &&
+         ops.begin()[2] == GGML_OP_ROPE) {
+         const int out[] = { node_idx + 2 };
+diff --git a/ggml/src/ggml-sycl/fusion.hpp b/ggml/src/ggml-sycl/fusion.hpp
+index a43dbaca..d47a29a1 100644
+--- a/ggml/src/ggml-sycl/fusion.hpp
++++ b/ggml/src/ggml-sycl/fusion.hpp
+@@ -55,4 +55,8 @@ bool ggml_sycl_match_moe_mmvq_fusion(const ggml_cgraph * cgraph, int i, ggml_syc
+ // MUL_MAT of one activation column followed by an ADD of a same-shape F32 tensor
+ bool ggml_sycl_match_mul_mat_add(const ggml_cgraph * cgraph, int i);
+ 
++// MUL -> SIN -> SQR -> MUL -> ADD at i, the snake activation: its x, a and inv_b
++bool ggml_sycl_match_snake(const ggml_cgraph * cgraph, int i, const ggml_tensor *& x, const ggml_tensor *& a,
++                           const ggml_tensor *& inv_b);
++
+ #endif  // GGML_SYCL_FUSION_HPP
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 75f3a50c..645c44a1 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -68,6 +68,7 @@
+ #include "ggml-sycl/fwht.hpp"
+ #include "ggml-sycl/fused-gemm.hpp"
+ #include "ggml-sycl/fused-add.hpp"
++#include "ggml-sycl/fused-elementwise.hpp"
+ #include "ggml-sycl/gemm.hpp"
+ #include "ggml-sycl/getrows.hpp"
+ #include "ggml-sycl/mem.hpp"
+@@ -6939,6 +6940,85 @@ static bool ggml_sycl_is_view_or_noop(const ggml_tensor * t) {
+            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
+ }
+ 
++// returns the number of following nodes to skip (0 = no fusion): ssm_scan + the cpy that scatters its state
++// snapshots into the cache. Ported from ggml_cuda_try_ssm_scan_cache_fusion; graph inspection only.
++static int ggml_sycl_try_ssm_scan_cache_fusion(const ggml_cgraph * cgraph, int node_idx,
++                                               ggml_sycl_ssm_scan_fused_cache & fused_state_cpy) {
++    if (!g_ggml_sycl_enable_fusion) {
++        return 0;
++    }
++    const ggml_tensor * ssm = cgraph->nodes[node_idx];
++    // the kernel skips the snapshot tail, so the scan output must not be a graph output
++    if (ssm->op != GGML_OP_SSM_SCAN || ssm->type != GGML_TYPE_F32 || (ssm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++        return 0;
++    }
++
++    const int64_t K = ggml_get_op_params_i32(ssm, 0); // snapshot slot count
++
++    const ggml_tensor * st = ssm->src[0];
++    const ggml_tensor * x  = ssm->src[1];
++    const ggml_tensor * A  = ssm->src[3];
++
++    const int64_t d_state = st->ne[0];
++    const int64_t D       = d_state * st->ne[1] * x->ne[1]; // d_state * head_dim * n_head
++    const int64_t n_tok   = x->ne[2];
++    const int64_t n_seqs  = x->ne[3];
++
++    // the SYCL kernel is the mamba-2 group scan for d_state 128 / 256
++    if (A->nb[1] != sizeof(float) || (d_state != 128 && d_state != 256)) {
++        return 0;
++    }
++    // the scan reads its input rows from the cache (picked by ids): with more than one sequence one could read a
++    // row another one writes in the same launch
++    if (n_seqs != 1) {
++        return 0;
++    }
++
++    const int64_t n_written = std::min<int64_t>(n_tok, K);
++    const size_t  tail_off  = ggml_row_size(GGML_TYPE_F32, ggml_nelements(x));
++
++    // the snapshot cpy is the first real node after the scan
++    const ggml_tensor * cpy  = nullptr;
++    int                 skip = 0;
++    for (int j = node_idx + 1; j < cgraph->n_nodes && cpy == nullptr; ++j) {
++        const ggml_tensor * n = cgraph->nodes[j];
++        if (ggml_sycl_is_view_or_noop(n)) {
++            continue;
++        }
++        if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++            return 0;
++        }
++        cpy  = n;
++        skip = j - node_idx;
++    }
++    if (cpy == nullptr) {
++        return 0;
++    }
++
++    const ggml_tensor * src = cpy->src[0]; // view of the scan's snapshot tail
++    const ggml_tensor * dst = cpy->src[1]; // the cache view the kernel writes instead
++
++    if (src->op != GGML_OP_VIEW || src->view_src != ssm || src->view_offs != tail_off || !ggml_is_contiguous(src)) {
++        return 0;
++    }
++    // dst is the [D, n_seqs, n_written] cache view, one sequence's state D floats long
++    const std::array<int64_t, GGML_MAX_DIMS> expected_ne = { D, n_seqs, n_written, 1 };
++    if (dst->op != GGML_OP_VIEW || dst->type != GGML_TYPE_F32 || dst->data == nullptr ||
++        !std::equal(expected_ne.begin(), expected_ne.end(), dst->ne) ||
++        dst->nb[0] != ggml_type_size(GGML_TYPE_F32) || dst->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D)) {
++        return 0;
++    }
++    // the kernel writes a sequence's state with src0's head stride, which must match the cache row
++    if (st->nb[0] != sizeof(float) || st->nb[1] != d_state * sizeof(float) ||
++        st->nb[2] != (size_t) (d_state * st->ne[1]) * sizeof(float)) {
++        return 0;
++    }
++
++    fused_state_cpy.data        = (float *) dst->data; // rollback slot 0 (newest)
++    fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / sizeof(float)) : 0;
++    return skip;
++}
++
+ // match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
+ // (slot i -> rollback group i, slot 0 newest), so the kernel can write them and skip the cpy.
+ // returns the number of following nodes to skip (0 = no fusion)
+@@ -7083,6 +7163,16 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+             }
+         }
+ #endif
++        // ssm_scan -> cpy: the scan writes its state snapshots into the cache
++        if (node->op == GGML_OP_SSM_SCAN) {
++            ggml_sycl_ssm_scan_fused_cache fused_state_cpy;
++            const int ssm_nodes_to_skip = ggml_sycl_try_ssm_scan_cache_fusion(cgraph, i, fused_state_cpy);
++            if (ssm_nodes_to_skip > 0) {
++                ggml_sycl_op_ssm_scan_fused_cache(*sycl_ctx, node, fused_state_cpy);
++                i += ssm_nodes_to_skip;
++                continue;
++            }
++        }
+         // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
+         if (node->op == GGML_OP_GATED_DELTA_NET) {
+             ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;
+@@ -7106,6 +7196,39 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+                 }
+             }
+         }
++        // MUL -> SIN -> SQR -> MUL -> ADD: the snake activation
++        if (node->op == GGML_OP_MUL) {
++            const ggml_tensor * sx;
++            const ggml_tensor * sa;
++            const ggml_tensor * sb;
++            if (ggml_sycl_match_snake(cgraph, i, sx, sa, sb)) {
++                ggml_sycl_op_snake(*sycl_ctx, sx, sa, sb, cgraph->nodes[i + 4]);
++                i += 4;
++                continue;
++            }
++        }
++        // SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST: the gated post weights of qwen4exp's hc_combine
++        if (node->op == GGML_OP_SCALE && i + 3 < cgraph->n_nodes &&
++            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST },
++                               { GGML_UNARY_OP_SIGMOID })) {
++            ggml_sycl_op_dsv4_hc_post_gated(*sycl_ctx, cgraph->nodes[i + 3], node, cgraph->nodes[i + 2]);
++            i += 3;
++            continue;
++        }
++        // SCALE -> TANH -> SCALE: the logit softcap
++        if (node->op == GGML_OP_SCALE && i + 2 < cgraph->n_nodes &&
++            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
++            ggml_sycl_op_softcap(*sycl_ctx, cgraph->nodes[i + 2], node);
++            i += 2;
++            continue;
++        }
++        // RELU -> SQR
++        if (node->op == GGML_OP_UNARY && i + 1 < cgraph->n_nodes &&
++            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_SQR }, { GGML_UNARY_OP_RELU })) {
++            ggml_sycl_op_relu_sqr(*sycl_ctx, node, cgraph->nodes[i + 1]);
++            i += 1;
++            continue;
++        }
+         // a chain of 3..8 ADDs (pairs keep the broadcasting ADD + ADD kernel below)
+         if (node->op == GGML_OP_ADD) {
+             const int n_adds = ggml_sycl_match_multi_add(cgraph, i);
+diff --git a/ggml/src/ggml-sycl/ssm_scan.cpp b/ggml/src/ggml-sycl/ssm_scan.cpp
+index 7fceb85d..9e033a9f 100644
+--- a/ggml/src/ggml-sycl/ssm_scan.cpp
++++ b/ggml/src/ggml-sycl/ssm_scan.cpp
+@@ -10,7 +10,7 @@ static void ssm_scan_f32_group(
+         const int src2_nb1, const int src2_nb2, const int src3_nb1,
+         const int src4_nb2, const int src4_nb3, const int src5_nb2, const int src5_nb3,
+         const int64_t s_off, const int64_t n_head, const int64_t d_head, const int64_t n_group, const int64_t n_tok,
+-        const int64_t K,
++        const int64_t K, float * __restrict__ cache, const int64_t cache_slot_stride,
+         const sycl::nd_item<2> & item) {
+ 
+     const int lane     = item.get_local_id(1) % WARP_SIZE;
+@@ -29,7 +29,11 @@ static void ssm_scan_f32_group(
+     const float * B_warp  = (const float *) ((const char *) src4 + (seq_idx * src4_nb3) + (group_off));
+     const float * C_warp  = (const float *) ((const char *) src5 + (seq_idx * src5_nb3) + (group_off));
+     float *       y_warp  = dst + (seq_idx * n_tok * n_head * d_head) + warp_idx;
+-    float *       s_warp  = (float *) ((char *) dst + s_off + seq_idx * src0_nb3 + head_idx * src0_nb2 + head_off * d_state);
++    // the fused cache cpy (ggml_sycl_ssm_scan_fused_cache) writes the final state and the snapshots straight into the
++    // cache, rollback slot 0 at cache, slot k cache_slot_stride floats further; one sequence only
++    const int64_t s_in_seq = head_idx * src0_nb2 + head_off * d_state; // bytes into a sequence's state
++    float *       s_warp   = cache ? (float *) ((char *) cache + s_in_seq) :
++                                     (float *) ((char *) dst + s_off + seq_idx * src0_nb3 + s_in_seq);
+ 
+     const int stride_x  = src1_nb2 / sizeof(float);
+     const int stride_dt = src2_nb1 / sizeof(float);
+@@ -68,7 +72,9 @@ static void ssm_scan_f32_group(
+ 
+         const int64_t slot = n_tok - 1 - i;
+         if (K > 1 && slot > 0 && slot < K) {
+-            float * s_snapshot_warp = (float *) ((char *) dst + s_off + (slot * item.get_group_range(0) + seq_idx) * src0_nb3 + head_idx * src0_nb2 + head_off * d_state);
++            float * s_snapshot_warp =
++                cache ? (float *) ((char *) (cache + slot * cache_slot_stride) + s_in_seq) :
++                        (float *) ((char *) dst + s_off + (slot * item.get_group_range(0) + seq_idx) * src0_nb3 + s_in_seq);
+ #pragma unroll
+             for (int j = 0; j < c_factor; j++) {
+                 s_snapshot_warp[WARP_SIZE * j + lane] = state[j];
+@@ -89,7 +95,7 @@ static void ssm_scan_f32_sycl(
+         const int src2_nb2, const int src3_nb1, const int src4_nb2, const int src4_nb3, const int src5_nb2,
+         const int src5_nb3, const int64_t s_off, const int64_t d_state, const int64_t head_dim,
+         const int64_t n_head, const int64_t n_group, const int64_t n_tok, const int64_t n_seq,
+-        const int64_t K,
++        const int64_t K, float * cache, const int64_t cache_slot_stride,
+         dpct::queue_ptr stream) {
+ 
+     // NOTE: if you change conditions here, be sure to update the corresponding supports_op condition!
+@@ -105,7 +111,8 @@ static void ssm_scan_f32_sycl(
+                 ssm_scan_f32_group<128 / WARP_SIZE, 128>(
+                     src0, src1, src2, src3, src4, src5, src6, dst,
+                     src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
+-                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok, K, item);
++                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok, K, cache,
++                    cache_slot_stride, item);
+             });
+     } else if (d_state == 256) {
+         constexpr int threads   = 256;
+@@ -118,14 +125,16 @@ static void ssm_scan_f32_sycl(
+                 ssm_scan_f32_group<256 / WARP_SIZE, 256>(
+                     src0, src1, src2, src3, src4, src5, src6, dst,
+                     src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
+-                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok, K, item);
++                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok, K, cache,
++                    cache_slot_stride, item);
+             });
+     } else {
+         GGML_ABORT("ssm_scan: unsupported d_state (must be 128 or 256)");
+     }
+ }
+ 
+-inline void ggml_sycl_op_ssm_scan(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
++inline void ggml_sycl_op_ssm_scan(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
++                                  const ggml_sycl_ssm_scan_fused_cache * fused = nullptr) {
+     const ggml_tensor * src0 = dst->src[0];
+     const ggml_tensor * src1 = dst->src[1];
+     const ggml_tensor * src2 = dst->src[2];
+@@ -161,10 +170,17 @@ inline void ggml_sycl_op_ssm_scan(ggml_backend_sycl_context & ctx, ggml_tensor *
+         static_cast<const int32_t *>(src6->data), static_cast<float *>(dst->data),
+         src0->nb[2], src0->nb[3], src1->nb[2], src1->nb[3], src2->nb[1], src2->nb[2],
+         src3->nb[1], src4->nb[2], src4->nb[3], src5->nb[2], src5->nb[3],
+-        s_off, nc, nr, nh, ng, n_t, n_s, K, stream);
++        s_off, nc, nr, nh, ng, n_t, n_s, K, fused ? fused->data : nullptr, fused ? fused->slot_stride : 0, stream);
+ }
+ 
+ void ggml_sycl_ssm_scan(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/7);
+     ggml_sycl_op_ssm_scan(ctx, dst);
+ }
++
++void ggml_sycl_op_ssm_scan_fused_cache(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
++                                       const ggml_sycl_ssm_scan_fused_cache & fused) {
++    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/7, " : state snapshots written into the cache");
++    GGML_ASSERT(dst->src[1]->ne[3] == 1);
++    ggml_sycl_op_ssm_scan(ctx, dst, &fused);
++}
+diff --git a/ggml/src/ggml-sycl/ssm_scan.hpp b/ggml/src/ggml-sycl/ssm_scan.hpp
+index 1f9731fb..07f51cc1 100644
+--- a/ggml/src/ggml-sycl/ssm_scan.hpp
++++ b/ggml/src/ggml-sycl/ssm_scan.hpp
+@@ -3,3 +3,14 @@
+ #include "common.hpp"
+ 
+ void ggml_sycl_ssm_scan(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
++
++// SSM_SCAN + the CPY that scatters its state snapshots into the cache (ported from CUDA's
++// ggml_cuda_try_ssm_scan_cache_fusion): the kernel writes the final state to data (rollback slot 0) and snapshot k
++// to data + k * slot_stride, and skips the snapshot tail of dst. One sequence only.
++struct ggml_sycl_ssm_scan_fused_cache {
++    float * data;
++    int64_t slot_stride;
++};
++
++void ggml_sycl_op_ssm_scan_fused_cache(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
++                                       const ggml_sycl_ssm_scan_fused_cache & fused);
+diff --git a/ggml/src/ggml-sycl/topk-moe.cpp b/ggml/src/ggml-sycl/topk-moe.cpp
+index bf451390..b8f50a41 100644
+--- a/ggml/src/ggml-sycl/topk-moe.cpp
++++ b/ggml/src/ggml-sycl/topk-moe.cpp
+@@ -1,6 +1,7 @@
+ #include <cfloat>
+ #include <initializer_list>
+ #include <vector>
++#include <iterator>
+ 
+ #include "ggml.h"
+ #include "ggml-impl.h"
+@@ -9,12 +10,16 @@
+ 
+ // SYCL port of ggml-cuda/topk-moe.cu. The kernel is a translation of the CUDA no-PDL path of
+ // topk_moe_cuda, including the routing bias (DeepSeek-V3-style selection on probs + bias with the
+-// unbiased probs as weights); the fusion-detection helpers below are ported near-verbatim from
+-// ggml-cuda.cu (pure graph / pointer inspection, backend-agnostic). CUDA's expert-group masking and
+-// sqrt(softplus) gating are not ported: those graphs do not match here and run unfused.
++// unbiased probs as weights), the sqrt(softplus) gating (DeepSeek-V4) and the expert-group masking of
++// DeepSeek-V3 (top n_group_used groups by the sum of their top two experts, up to WARP_SIZE groups); the
++// fusion-detection helpers below are ported near-verbatim from ggml-cuda.cu (pure graph / pointer
++// inspection, backend-agnostic).
+ 
+ struct ggml_sycl_topk_moe_args {
+     bool sigmoid{};
++    bool sqrt_softplus{};
++    int  n_groups{};
++    int  n_group_used{};
+     bool softmax{};
+     bool delayed_softmax{};
+     bool prob_bias{};
+@@ -24,8 +29,11 @@ struct ggml_sycl_topk_moe_args {
+ 
+ struct topk_moe_config {
+     bool use_sigmoid;
++    bool use_sqrt_softplus;
+     bool with_norm;
+     bool delayed_softmax;
++    int  n_groups;
++    int  n_group_used;
+ };
+ 
+ // warp-local softmax used for both the pre-top-k logits and the post-top-k delayed path
+@@ -77,6 +85,93 @@ static inline void sigmoid_warp_inplace(float (&vals)[experts_per_thread], const
+     }
+ }
+ 
++template <int experts_per_thread, bool use_limit>
++static inline void sqrt_softplus_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
++#pragma unroll
++    for (int i = 0; i < experts_per_thread; i++) {
++        const int  idx    = lane + i * WARP_SIZE;
++        const bool active = !use_limit || (idx < limit);
++        vals[i] = active ? sycl::sqrt(vals[i] > 20.0f ? vals[i] : sycl::log1p(sycl::exp(vals[i]))) : -INFINITY;
++    }
++}
++
++// -inf for the experts outside the n_group_used best groups; a group scores the sum of its top two experts
++// (DeepSeek-V3). n_experts is a power of two here, so the group size is one too: a group is whole elements of
++// vals (n_per_group >= WARP_SIZE) or an aligned block of lanes inside one element. Lane g ends up holding
++// group g's score, so n_groups <= WARP_SIZE. Scoring takes one pass over vals. Only the has_groups
++// instantiations of topk_moe_kernel carry this: at 256 / 512 experts it costs registers that the models
++// without expert groups should not pay (see launch_topk_moe).
++template <int n_experts, int experts_per_thread>
++static inline void group_mask_warp_inplace(float (&vals)[experts_per_thread], const int n_groups,
++                                           const int n_group_used, const int lane, const sycl::sub_group & sg) {
++    const int n_per_group = n_experts / n_groups;
++    const int log2_group  = sycl::ctz(n_per_group);
++    float     score       = -INFINITY;
++
++    if (n_per_group >= WARP_SIZE) {
++        const int elems = n_per_group / WARP_SIZE;  // elements of vals per group, a power of two
++        float     top1  = -INFINITY;
++        float     top2  = -INFINITY;
++#pragma unroll
++        for (int i = 0; i < experts_per_thread; i++) {
++            top2 = sycl::fmax(top2, sycl::fmin(top1, vals[i]));
++            top1 = sycl::fmax(top1, vals[i]);
++            if (((i + 1) & (elems - 1)) == 0) {  // last element of group i / elems
++#pragma unroll
++                for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
++                    const float o1 = dpct::permute_sub_group_by_xor(sg, top1, offset);
++                    const float o2 = dpct::permute_sub_group_by_xor(sg, top2, offset);
++                    top2           = sycl::fmax(sycl::fmin(top1, o1), sycl::fmax(top2, o2));
++                    top1           = sycl::fmax(top1, o1);
++                }
++                if (lane == i / elems) {
++                    score = top1 + top2;
++                }
++                top1 = -INFINITY;
++                top2 = -INFINITY;
++            }
++        }
++    } else {
++        const int groups_per_elem = WARP_SIZE / n_per_group;
++#pragma unroll
++        for (int i = 0; i < experts_per_thread; i++) {
++            // top two inside each aligned block of n_per_group lanes
++            float top1 = vals[i];
++            float top2 = -INFINITY;
++            for (int offset = n_per_group / 2; offset > 0; offset >>= 1) {
++                const float o1 = dpct::permute_sub_group_by_xor(sg, top1, offset);
++                const float o2 = dpct::permute_sub_group_by_xor(sg, top2, offset);
++                top2           = sycl::fmax(sycl::fmin(top1, o1), sycl::fmax(top2, o2));
++                top1           = sycl::fmax(top1, o1);
++            }
++            // block m holds group i * groups_per_elem + m; that group's lane takes it from the block's first lane
++            const int   g0  = i * groups_per_elem;
++            const bool  own = lane >= g0 && lane < g0 + groups_per_elem;
++            const float s   = sycl::select_from_group(sg, top1 + top2, own ? (lane - g0) << log2_group : 0);
++            if (own) {
++                score = s;
++            }
++        }
++    }
++
++    // rank of each group, the lower index wins ties
++    int rank = 0;
++    for (int g = 0; g < n_groups; g++) {
++        const float other = sycl::select_from_group(sg, score, g);
++        rank += other > score || (other == score && g < lane);
++    }
++    const bool     keep      = lane < n_groups && rank < n_group_used;
++    const uint32_t keep_bits = sycl::reduce_over_group(sg, keep ? 1u << lane : 0u, sycl::bit_or<uint32_t>());
++
++#pragma unroll
++    for (int i = 0; i < experts_per_thread; i++) {
++        const int g = (i * WARP_SIZE + lane) >> log2_group;
++        if (g >= n_groups || !((keep_bits >> g) & 1u)) {
++            vals[i] = -INFINITY;
++        }
++    }
++}
++
+ /*
+     This kernel does the following:
+     1. optionally softmax/sigmoid over the logits per token [n_experts, n_tokens]
+@@ -87,7 +182,7 @@ static inline void sigmoid_warp_inplace(float (&vals)[experts_per_thread], const
+     It is intended as a fusion of the softmax->top-k->get_rows pipeline for MoE models.
+     One sub-group handles one row/token, mirroring topk_moe_cuda's one-warp-per-row layout.
+ */
+-template <int n_experts, bool has_bias>
++template <int n_experts, bool has_bias, bool has_groups>
+ static void topk_moe_kernel(const float * __restrict__ logits,
+                             float * __restrict__       weights,
+                             int32_t * __restrict__     ids,
+@@ -124,6 +219,8 @@ static void topk_moe_kernel(const float * __restrict__ logits,
+     if (!config.delayed_softmax) {
+         if (config.use_sigmoid) {
+             sigmoid_warp_inplace<experts_per_thread, false>(wt, n_experts, lane);
++        } else if (config.use_sqrt_softplus) {
++            sqrt_softplus_warp_inplace<experts_per_thread, false>(wt, n_experts, lane);
+         } else {
+             softmax_warp_inplace<experts_per_thread, false>(wt, n_experts, lane);
+         }
+@@ -153,6 +250,16 @@ static void topk_moe_kernel(const float * __restrict__ logits,
+         }
+     }
+ 
++    // without a bias, masking wt is safe: the matcher ensures the kept groups hold all used experts
++    if constexpr (has_groups) {
++        const sycl::sub_group gsg = item_ct1.get_sub_group();
++        if constexpr (has_bias) {
++            group_mask_warp_inplace<n_experts>(selection_wt, config.n_groups, config.n_group_used, lane, gsg);
++        } else {
++            group_mask_warp_inplace<n_experts>(wt, config.n_groups, config.n_group_used, lane, gsg);
++        }
++    }
++
+     // each thread now holds either a portion of the softmax distribution or the raw logits. Do the
+     // argmax reduce over n_expert_used, each time marking the selected expert as -inf to exclude it
+     // from the next iteration.
+@@ -252,18 +359,57 @@ static void topk_moe_kernel(const float * __restrict__ logits,
+     }
+ }
+ 
+-template <int n_experts, bool has_bias>
++// A kernel with or without the 256-register file: two kernel types, since one lambda launched with two
++// property sets would be two kernels of one name.
++template <typename K, bool large_grf> struct topk_moe_grf_kernel {
++    K k;
++
++    void operator()(sycl::nd_item<1> item) const { k(item); }
++
++    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
++        if constexpr (large_grf) {
++            return sycl::ext::oneapi::experimental::properties{
++                sycl::ext::intel::experimental::grf_size<256>,
++                sycl::ext::oneapi::experimental::sub_group_size<WARP_SIZE> };
++        } else {
++            return sycl::ext::oneapi::experimental::properties{
++                sycl::ext::oneapi::experimental::sub_group_size<WARP_SIZE> };
++        }
++    }
++};
++
++template <int n_experts, bool has_bias, bool has_groups>
+ static void launch_topk_moe(queue_ptr stream, const float * logits, float * weights, int32_t * ids, const float * bias,
+                             int n_rows, int n_expert_used, float clamp_val, float scale_val,
+                             const topk_moe_config & config) {
+-    const sycl::range<1> block_dims(WARP_SIZE);
+-    const sycl::range<1> block_nums(n_rows);
+-    stream->parallel_for(sycl::nd_range<1>(block_nums * block_dims, block_dims),
+-                         [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+-                             topk_moe_kernel<n_experts, has_bias>(logits, weights, ids, bias, n_rows, n_expert_used,
+-                                                                  clamp_val, scale_val, config);
+-                             GGML_UNUSED(item_ct1);
+-                         });
++    const sycl::range<1>    block_dims(WARP_SIZE);
++    const sycl::range<1>    block_nums(n_rows);
++    const sycl::nd_range<1> range(block_nums * block_dims, block_dims);
++    const auto              kernel = [=](sycl::nd_item<1> item_ct1) {
++        topk_moe_kernel<n_experts, has_bias, has_groups>(logits, weights, ids, bias, n_rows, n_expert_used, clamp_val,
++                                                         scale_val, config);
++        GGML_UNUSED(item_ct1);
++    };
++    if constexpr (has_groups && n_experts >= 256) {
++        // The grouped masking spills 1.2 to 9.2 KB per thread at 128 registers here (acm-g10). A router runs
++        // one sub-group per token and is small next to the expert mat-muls, so it has no occupancy worth
++        // keeping: it takes the 256-register file on the Intel GPUs with XMX, which all have one. Elsewhere
++        // (the CPU OpenCL device rejects the option the runtime passes for it) it stays at 128.
++        sycl::device dev = stream->get_device();
++        if (dev.is_gpu() && gpu_has_xmx(dev)) {
++            stream->submit([&](sycl::handler & cgh) {
++                cgh.parallel_for(range, topk_moe_grf_kernel<decltype(kernel), true>{ kernel });
++            });
++        } else {
++            stream->submit([&](sycl::handler & cgh) {
++                cgh.parallel_for(range, topk_moe_grf_kernel<decltype(kernel), false>{ kernel });
++            });
++        }
++    } else {
++        stream->parallel_for(range, [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++            kernel(item_ct1);
++        });
++    }
+ }
+ 
+ template <bool has_bias>
+@@ -273,8 +419,13 @@ static void launch_topk_moe_n(queue_ptr stream, int n_experts, const float * log
+     switch (n_experts) {
+ #define GGML_SYCL_TOPK_MOE_CASE(N)                                                                                \
+     case N:                                                                                                       \
+-        launch_topk_moe<N, has_bias>(stream, logits, weights, ids, bias, n_rows, n_expert_used, clamp_val,     \
+-                                     scale_val, config);                                                        \
++        if (config.n_groups > 0) {                                                                              \
++            launch_topk_moe<N, has_bias, true>(stream, logits, weights, ids, bias, n_rows, n_expert_used,      \
++                                               clamp_val, scale_val, config);                                  \
++        } else {                                                                                                \
++            launch_topk_moe<N, has_bias, false>(stream, logits, weights, ids, bias, n_rows, n_expert_used,     \
++                                                clamp_val, scale_val, config);                                 \
++        }                                                                                                       \
+         break;
+         GGML_SYCL_TOPK_MOE_CASE(1)
+         GGML_SYCL_TOPK_MOE_CASE(2)
+@@ -300,6 +451,9 @@ static void ggml_sycl_op_topk_moe(ggml_backend_sycl_context &     ctx,
+                                   const ggml_tensor *             scale,
+                                   const ggml_tensor *             bias,
+                                   const ggml_sycl_topk_moe_args & args) {
++    scope_op_debug_print scope_dbg_print(__func__, weights, /*num_src=*/0,
++                                         args.n_groups > 0 ? " : fused top-k MoE routing, expert groups" :
++                                                             " : fused top-k MoE routing");
+     GGML_ASSERT(logits->type  == GGML_TYPE_F32);
+     GGML_ASSERT(weights->type == GGML_TYPE_F32);
+     GGML_ASSERT(ids->type     == GGML_TYPE_I32);
+@@ -319,9 +473,12 @@ static void ggml_sycl_op_topk_moe(ggml_backend_sycl_context &     ctx,
+     const float scale_val = scale ? ggml_get_op_params_f32(scale, 0) : 1.0f;
+ 
+     topk_moe_config config;
+-    config.use_sigmoid     = args.sigmoid;
+-    config.with_norm       = with_norm;
+-    config.delayed_softmax = args.delayed_softmax;
++    config.use_sigmoid       = args.sigmoid;
++    config.use_sqrt_softplus = args.sqrt_softplus;
++    config.with_norm         = with_norm;
++    config.delayed_softmax   = args.delayed_softmax;
++    config.n_groups          = args.n_groups;
++    config.n_group_used      = args.n_group_used;
+ 
+     queue_ptr stream = ctx.stream();
+     ggml_sycl_set_device(ctx.device);
+@@ -364,7 +521,8 @@ static bool ggml_sycl_should_use_topk_moe(const ggml_tensor * gating_op, const g
+             return false;
+         }
+     } else if (gating_op->op == GGML_OP_UNARY) {
+-        if (ggml_get_unary_op(gating_op) != GGML_UNARY_OP_SIGMOID) {
++        const ggml_unary_op uop = ggml_get_unary_op(gating_op);
++        if (uop != GGML_UNARY_OP_SIGMOID && uop != GGML_UNARY_OP_SOFTPLUS) {
+             return false;
+         }
+     }
+@@ -372,6 +530,59 @@ static bool ggml_sycl_should_use_topk_moe(const ggml_tensor * gating_op, const g
+     return true;
+ }
+ 
++// the expert-group selection of build_moe_ffn (n_expert_groups > 1), ported from CUDA's topk_moe_group_pattern:
++// src0 / src1 index into this table, -1 is the (biased) probs, -2 is not checked
++static const struct {
++    ggml_op op;
++    int     src0;
++    int     src1;
++} topk_moe_group_pattern[] = {
++    { GGML_OP_RESHAPE, -1, -2 },  //  0: [n_exp_per_group, n_expert_groups, n_tokens]
++    { GGML_OP_RESHAPE, 0, -2 },   //  1: [1, n_exp_per_group, n_expert_groups, n_tokens]
++    { GGML_OP_ARGSORT, 0, -2 },   //  2
++    { GGML_OP_VIEW, 2, -2 },      //  3: top-2 per group
++    { GGML_OP_GET_ROWS, 1, 3 },   //  4
++    { GGML_OP_RESHAPE, 4, -2 },   //  5
++    { GGML_OP_SUM_ROWS, 5, -2 },  //  6: group scores
++    { GGML_OP_RESHAPE, 6, -2 },   //  7
++    { GGML_OP_ARGSORT, 7, -2 },   //  8
++    { GGML_OP_VIEW, 8, -2 },      //  9: top n_group_used groups
++    { GGML_OP_GET_ROWS, 0, 9 },   // 10
++    { GGML_OP_FILL, 0, -2 },      // 11
++    { GGML_OP_SET_ROWS, 10, 9 },  // 12: unused groups -> -inf
++    { GGML_OP_RESHAPE, 12, -2 },  // 13: [n_expert, n_tokens]
++};
++
++static bool ggml_sycl_topk_moe_group_fusion(const ggml_cgraph * cgraph, int node_idx, const ggml_tensor * selection,
++                                            ggml_sycl_topk_moe_args & args) {
++    const int n_ops = (int) std::size(topk_moe_group_pattern);
++    if (node_idx + n_ops > cgraph->n_nodes) {
++        return false;
++    }
++
++    ggml_tensor * const * nodes  = cgraph->nodes + node_idx;
++    auto                  src_ok = [&](const ggml_tensor * src, int idx) {
++        return idx == -2 || src == (idx == -1 ? selection : nodes[idx]);
++    };
++    for (int i = 0; i < n_ops; i++) {
++        const auto & p = topk_moe_group_pattern[i];
++        if (nodes[i]->op != p.op || !src_ok(nodes[i]->src[0], p.src0) || !src_ok(nodes[i]->src[1], p.src1)) {
++            return false;
++        }
++    }
++
++    const int n_groups     = nodes[0]->ne[1];
++    const int n_group_used = nodes[9]->ne[0];
++    if (nodes[3]->ne[0] != 2 || nodes[12]->src[2] != nodes[11] || ggml_get_op_params_f32(nodes[11], 0) != -INFINITY ||
++        n_groups > WARP_SIZE) {
++        return false;
++    }
++
++    args.n_groups     = n_groups;
++    args.n_group_used = n_group_used;
++    return true;
++}
++
+ // ported from ggml_cuda_topk_moe_fusion - pure graph inspection, backend-agnostic
+ static bool ggml_sycl_topk_moe_fusion(const ggml_cgraph * cgraph, int node_idx, ggml_sycl_topk_moe_args & args) {
+     args = ggml_sycl_topk_moe_args{};
+@@ -384,10 +595,17 @@ static bool ggml_sycl_topk_moe_fusion(const ggml_cgraph * cgraph, int node_idx,
+     }
+ 
+     if (nodes[node_idx]->op == GGML_OP_UNARY) {
+-        if (ggml_get_unary_op(nodes[node_idx]) != GGML_UNARY_OP_SIGMOID) {
++        const ggml_unary_op unary_op = ggml_get_unary_op(nodes[node_idx]);
++        if (unary_op == GGML_UNARY_OP_SIGMOID) {
++            args.sigmoid = true;
++        } else if (unary_op == GGML_UNARY_OP_SOFTPLUS && node_idx + 1 < n_nodes &&
++                   nodes[node_idx + 1]->op == GGML_OP_SQRT && nodes[node_idx + 1]->src[0] == nodes[node_idx]) {
++            // sqrt(softplus(x)) scoring (DeepSeek-V4)
++            args.sqrt_softplus = true;
++            node_idx++;
++        } else {
+             return false;
+         }
+-        args.sigmoid = true;
+     }
+ 
+     if (nodes[node_idx]->op == GGML_OP_ARGSORT) {
+@@ -396,7 +614,7 @@ static bool ggml_sycl_topk_moe_fusion(const ggml_cgraph * cgraph, int node_idx,
+ 
+     node_idx++;
+ 
+-    if (args.sigmoid || args.softmax) {
++    if (args.sigmoid || args.sqrt_softplus || args.softmax) {
+         // SOFTMAX -> RESHAPE
+         if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_RESHAPE ||
+             nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
+@@ -410,18 +628,20 @@ static bool ggml_sycl_topk_moe_fusion(const ggml_cgraph * cgraph, int node_idx,
+         }
+ 
+         // src of bias add is the unreshaped probs (-2 instead of -1)
+-        if (nodes[node_idx]->op == GGML_OP_ADD && nodes[node_idx]->src[0] == nodes[node_idx - 2]) {
++        const ggml_tensor * selection = nodes[node_idx - 2];
++        if (nodes[node_idx]->op == GGML_OP_ADD && nodes[node_idx]->src[0] == selection) {
+             args.prob_bias = true;
++            selection      = nodes[node_idx];
+             node_idx++;
+         }
+-        // RESHAPE/ADD -> ARGSORT
+-        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_ARGSORT) {
+-            return false;
++
++        if (ggml_sycl_topk_moe_group_fusion(cgraph, node_idx, selection, args)) {
++            node_idx += (int) std::size(topk_moe_group_pattern);
++            selection = nodes[node_idx - 1];
+         }
+ 
+-        if (args.prob_bias && nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
+-            return false;
+-        } else if (!args.prob_bias && nodes[node_idx]->src[0] != nodes[node_idx - 2]) {
++        // RESHAPE / ADD / group mask -> ARGSORT
++        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_ARGSORT || nodes[node_idx]->src[0] != selection) {
+             return false;
+         }
+ 
+@@ -432,6 +652,11 @@ static bool ggml_sycl_topk_moe_fusion(const ggml_cgraph * cgraph, int node_idx,
+             nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
+             return false;
+         }
++        // the kept groups must hold all used experts
++        if (args.n_groups > 0 &&
++            nodes[node_idx]->ne[0] > args.n_group_used * (probs_reshaped->ne[1] / args.n_groups)) {
++            return false;
++        }
+         node_idx++;
+ 
+         if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_GET_ROWS) {
+@@ -605,17 +830,28 @@ int ggml_sycl_fuse_topk_moe(ggml_backend_sycl_context & ctx, ggml_cgraph * cgrap
+     int                  out_nodes[2];
+ 
+     if (!args.delayed_softmax) {
+-        const ggml_op gating_op = args.sigmoid ? GGML_OP_UNARY : GGML_OP_SOFT_MAX;
+-        ops.insert(ops.end(), { gating_op, GGML_OP_RESHAPE });
++        if (args.sigmoid) {
++            ops.push_back(GGML_OP_UNARY);
++        } else if (args.sqrt_softplus) {
++            ops.insert(ops.end(), { GGML_OP_UNARY, GGML_OP_SQRT });
++        } else {
++            ops.push_back(GGML_OP_SOFT_MAX);
++        }
++        ops.push_back(GGML_OP_RESHAPE);
+         if (args.prob_bias) {
+             // selection on probs + bias: the bias must be one F32 value per expert
+             ops.push_back(GGML_OP_ADD);
+-            bias = cgraph->nodes[i + 2]->src[1];
++            bias = cgraph->nodes[i + (int) ops.size() - 1]->src[1];
+             if (bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias) || bias->ne[0] != logits->ne[0] ||
+                 ggml_nelements(bias) != bias->ne[0]) {
+                 return 0;
+             }
+         }
++        if (args.n_groups > 0) {
++            for (const auto & p : topk_moe_group_pattern) {
++                ops.push_back(p.op);
++            }
++        }
+         ops.insert(ops.end(), { GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS });
+         out_nodes[0] = i + (int) ops.size() - 2;
+         ids          = cgraph->nodes[out_nodes[0]];

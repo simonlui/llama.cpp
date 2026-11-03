@@ -9,13 +9,18 @@ GGML_SYCL_FA_GQA_DEC=0 turns it off. Author timings are on an A770 under Windows
 Local change: the q8_0 D=256 SLM ESIMD kernel tests mask on the host (has_mask). The in-kernel
 64-bit pointer compare made IGC 2.43 emit an unemulated 64-bit shift for acm-g10 ("Q destination
 data type is not supported"), which failed the whole ESIMD image for DG2.
+Local change: the D=256 SPMD partial kernels (plain and SLM) ask for grf_size<256> on Intel GPUs with
+XMX. A lane holds D / 16 floats of the query row and of the accumulator plus its K / V slice, about 128
+registers at D=256, and an acm-g10 AOT build spilled 0.7-1.7 KB per thread at 128; at 256 none spills.
+D=64/128 keep 128, and so do other devices: the runtime passes the request as an IGC option that the
+CPU OpenCL device rejects.
 
 diff --git a/ggml/src/ggml-sycl/fattn-gqa-dec.cpp b/ggml/src/ggml-sycl/fattn-gqa-dec.cpp
 new file mode 100644
-index 00000000..c7a333e1
+index 00000000..bc9095f1
 --- /dev/null
 +++ b/ggml/src/ggml-sycl/fattn-gqa-dec.cpp
-@@ -0,0 +1,1344 @@
+@@ -0,0 +1,1391 @@
 +// GQA-grouped flash-attention decode for small query batches (1..4 tokens, e.g. a
 +// speculative-decoding verify), written for Xe-HPG (Arc A770).
 +//
@@ -73,6 +78,51 @@ index 00000000..c7a333e1
 +    }
 +}
 +
++// The SPMD partial kernels keep a lane's slice of the query row and of the accumulator (D / 16 floats
++// each) plus the K / V slice it is working on in registers: at D = 256 that is about 128 registers of
++// 32 bytes before any addressing, and an acm-g10 AOT build spilled 0.25 to 1.6 KB per thread at the
++// default 128. At D >= 256 they ask for the 256-register file (honoured by AOT builds for SPMD kernels)
++// on the Intel GPUs with XMX, which all have it. Elsewhere the runtime's IGC option for it fails the
++// build (the CPU OpenCL device rejects it, and lists AMX as ext_intel_matrix), so those keep 128.
++static bool gqa_dec_large_grf(dpct::queue_ptr stream) {
++    sycl::device dev = stream->get_device();
++    return dev.is_gpu() && gpu_has_xmx(dev);
++}
++
++// one kernel type per register-file size: a lambda launched with two property sets would be two
++// kernels of one name
++template <typename Kernel, bool LG> struct gqa_dec_kernel {
++    Kernel k;
++
++    void operator()(sycl::nd_item<2> it) const { k(it); }
++
++    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
++        if constexpr (LG) {
++            return sycl::ext::oneapi::experimental::properties{
++                sycl::ext::intel::experimental::grf_size<256>,
++                sycl::ext::oneapi::experimental::sub_group_size<GQA_DEC_SG> };
++        } else {
++            return sycl::ext::oneapi::experimental::properties{
++                sycl::ext::oneapi::experimental::sub_group_size<GQA_DEC_SG> };
++        }
++    }
++};
++
++template <int D, typename Kernel>
++static void gqa_dec_parallel_for(sycl::handler & cgh, bool large_grf, const sycl::nd_range<2> & range,
++                                 Kernel && kernel) {
++    if constexpr (D >= 256) {
++        using K = std::decay_t<Kernel>;
++        if (large_grf) {
++            cgh.parallel_for(range, gqa_dec_kernel<K, true>{ kernel });
++        } else {
++            cgh.parallel_for(range, gqa_dec_kernel<K, false>{ kernel });
++        }
++    } else {
++        cgh.parallel_for(range, kernel);
++    }
++}
++
 +// SLM variant: the work-group dequantizes a tile of GQA_DEC_TILE K/V rows once, with
 +// consecutive work-items on consecutive bytes, into local memory; every query row
 +// (one sub-group each) then reads its 16-element slice from SLM. The KV head's rows
@@ -91,11 +141,12 @@ index 00000000..c7a333e1
 +    const int     nthr  = rows * GQA_DEC_SG;
 +    const sycl::range<2> lws(1, (size_t) nthr);
 +    const sycl::range<2> gws((size_t) n_kvh * n_chunks, (size_t) nthr);
++    const bool           large_grf = D >= 256 && gqa_dec_large_grf(stream);
 +
 +    stream->submit([&](sycl::handler & cgh) {
 +        sycl::local_accessor<float, 1> ks(sycl::range<1>(T * D), cgh);
 +        sycl::local_accessor<float, 1> vs(sycl::range<1>(T * D), cgh);
-+        cgh.parallel_for(sycl::nd_range<2>(gws, lws), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(GQA_DEC_SG)]] {
++        gqa_dec_parallel_for<D>(cgh, large_grf, sycl::nd_range<2>(gws, lws), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(GQA_DEC_SG)]] {
 +            const auto sg    = it.get_sub_group();
 +            const int  lane  = sg.get_local_linear_id();
 +            const int  tid   = it.get_local_id(1);
@@ -244,9 +295,10 @@ index 00000000..c7a333e1
 +    const int     n_kvh = n_head / gqa;
 +    const sycl::range<2> lws(1, (size_t) rows * GQA_DEC_SG);
 +    const sycl::range<2> gws((size_t) n_kvh * n_chunks, (size_t) rows * GQA_DEC_SG);
++    const bool           large_grf = D >= 256 && gqa_dec_large_grf(stream);
 +
 +    stream->submit([&](sycl::handler & cgh) {
-+    cgh.parallel_for(sycl::nd_range<2>(gws, lws),
++    gqa_dec_parallel_for<D>(cgh, large_grf, sycl::nd_range<2>(gws, lws),
 +        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(GQA_DEC_SG)]] {
 +        const auto sg    = it.get_sub_group();
 +        const int  lane  = sg.get_local_linear_id();
