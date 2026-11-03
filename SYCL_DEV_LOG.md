@@ -238,7 +238,25 @@ Verification so far:
     and quantized keys and unaligned views) segfaults on its first launch when run normally, with or
     without ASLR, and passes 5/5 under gdb: timing-dependent inside the CPU runtime. Not chased further.
 
-  bf16 kernels crash the CPU device as before.
+  bf16 kernels crash the CPU device as before. With the `nsm` hook, TILE FA on the gpt-oss / Flint sink
+  shapes (`GGML_SYCL_ENABLE_MKL_FA=0`) passes 4/4, so TILE and 31542's oneMKL route agree there.
+- **`test-llama-archs`** (upstream's random-weight models through the whole stack, against the CPU
+  backend) on the CPU device, with `GGML_SYCL_ENABLE_GRAPH=0` and `=1`:
+
+  | Architecture | NMSE vs CPU | Mixed batch | Roundtrip |
+  |---|---|---|---|
+  | llama (dense, MoE), qwen35, qwen35moe, qwen3next, gemma3, mamba2, gpt-oss | OK, at most 3e-8, both settings | exact, both settings | OK except llama dense |
+
+  The delta-net models (qwen35, qwen35moe, qwen3next) are where C70 and PR 31355 apply, gpt-oss is where
+  31542 applies, and mamba2 is where local 0015's SSM cache fusion applies. With one seed (`-s 42`) the two
+  graph settings give identical NMSE.
+  Graph replay itself never ran here: `check_graph_compatibility` turns graphs off for every graph with a
+  MUL_MAT because the CPU OpenCL runtime lacks the oneAPI async memory-allocation extension. Replay
+  correctness and speed are therefore A770-only checks (commands below).
+  Roundtrip (save the device model to GGUF, reload, require bit-identical logits) fails for some seeds:
+  llama dense with two random seeds, qwen35 with `-s 42`. It fails the same with `GGML_SYCL_ENABLE_FUSION=0`,
+  which also turns off 0014's activation cache, and NMSE is unchanged, so no local fusion is behind it.
+  Whether upstream SYCL fails the same way was not checked (no upstream-only build here).
 
 ### Measuring on the A770 (not done here: no Intel GPU)
 
@@ -250,11 +268,17 @@ is worth measuring here. A/B on the same build:
 for g in 0 1; do GGML_SYCL_ENABLE_GRAPH=$g ./build_sycl/bin/llama-bench -m MODEL -fa 1 -p 0 -n 128 -r 5; done
 ```
 
-The log says `enabling SYCL graphs` or `disabling SYCL graphs`, and `GGML_SYCL_DEBUG=1` adds why.
-Graphs turn off for multi-GPU, a MUL_MAT_ID that waits on the host, OUT_PROD / CONV_3D / SOLVE_TRI, and,
-when oneDNN is older than 3.12.3, any graph with a oneDNN MUL_MAT or oneDNN FA. Decode of a single-GPU
-model normally qualifies. A replay needs two
-identical calls first, so use `-n 128` or longer.
+The log prints `disabling SYCL graphs` when a graph does not qualify; the reason is a debug-level line, so
+add `--verbose`. Graphs turn off for multi-GPU, a MUL_MAT_ID that waits on the host, OUT_PROD / CONV_3D /
+SOLVE_TRI, any MUL_MAT when the device lacks the async memory-allocation extension
+(`ext_oneapi_async_memory_alloc`, which is why the CPU test device never replays), and, when oneDNN is
+older than 3.12.3, a oneDNN MUL_MAT or oneDNN FA. Decode of a single-GPU model normally qualifies. A replay needs two
+identical calls first, so use `-n 128` or longer. Check replay correctness on the card too (the CPU test
+device cannot replay, see above); `test-llama-archs` needs `-DLLAMA_BUILD_TESTS=ON`:
+
+```bash
+GGML_SYCL_ENABLE_GRAPH=1 ./build_sycl/bin/test-llama-archs -b SYCL0 -a '^(llama|qwen35|qwen3next|gpt-oss|gemma3)$' -s 42
+```
 
 To see how far marfrit/arcint's OpenCL kernels are ahead before porting any of them, build its patched
 llama.cpp (pinned at `3e4dfa8`) with the OpenCL backend and run the same `llama-bench` line on both:
