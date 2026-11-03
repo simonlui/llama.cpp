@@ -1,0 +1,547 @@
+Subject: [PATCH] sycl: fold the residual / bias ADD after a one-column mat-vec into the DMMV store
+
+Local port of the MUL_MAT + ADD fusion CUDA, Vulkan and Metal run on the residual add after the attention
+output and the FFN down projection (and on biases). ggml_sycl_mul_mat_add_fused points the mat-vec at the
+ADD's memory and hands the addend through the context; the DMMV kernels add it in their store:
+the ESIMD reorder kernels the A770 runs for q2_K..q6_K and q8_0 (a separate policy, since IGC's ESIMD back
+end crashes on a load behind a run-time null check), and the generic plain / reorder kernels (q4_0, q4_1,
+q5_0, q5_1, q8_0, q1_0). A kernel that does not take it (MMVQ, the non-ESIMD k-quant DMMV) leaves its
+plain result there and one in-place ADD follows, so the fusion never adds a launch. Overlaps of the
+ADD's memory with the activation or the addend decline; graph_optimize keeps the activation alive until
+the ADD so the allocator does not produce the first.
+
+diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
+index 15f71809..289f91e9 100644
+--- a/ggml/src/ggml-sycl/common.hpp
++++ b/ggml/src/ggml-sycl/common.hpp
+@@ -602,6 +602,12 @@ struct ggml_backend_sycl_context {
+ 
+     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
+ 
++    // MUL_MAT + ADD fusion (ggml_sycl_mul_mat_add_fused): the addend of the ADD after a one-column mat-vec
++    // whose output the mat-vec writes. A DMMV kernel that folds it into its store writes sum + mmv_add[row] and
++    // sets mmv_add_applied; otherwise the caller runs the ADD.
++    const float * mmv_add         = nullptr;
++    bool          mmv_add_applied = false;
++
+     explicit ggml_backend_sycl_context(int device) :
+         device(device),
+         name(GGML_SYCL_NAME + std::to_string(device)) {
+diff --git a/ggml/src/ggml-sycl/dmmv.cpp b/ggml/src/ggml-sycl/dmmv.cpp
+index 7d11095b..9ce8ba48 100644
+--- a/ggml/src/ggml-sycl/dmmv.cpp
++++ b/ggml/src/ggml-sycl/dmmv.cpp
+@@ -48,7 +48,7 @@ static void convert_f32(const void * vx, const int64_t ib, const int iqs, dfloat
+ 
+ template <int qk, int qr, dequantize_kernel_t dequantize_kernel>
+ static void dequantize_mul_mat_vec(const void * __restrict__ vx, const dfloat * __restrict__ y, float * __restrict__ dst, const int ncols, const int nrows,
+-                                   const sycl::nd_item<3> &item_ct1) {
++                                   const sycl::nd_item<3> &item_ct1, const float * __restrict__ add = nullptr) {
+     // qk = quantized weights per x block
+     // qr = number of quantized weights per data value in x block
+     const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) +
+@@ -113,16 +113,18 @@ static void dequantize_mul_mat_vec(const void * __restrict__ vx, const dfloat *
+ 
+     if (tid == 0) {
+ #ifdef GGML_SYCL_F16
+-        dst[row] = tmp.x() + tmp.y();
++        const float r = tmp.x() + tmp.y();
+ #else
+-        dst[row] = tmp;
++        const float r = tmp;
+ #endif // GGML_SYCL_F16
++        // a fused residual / bias ADD (ggml_sycl_mul_mat_add_fused)
++        dst[row] = add ? r + add[row] : r;
+     }
+ }
+ 
+ template <int qk, int qr, int qbytes, dequantize_kernel_t_reorder dequantize_kernel_reorder>
+ static void dequantize_mul_mat_vec_reorder(const void * __restrict__ vx, const dfloat * __restrict__ y, float * __restrict__ dst, const int ncols, const int nrows,
+-                                   const sycl::nd_item<3> &item_ct1) {
++                                   const sycl::nd_item<3> &item_ct1, const float * __restrict__ add = nullptr) {
+     // qk = quantized weights per x block
+     // qr = number of quantized weights per data value in x block
+     // qbytes = bytes of the quants region per block (not qk/qr for bit-packed types)
+@@ -220,10 +222,12 @@ static void dequantize_mul_mat_vec_reorder(const void * __restrict__ vx, const d
+ 
+     if (tid == 0) {
+ #ifdef GGML_SYCL_F16
+-        dst[row] = tmp.x() + tmp.y();
++        const float r = tmp.x() + tmp.y();
+ #else
+-        dst[row] = tmp;
++        const float r = tmp;
+ #endif // GGML_SYCL_F16
++        // a fused residual / bias ADD (ggml_sycl_mul_mat_add_fused)
++        dst[row] = add ? r + add[row] : r;
+     }
+ }
+ 
+@@ -1509,7 +1513,7 @@ static void dequantize_mul_mat_vec_q6_k_reorder(const void * __restrict__ vx, co
+ template <int qk, int qr, dequantize_kernel_t dequantize_kernel>
+ static void launch_dequantize_mul_mat_vec(const void *vx, const dfloat *y, float *dst,
+                                           const int ncols, const int nrows,
+-                                          dpct::queue_ptr stream) {
++                                          dpct::queue_ptr stream, const float * add = nullptr) {
+     GGML_ASSERT(ncols % GGML_SYCL_DMMV_X == 0);
+     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+     // the number of rows may exceed maximum grid size in the y or z dimensions, use the x dimension instead
+@@ -1520,7 +1524,7 @@ static void launch_dequantize_mul_mat_vec(const void *vx, const dfloat *y, float
+             sycl::nd_range<3>(block_nums * block_dims, block_dims),
+             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                 dequantize_mul_mat_vec<qk, qr, dequantize_kernel>(
+-                    vx, y, dst, ncols, nrows, item_ct1);
++                    vx, y, dst, ncols, nrows, item_ct1, add);
+             });
+     }
+ }
+@@ -1528,7 +1532,7 @@ static void launch_dequantize_mul_mat_vec(const void *vx, const dfloat *y, float
+ template <int qk, int qr, int qbytes, dequantize_kernel_t_reorder dequantize_kernel>
+ static void launch_dequantize_mul_mat_vec_reorder(const void *vx, const dfloat *y, float *dst,
+                                                   const int ncols, const int nrows,
+-                                                  dpct::queue_ptr stream) {
++                                                  dpct::queue_ptr stream, const float * add = nullptr) {
+     GGML_ASSERT(ncols % GGML_SYCL_DMMV_X == 0);
+     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+     // the number of rows may exceed maximum grid size in the y or z dimensions, use the x dimension instead
+@@ -1539,7 +1543,7 @@ static void launch_dequantize_mul_mat_vec_reorder(const void *vx, const dfloat *
+             sycl::nd_range<3>(block_nums * block_dims, block_dims),
+             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                 dequantize_mul_mat_vec_reorder<qk, qr, qbytes, dequantize_kernel>(
+-                    vx, y, dst, ncols, nrows, item_ct1);
++                    vx, y, dst, ncols, nrows, item_ct1, add);
+             });
+     }
+ }
+@@ -1583,6 +1587,23 @@ struct esimd_dmmv_row_pair_policy {
+     }
+ };
+ 
++// plain mat-vec with a fused residual / bias ADD (ggml_sycl_mul_mat_add_fused): dst = sum + add. Its own policy,
++// and the addend gathered, because IGC's ESIMD back end (acm-g10, oneAPI 2026.2) crashes on a load from it
++// behind a run-time null check.
++struct esimd_dmmv_row_pair_add_policy : esimd_dmmv_row_pair_policy {
++    const float * add;
++
++    ESIMD_INLINE void epilogue(int g, int nrows, float sum_a, float sum_b) const {
++        using namespace sycl::ext::intel::esimd;
++
++        simd<uint32_t, 2> offs;
++        offs[0] = (uint32_t) row_a(g) * sizeof(float);
++        offs[1] = (uint32_t) (has_b(g, nrows) ? row_b(g) : row_a(g)) * sizeof(float);
++        const simd<float, 2> a = gather<float, 2>(add, offs);
++        esimd_dmmv_row_pair_policy::epilogue(g, nrows, sum_a + a[0], sum_b + a[1]);
++    }
++};
++
+ // fused gate+up+GLU: a work-group owns one row of both matrices; a is the gate, b the up
+ struct esimd_dmmv_glu_policy {
+     const void * vgate;
+@@ -1669,10 +1690,9 @@ ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd(
+     }
+ }
+ 
+-static void dequantize_mul_mat_vec_q2_K_sycl_reorder_esimd(const void *vx, const float *y,
+-                                                           float *dst, const int ncols,
+-                                                           const int nrows,
+-                                                           dpct::queue_ptr stream) {
++template <ggml_type T, typename Policy>
++static void dmmv_reorder_esimd_launch(const Policy & policy, const float * y, const int ncols, const int nrows,
++                                      dpct::queue_ptr stream) {
+     GGML_ASSERT(ncols % QK_K == 0);
+     const int workgroups = (nrows + 1) / 2;
+     stream->submit([&](sycl::handler &h) {
+@@ -1680,78 +1700,64 @@ static void dequantize_mul_mat_vec_q2_K_sycl_reorder_esimd(const void *vx, const
+         h.parallel_for(
+             sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * GGML_SYCL_DMMV_ESIMD_WG_SIZE), sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE)),
+             [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+-                dequantize_mul_mat_vec_reorder_esimd<GGML_TYPE_Q2_K>(
+-                    esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows, lmem, it);
++                dequantize_mul_mat_vec_reorder_esimd<T>(policy, y, ncols, nrows, lmem, it);
+             });
+     });
+ }
+ 
++static void dequantize_mul_mat_vec_q2_K_sycl_reorder_esimd(const void *vx, const float *y,
++                                                           float *dst, const int ncols,
++                                                           const int nrows,
++                                                           dpct::queue_ptr stream, const float * add = nullptr) {
++    if (add) {
++        dmmv_reorder_esimd_launch<GGML_TYPE_Q2_K>(esimd_dmmv_row_pair_add_policy{ { vx, dst }, add }, y, ncols, nrows, stream);
++    } else {
++        dmmv_reorder_esimd_launch<GGML_TYPE_Q2_K>(esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows, stream);
++    }
++}
++
+ static void dequantize_mul_mat_vec_q3_K_sycl_reorder_esimd(const void *vx, const float *y,
+                                                            float *dst, const int ncols,
+                                                            const int nrows,
+-                                                           dpct::queue_ptr stream) {
+-    GGML_ASSERT(ncols % QK_K == 0);
+-    const int workgroups = (nrows + 1) / 2;
+-    stream->submit([&](sycl::handler &h) {
+-        sycl::local_accessor<float, 1> lmem(sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE * 2), h);
+-        h.parallel_for(
+-            sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * GGML_SYCL_DMMV_ESIMD_WG_SIZE), sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE)),
+-            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+-                dequantize_mul_mat_vec_reorder_esimd<GGML_TYPE_Q3_K>(
+-                    esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows, lmem, it);
+-            });
+-    });
++                                                           dpct::queue_ptr stream, const float * add = nullptr) {
++    if (add) {
++        dmmv_reorder_esimd_launch<GGML_TYPE_Q3_K>(esimd_dmmv_row_pair_add_policy{ { vx, dst }, add }, y, ncols, nrows, stream);
++    } else {
++        dmmv_reorder_esimd_launch<GGML_TYPE_Q3_K>(esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows, stream);
++    }
+ }
+ 
+ static void dequantize_mul_mat_vec_q4_K_sycl_reorder_esimd(const void *vx, const float *y,
+                                                            float *dst, const int ncols,
+                                                            const int nrows,
+-                                                           dpct::queue_ptr stream) {
+-    GGML_ASSERT(ncols % QK_K == 0);
+-    const int workgroups = (nrows + 1) / 2;
+-    stream->submit([&](sycl::handler &h) {
+-        sycl::local_accessor<float, 1> lmem(sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE * 2), h);
+-        h.parallel_for(
+-            sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * GGML_SYCL_DMMV_ESIMD_WG_SIZE), sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE)),
+-            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+-                dequantize_mul_mat_vec_reorder_esimd<GGML_TYPE_Q4_K>(
+-                    esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows, lmem, it);
+-            });
+-    });
++                                                           dpct::queue_ptr stream, const float * add = nullptr) {
++    if (add) {
++        dmmv_reorder_esimd_launch<GGML_TYPE_Q4_K>(esimd_dmmv_row_pair_add_policy{ { vx, dst }, add }, y, ncols, nrows, stream);
++    } else {
++        dmmv_reorder_esimd_launch<GGML_TYPE_Q4_K>(esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows, stream);
++    }
+ }
+ 
+ static void dequantize_mul_mat_vec_q5_K_sycl_reorder_esimd(const void *vx, const float *y,
+                                                            float *dst, const int ncols,
+                                                            const int nrows,
+-                                                           dpct::queue_ptr stream) {
+-    GGML_ASSERT(ncols % QK_K == 0);
+-    const int workgroups = (nrows + 1) / 2;
+-    stream->submit([&](sycl::handler &h) {
+-        sycl::local_accessor<float, 1> lmem(sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE * 2), h);
+-        h.parallel_for(
+-            sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * GGML_SYCL_DMMV_ESIMD_WG_SIZE), sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE)),
+-            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+-                dequantize_mul_mat_vec_reorder_esimd<GGML_TYPE_Q5_K>(
+-                    esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows, lmem, it);
+-            });
+-    });
++                                                           dpct::queue_ptr stream, const float * add = nullptr) {
++    if (add) {
++        dmmv_reorder_esimd_launch<GGML_TYPE_Q5_K>(esimd_dmmv_row_pair_add_policy{ { vx, dst }, add }, y, ncols, nrows, stream);
++    } else {
++        dmmv_reorder_esimd_launch<GGML_TYPE_Q5_K>(esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows, stream);
++    }
+ }
+ 
+ static void dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd(const void *vx, const float *y,
+                                                            float *dst, const int ncols,
+                                                            const int nrows,
+-                                                           dpct::queue_ptr stream) {
+-    GGML_ASSERT(ncols % QK_K == 0);
+-    const int workgroups = (nrows + 1) / 2;
+-    stream->submit([&](sycl::handler &h) {
+-        sycl::local_accessor<float, 1> lmem(sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE * 2), h);
+-        h.parallel_for(
+-            sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * GGML_SYCL_DMMV_ESIMD_WG_SIZE), sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE)),
+-            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+-                dequantize_mul_mat_vec_reorder_esimd<GGML_TYPE_Q6_K>(
+-                    esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows, lmem, it);
+-            });
+-    });
++                                                           dpct::queue_ptr stream, const float * add = nullptr) {
++    if (add) {
++        dmmv_reorder_esimd_launch<GGML_TYPE_Q6_K>(esimd_dmmv_row_pair_add_policy{ { vx, dst }, add }, y, ncols, nrows, stream);
++    } else {
++        dmmv_reorder_esimd_launch<GGML_TYPE_Q6_K>(esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows, stream);
++    }
+ }
+ 
+ // Q8_0 SOA reorder layout: [qs: nb*QK8_0] [d: nb*sizeof(half)].
+@@ -1883,8 +1889,13 @@ static void q8_0_esimd_launch_scaled(const Policy & policy, const float * y, con
+ static void dequantize_mul_mat_vec_q8_0_sycl_reorder_esimd(const void *vx, const float *y,
+                                                            float *dst, const int ncols,
+                                                            const int nrows,
+-                                                           dpct::queue_ptr stream) {
+-    q8_0_esimd_launch_scaled(esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows, (nrows + 1) / 2, stream);
++                                                           dpct::queue_ptr stream, const float * add = nullptr) {
++    if (add) {
++        q8_0_esimd_launch_scaled(esimd_dmmv_row_pair_add_policy{ { vx, dst }, add }, y, ncols, nrows, (nrows + 1) / 2,
++                                 stream);
++    } else {
++        q8_0_esimd_launch_scaled(esimd_dmmv_row_pair_policy{ vx, dst }, y, ncols, nrows, (nrows + 1) / 2, stream);
++    }
+ }
+ 
+ // ESIMD fused gate+up+GLU on reordered K-quant SOA weights: one output row (gate
+@@ -1949,6 +1960,11 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
+     const int64_t ne00 = src0->ne[0];
+     const int64_t row_diff = row_high - row_low;
+     GGML_ASSERT(src1->type == GGML_TYPE_F32);
++
++    // a fused ADD (ggml_sycl_mul_mat_add_fused): the kernels below that take it add add[row] to their result
++    // and mark it applied; the rest leave it to the caller
++    const float * add     = ctx.mmv_add && src1_ncols == 1 ? ctx.mmv_add + row_low : nullptr;
++    bool          applied = false;
+     // on some GPUs it is faster to convert src1 to half and to use half precision intrinsics
+ #ifdef GGML_SYCL_F16
+     ggml_sycl_pool_alloc<sycl::half> src1_dfloat_a(ctx.pool());
+@@ -1986,41 +2002,51 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
+         case GGML_TYPE_Q1_0:
+             if ((ggml_tensor_extra_gpu*)dst->src[0]->extra &&
+                 ((ggml_tensor_extra_gpu*)dst->src[0]->extra)->optimized_feature.reorder) {
+-                launch_dequantize_mul_mat_vec_reorder<QK1_0, QR1_0, QK1_0/8, dequantize_q1_0_reorder>(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
++                launch_dequantize_mul_mat_vec_reorder<QK1_0, QR1_0, QK1_0/8, dequantize_q1_0_reorder>(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream, add);
++                applied = add != nullptr;
+             } else {
+-                launch_dequantize_mul_mat_vec<QK1_0, QR1_0, dequantize_q1_0>(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
++                launch_dequantize_mul_mat_vec<QK1_0, QR1_0, dequantize_q1_0>(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream, add);
++                applied = add != nullptr;
+             }
+             break;
+         case GGML_TYPE_Q4_0:
+             if ((ggml_tensor_extra_gpu*)dst->src[0]->extra &&
+                 ((ggml_tensor_extra_gpu*)dst->src[0]->extra)->optimized_feature.reorder) {
+-                launch_dequantize_mul_mat_vec_reorder<QK4_0, QR4_0, QK4_0/2, dequantize_q4_0_reorder>(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
++                launch_dequantize_mul_mat_vec_reorder<QK4_0, QR4_0, QK4_0/2, dequantize_q4_0_reorder>(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream, add);
++                applied = add != nullptr;
+             } else {
+-                launch_dequantize_mul_mat_vec<QK4_0, QR4_0, dequantize_q4_0>(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
++                launch_dequantize_mul_mat_vec<QK4_0, QR4_0, dequantize_q4_0>(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream, add);
++                applied = add != nullptr;
+             }
+             break;
+         case GGML_TYPE_Q4_1:
+-            launch_dequantize_mul_mat_vec<QK4_1, QR4_1, dequantize_q4_1>(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
++            launch_dequantize_mul_mat_vec<QK4_1, QR4_1, dequantize_q4_1>(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream, add);
++            applied = add != nullptr;
+             break;
+         case GGML_TYPE_Q5_0:
+-            launch_dequantize_mul_mat_vec<QK5_0, QR5_0, dequantize_q5_0>(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
++            launch_dequantize_mul_mat_vec<QK5_0, QR5_0, dequantize_q5_0>(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream, add);
++            applied = add != nullptr;
+             break;
+         case GGML_TYPE_Q5_1:
+-            launch_dequantize_mul_mat_vec<QK5_1, QR5_1, dequantize_q5_1>(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
++            launch_dequantize_mul_mat_vec<QK5_1, QR5_1, dequantize_q5_1>(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream, add);
++            applied = add != nullptr;
+             break;
+         case GGML_TYPE_Q8_0:
+             if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
+                 ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+ #ifdef GGML_SYCL_DMMV_HAS_ESIMD
+                 if (g_ggml_sycl_enable_esimd) {
+-                    dequantize_mul_mat_vec_q8_0_sycl_reorder_esimd(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
++                    dequantize_mul_mat_vec_q8_0_sycl_reorder_esimd(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream, add);
++                    applied = add != nullptr;
+                 } else
+ #endif
+                 {
+-                    launch_dequantize_mul_mat_vec_reorder<QK8_0, QR8_0, QK8_0, dequantize_q8_0_reorder>(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
++                    launch_dequantize_mul_mat_vec_reorder<QK8_0, QR8_0, QK8_0, dequantize_q8_0_reorder>(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream, add);
++                applied = add != nullptr;
+                 }
+             } else {
+-                launch_dequantize_mul_mat_vec<QK8_0, QR8_0, dequantize_q8_0>(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
++                launch_dequantize_mul_mat_vec<QK8_0, QR8_0, dequantize_q8_0>(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream, add);
++                applied = add != nullptr;
+             }
+             break;
+         case GGML_TYPE_Q2_K:
+@@ -2028,7 +2054,8 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
+                 ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+ #ifdef GGML_SYCL_DMMV_HAS_ESIMD
+                 if (g_ggml_sycl_enable_esimd) {
+-                    dequantize_mul_mat_vec_q2_K_sycl_reorder_esimd(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
++                    dequantize_mul_mat_vec_q2_K_sycl_reorder_esimd(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream, add);
++                    applied = add != nullptr;
+                 }
+                 else
+ #endif
+@@ -2044,7 +2071,8 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
+                 ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+ #ifdef GGML_SYCL_DMMV_HAS_ESIMD
+                 if (g_ggml_sycl_enable_esimd) {
+-                    dequantize_mul_mat_vec_q3_K_sycl_reorder_esimd(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
++                    dequantize_mul_mat_vec_q3_K_sycl_reorder_esimd(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream, add);
++                    applied = add != nullptr;
+                 }
+                 else
+ #endif
+@@ -2060,7 +2088,8 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
+                 ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+ #ifdef GGML_SYCL_DMMV_HAS_ESIMD
+                 if (g_ggml_sycl_enable_esimd) {
+-                    dequantize_mul_mat_vec_q4_K_sycl_reorder_esimd(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
++                    dequantize_mul_mat_vec_q4_K_sycl_reorder_esimd(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream, add);
++                    applied = add != nullptr;
+                 }
+                 else
+ #endif
+@@ -2076,7 +2105,8 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
+                 ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+ #ifdef GGML_SYCL_DMMV_HAS_ESIMD
+                 if (g_ggml_sycl_enable_esimd) {
+-                    dequantize_mul_mat_vec_q5_K_sycl_reorder_esimd(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
++                    dequantize_mul_mat_vec_q5_K_sycl_reorder_esimd(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream, add);
++                    applied = add != nullptr;
+                 }
+                 else
+ #endif
+@@ -2092,7 +2122,8 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
+                 ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+ #ifdef GGML_SYCL_DMMV_HAS_ESIMD
+                 if (g_ggml_sycl_enable_esimd) {
+-                    dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
++                    dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream, add);
++                    applied = add != nullptr;
+                 }
+                 else
+ #endif
+@@ -2119,6 +2150,8 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
+             GGML_ABORT("fatal error");
+     }
+ 
++    ctx.mmv_add_applied = applied;
++
+     GGML_UNUSED(src1);
+     GGML_UNUSED(dst);
+     GGML_UNUSED(src1_ddq_i);
+diff --git a/ggml/src/ggml-sycl/fusion.cpp b/ggml/src/ggml-sycl/fusion.cpp
+index 65dccde4..c398da04 100644
+--- a/ggml/src/ggml-sycl/fusion.cpp
++++ b/ggml/src/ggml-sycl/fusion.cpp
+@@ -442,6 +442,24 @@ bool ggml_sycl_match_moe_mmvq_fusion(const ggml_cgraph * cgraph, int i, ggml_syc
+     return false;
+ }
+ 
++// MUL_MAT (one activation column) + ADD of a same-shape F32 tensor: the residual or bias add the DMMV kernels
++// fold into their store (ported from the CUDA / Vulkan / Metal mul_mat + add fusions)
++bool ggml_sycl_match_mul_mat_add(const ggml_cgraph * cgraph, int i) {
++    static const ggml_op ops[] = { GGML_OP_MUL_MAT, GGML_OP_ADD };
++    if (!g_ggml_sycl_enable_fusion || i + 1 >= cgraph->n_nodes || !ggml_can_fuse(cgraph, i, ops, 2)) {
++        return false;
++    }
++    const ggml_tensor * mm     = cgraph->nodes[i];
++    const ggml_tensor * add    = cgraph->nodes[i + 1];
++    const ggml_tensor * addend = add->src[0] == mm ? add->src[1] : add->src[0];
++    const ggml_tensor * w      = mm->src[0];
++    const ggml_tensor * x      = mm->src[1];
++    return x->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 &&
++           addend->type == GGML_TYPE_F32 && x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1 && w->ne[2] == 1 &&
++           w->ne[3] == 1 && ggml_is_contiguous(mm) && ggml_is_contiguous(add) && ggml_is_contiguous(addend) &&
++           ggml_are_same_shape(addend, add);
++}
++
+ // the unary ops the fused unary chains in element_wise.cpp have a functor for
+ static bool ggml_sycl_fused_unary_has_kernel(ggml_unary_op unary_op) {
+     return unary_op == GGML_UNARY_OP_SILU || unary_op == GGML_UNARY_OP_SIGMOID ||
+diff --git a/ggml/src/ggml-sycl/fusion.hpp b/ggml/src/ggml-sycl/fusion.hpp
+index 28569ac6..a43dbaca 100644
+--- a/ggml/src/ggml-sycl/fusion.hpp
++++ b/ggml/src/ggml-sycl/fusion.hpp
+@@ -52,4 +52,7 @@ struct ggml_sycl_moe_fusion_match {
+ 
+ bool ggml_sycl_match_moe_mmvq_fusion(const ggml_cgraph * cgraph, int i, ggml_sycl_moe_fusion_match & m);
+ 
++// MUL_MAT of one activation column followed by an ADD of a same-shape F32 tensor
++bool ggml_sycl_match_mul_mat_add(const ggml_cgraph * cgraph, int i);
++
+ #endif  // GGML_SYCL_FUSION_HPP
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index b8b2cc50..13d0e206 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -5636,6 +5636,56 @@ static bool ggml_sycl_mul_mat_glu_fused(ggml_backend_sycl_context & ctx, ggml_cg
+                                                /*stride_col_dst=*/(int) glu->ne[0], stream);
+ }
+ 
++// MUL_MAT of one activation column + ADD (the residual after the attention output and the FFN down projection,
++// or a bias), ported from the CUDA / Vulkan / Metal mul_mat + add fusions. The mat-vec writes straight into the
++// ADD's memory and the DMMV kernels add the addend in their store; a kernel that does not take it leaves its plain
++// result there, and an in-place ADD finishes the job, so the fusion never costs a launch.
++static bool ggml_sycl_mul_mat_add_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
++    if (!ggml_sycl_match_mul_mat_add(cgraph, i)) {
++        return false;
++    }
++    ggml_tensor *       mm     = cgraph->nodes[i];
++    ggml_tensor *       add    = cgraph->nodes[i + 1];
++    const int           mm_src = add->src[0] == mm ? 0 : 1;
++    const ggml_tensor * addend = add->src[1 - mm_src];
++
++    // the row slices of split weights are stitched together elsewhere
++    if (ggml_backend_buffer_is_sycl_split(mm->src[0]->buffer)) {
++        return false;
++    }
++    // the mat-vec reads its activation while it writes the ADD's memory, and the fallback would overwrite the
++    // addend before reading it: either overlap declines (graph_optimize keeps the activation alive to avoid it)
++    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
++        const char * pa = (const char *) a->data;
++        const char * pb = (const char *) b->data;
++        return pa < pb + ggml_nbytes(b) && pb < pa + ggml_nbytes(a);
++    };
++    if (overlap(add, mm->src[1]) || overlap(add, addend)) {
++        return false;
++    }
++
++    void * mm_data      = mm->data;
++    mm->data            = add->data;
++    ctx.mmv_add         = (const float *) addend->data;
++    ctx.mmv_add_applied = false;
++    ggml_sycl_mul_mat(ctx, mm->src[0], mm->src[1], mm);
++    const bool applied  = ctx.mmv_add_applied;
++    ctx.mmv_add         = nullptr;
++    ctx.mmv_add_applied = false;
++
++    GGML_SYCL_DEBUG("[SYCL] %s: %s\n", __func__,
++                    applied ? "ADD folded into the mat-vec store" : "mat-vec without the epilogue, ADD in place");
++    if (!applied) {
++        // the plain mat-vec result is in the ADD's memory: add the addend in place
++        ggml_tensor mm_out          = *mm;
++        ggml_tensor add_node        = *add;
++        add_node.src[mm_src]        = &mm_out;
++        ggml_sycl_add(ctx, &add_node);
++    }
++    mm->data = mm_data;
++    return true;
++}
++
+ // Batch the run of consecutive L2_NORM siblings starting at node_idx into one launch.
+ // Returns the number of extra graph nodes consumed, or 0 if the run is shorter than two
+ // (the caller then runs the norm through the per-tensor kernel).
+@@ -7130,6 +7180,12 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+             }
+         }
+ 
++        // MUL_MAT + ADD (residual / bias) into the mat-vec's store
++        if (node->op == GGML_OP_MUL_MAT && ggml_sycl_mul_mat_add_fused(*sycl_ctx, cgraph, i)) {
++            i += 1;
++            continue;
++        }
++
+         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
+         if (!ok) {
+             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+@@ -7521,6 +7577,14 @@ static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph
+             i += m.node_count - 1;
+         }
+     }
++    // the fused MUL_MAT + ADD writes the ADD while reading the mat-vec's activation: keep the activation alive
++    // until the ADD (ggml_sycl_mul_mat_add_fused declines overlaps)
++    for (int i = 0; i < cgraph->n_nodes; ++i) {
++        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT && ggml_sycl_match_mul_mat_add(cgraph, i)) {
++            params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[1], cgraph->nodes[i + 1]);
++            ++i;
++        }
++    }
+     // keep the inputs of the fused MoE expert sum alive until its output, so the allocator cannot hand the
+     // output the memory of the expert results it reads (ggml_sycl_fusion_ranges_ok would then decline it)
+     for (int i = 0; i < cgraph->n_nodes; ++i) {

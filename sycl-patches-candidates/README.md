@@ -113,6 +113,9 @@ the A770 compiles at JIT time) and its DG2 assembly read from IGC dumps:
   (3..4 columns, 0.7-1 KB) and C30's 5..8-column q4_K pairing under C90 bit 16 (2.3-3.6 KB),
   and C90 bit 4 now gives q5_K weight reuse without the paired gate + up (1.1-3.5 KB). C30's
   plain-MMVQ pairing does not spill on DG2 and is unaffected.
+- Since local patch `ZZ-LOCAL-0012` (2026-11-03), MUL_MAT_ID batches of 2 tokens up to a per-type cap
+  (4 for the k-quants, 8 for q4_0 / q8_0 / mxfp4) take the MoE MMVQ instead of the grouped GEMM, so C20 / C21
+  only see wider batches. `GGML_SYCL_MMID_MMVQ_MAX_TOKENS=1` restores the old split when comparing them.
 - C40 `fattn-gqa-dec.cpp`: the original failed. The q8_0 D=256 SLM ESIMD kernel's
   in-kernel `mask` null test made IGC 2.43 emit a 64-bit shift that DG2 cannot
   execute, and that failed every ESIMD kernel in the file. C40 now tests `mask`

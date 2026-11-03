@@ -1,0 +1,1140 @@
+Subject: [PATCH] sycl: port the RoPE / norm, MoE expert-sum, ADD-chain and biased top-k MoE fusions
+
+Local port of graph fusions CUDA, Vulkan and Metal run and SYCL did not:
+
+- ROPE -> VIEW -> SET_ROWS: the rope kernels already had a set_rows destination
+  (ggml_sycl_rope_fused) that nothing called. The predicate is CUDA's
+  ggml_cuda_should_fuse_rope_set_rows, limited to what the SYCL kernels take: f32 in, f32 / f16 cache,
+  I64 row ids, the norm and neox modes, and a cache whose element index fits 32 bits.
+- RMS_NORM -> MUL -> ROPE (-> VIEW -> SET_ROWS): the Q / K norms of Qwen3, Gemma 3 and OLMo 2 in one
+  launch, K written straight into the KV cache. Ported from CUDA's rms_norm_mul_rope_f32; one sub-group
+  per (head, token) row sums the row in the order the one-sub-group rms_norm kernel does.
+- MUL (router weights) [* MUL (expert scale)] -> one VIEW per expert -> k - 1 ADDs: the expert sum of a
+  MoE layer in one kernel (CUDA's ggml_cuda_match_moe_weighted_reduction, Metal's moe_reduce), up to 15
+  experts. graph_optimize keeps the expert results alive until the sum so its output cannot be placed
+  over them.
+- A chain of 3..8 same-shape contiguous F32 ADDs (CUDA / Vulkan multi-add); pairs and broadcasts keep
+  the ADD + ADD kernel.
+- topk-moe with a routing bias (sigmoid + bias, DeepSeek-V3 style): selection on probs + bias, weights
+  from the probs, as CUDA's topk_moe_cuda<has_bias>. Expert-group masking and sqrt(softplus) gating are
+  not ported and stay unfused.
+
+Each fusion can be turned off with GGML_SYCL_ENABLE_FUSION=0 like the existing ones.
+
+diff --git a/ggml/src/ggml-sycl/fused-add.cpp b/ggml/src/ggml-sycl/fused-add.cpp
+new file mode 100644
+index 00000000..6c8ad915
+--- /dev/null
++++ b/ggml/src/ggml-sycl/fused-add.cpp
+@@ -0,0 +1,89 @@
++#include "fused-add.hpp"
++
++static constexpr int GGML_SYCL_FUSED_ADD_BLOCK  = 256;
++static constexpr int GGML_SYCL_MULTI_ADD_MAX    = 8;
++
++void ggml_sycl_op_moe_weighted_reduction(ggml_backend_sycl_context & ctx, const ggml_tensor * experts,
++                                         const ggml_tensor * expert_scale, const ggml_tensor * weights,
++                                         ggml_tensor * dst) {
++    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/0, " : fused MoE weighted sum");
++    GGML_ASSERT(experts->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(expert_scale == nullptr || expert_scale->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(experts) && ggml_is_contiguous(weights) && ggml_is_contiguous(dst));
++    GGML_ASSERT(expert_scale == nullptr || ggml_is_contiguous(expert_scale));
++
++    const int64_t n_embd        = experts->ne[0];
++    const int     n_expert_used = (int) experts->ne[1];
++    const int64_t n_tokens      = experts->ne[2] * experts->ne[3];
++
++    const float * x     = (const float *) experts->data;
++    const float * scale = expert_scale ? (const float *) expert_scale->data : nullptr;
++    const float * w     = (const float *) weights->data;
++    float *       out   = (float *) dst->data;
++
++    dpct::queue_ptr stream = ctx.stream();
++    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
++
++    const int64_t n_col_blocks = (n_embd + GGML_SYCL_FUSED_ADD_BLOCK - 1) / GGML_SYCL_FUSED_ADD_BLOCK;
++    stream->parallel_for(
++        sycl::nd_range<2>(sycl::range<2>(n_tokens, n_col_blocks * GGML_SYCL_FUSED_ADD_BLOCK),
++                          sycl::range<2>(1, GGML_SYCL_FUSED_ADD_BLOCK)),
++        [=](sycl::nd_item<2> it) {
++            const int64_t token = it.get_global_id(0);
++            const int64_t col   = it.get_global_id(1);
++            if (col >= n_embd) {
++                return;
++            }
++            // the unfused graph rounds each product before the next ADD, in expert order
++            const int64_t first = token * n_expert_used;
++            float         sum   = (x[first * n_embd + col] * (scale ? scale[first] : 1.0f)) * w[first];
++            for (int e = 1; e < n_expert_used; ++e) {
++                const int64_t row = first + e;
++                sum += (x[row * n_embd + col] * (scale ? scale[row] : 1.0f)) * w[row];
++            }
++            out[token * n_embd + col] = sum;
++        });
++}
++
++namespace {
++struct multi_add_args {
++    const float * src[GGML_SYCL_MULTI_ADD_MAX + 1];
++};
++}  // namespace
++
++void ggml_sycl_op_multi_add(ggml_backend_sycl_context & ctx, ggml_tensor * const * adds, int n_adds) {
++    GGML_ASSERT(n_adds >= 2 && n_adds <= GGML_SYCL_MULTI_ADD_MAX);
++    ggml_tensor * dst = adds[n_adds - 1];
++    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/0, " : fused ADD chain");
++
++    multi_add_args args = {};
++    args.src[0] = (const float *) adds[0]->src[0]->data;
++    for (int i = 0; i < n_adds; ++i) {
++        GGML_ASSERT(i == 0 || adds[i]->src[0] == adds[i - 1]);
++        args.src[i + 1] = (const float *) adds[i]->src[1]->data;
++    }
++    float *       out = (float *) dst->data;
++    const int64_t n   = ggml_nelements(dst);
++    const int     nsrc = n_adds + 1;
++
++    dpct::queue_ptr stream = ctx.stream();
++    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
++
++    const int64_t n_blocks = (n + GGML_SYCL_FUSED_ADD_BLOCK - 1) / GGML_SYCL_FUSED_ADD_BLOCK;
++    stream->parallel_for(
++        sycl::nd_range<1>(sycl::range<1>(n_blocks * GGML_SYCL_FUSED_ADD_BLOCK), sycl::range<1>(GGML_SYCL_FUSED_ADD_BLOCK)),
++        [=](sycl::nd_item<1> it) {
++            const int64_t i = it.get_global_id(0);
++            if (i >= n) {
++                return;
++            }
++            float acc = args.src[0][i];
++#pragma unroll
++            for (int s = 1; s < GGML_SYCL_MULTI_ADD_MAX + 1; ++s) {
++                if (s < nsrc) {
++                    acc += args.src[s][i];
++                }
++            }
++            out[i] = acc;
++        });
++}
+diff --git a/ggml/src/ggml-sycl/fused-add.hpp b/ggml/src/ggml-sycl/fused-add.hpp
+new file mode 100644
+index 00000000..7d76f058
+--- /dev/null
++++ b/ggml/src/ggml-sycl/fused-add.hpp
+@@ -0,0 +1,17 @@
++#ifndef GGML_SYCL_FUSED_ADD_HPP
++#define GGML_SYCL_FUSED_ADD_HPP
++
++#include "common.hpp"
++
++// dst = experts[:, 0] * w[0] + ... + experts[:, k - 1] * w[k - 1] per token, w = expert_scale * weights: the MUL by
++// the router weights and the chain of k - 1 ADDs that sums the expert outputs of a MoE layer, in one launch
++// (ported from ggml_cuda_op_moe_weighted_reduction)
++void ggml_sycl_op_moe_weighted_reduction(ggml_backend_sycl_context & ctx, const ggml_tensor * experts,
++                                         const ggml_tensor * expert_scale, const ggml_tensor * weights,
++                                         ggml_tensor * dst);
++
++// adds[0..n_adds) is a chain of same-shape, contiguous F32 ADDs, each consuming the previous one as src[0]:
++// one launch writes the last one, summing in the order the separate ADDs would
++void ggml_sycl_op_multi_add(ggml_backend_sycl_context & ctx, ggml_tensor * const * adds, int n_adds);
++
++#endif  // GGML_SYCL_FUSED_ADD_HPP
+diff --git a/ggml/src/ggml-sycl/fusion.cpp b/ggml/src/ggml-sycl/fusion.cpp
+index 9b553829..775626ec 100644
+--- a/ggml/src/ggml-sycl/fusion.cpp
++++ b/ggml/src/ggml-sycl/fusion.cpp
+@@ -1,7 +1,9 @@
+ #include "fusion.hpp"
+ #include "binbcast.hpp"
++#include "ggml-backend-impl.h"
+ 
+ #include <algorithm>
++#include <vector>
+ 
+ // mul_mat(gate) + mul_mat(up) + GLU: graph shape and tensor properties only. Backend state
+ // (weight layout, split buffers, DMMV) is checked by ggml_sycl_op_mul_mat_glu_fused().
+@@ -82,6 +84,288 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
+     return true;
+ }
+ 
++// false when a node the fused group writes overlaps a source it reads that is not one of the group's own
++// intermediates (ported from ggml_cuda_check_fusion_memory_ranges)
++bool ggml_sycl_fusion_ranges_ok(const ggml_cgraph * cgraph, int node_idx, int node_count, const int * out_nodes,
++                                int out_count) {
++    auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
++        const int64_t a_start = (int64_t) a->data;
++        const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
++        const int64_t b_start = (int64_t) b->data;
++        const int64_t b_end   = b_start + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
++        return (b_start <= a_start && a_start < b_end) || (a_start <= b_start && b_start < a_end);
++    };
++
++    for (int i = 0; i < out_count; ++i) {
++        const ggml_tensor * dst = cgraph->nodes[out_nodes[i]];
++        for (int j = node_idx; j < node_idx + node_count; ++j) {
++            for (int s = 0; s < GGML_MAX_SRC; ++s) {
++                const ggml_tensor * src = cgraph->nodes[j]->src[s];
++                if (!src || src->op == GGML_OP_NONE || !overlap(dst, src)) {
++                    continue;
++                }
++                bool intermediate = false;
++                for (int k = node_idx; k < j; ++k) {
++                    intermediate = intermediate || cgraph->nodes[k] == src;
++                }
++                if (!intermediate) {
++                    return false;
++                }
++            }
++        }
++    }
++    return true;
++}
++
++// ROPE -> VIEW -> SET_ROWS: the rope kernels' set_rows path (ported from ggml_cuda_should_fuse_rope_set_rows)
++static bool ggml_sycl_should_fuse_rope_set_rows(const ggml_tensor * rope, const ggml_tensor * view,
++                                                const ggml_tensor * set_rows) {
++    if (rope->op != GGML_OP_ROPE || view->op != GGML_OP_VIEW || set_rows->op != GGML_OP_SET_ROWS) {
++        return false;
++    }
++    if (view->src[0] != rope || set_rows->src[0] != view) {
++        return false;
++    }
++    // the kernels index the cache row by the token (ne[2]) only
++    if (rope->src[0]->ne[3] != 1) {
++        return false;
++    }
++    // the set_rows path of the rope kernels reads f32 and writes f32 or f16
++    if (rope->src[0]->type != GGML_TYPE_F32 || rope->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (set_rows->type != GGML_TYPE_F32 && set_rows->type != GGML_TYPE_F16) {
++        return false;
++    }
++    if (set_rows->src[1]->type != GGML_TYPE_I64 || set_rows->src[1]->ne[0] != rope->ne[2] ||
++        set_rows->nb[0] != ggml_type_size(set_rows->type)) {
++        return false;
++    }
++    // the view flattens the heads of a token into one cache row
++    if (!ggml_is_contiguous(view) || view->ne[0] != rope->ne[0] * rope->ne[1]) {
++        return false;
++    }
++    // the rope kernels compute the destination index in 32 bits
++    if (ggml_nelements(set_rows) > INT32_MAX) {
++        return false;
++    }
++    // only the norm / neox kernels take the set_rows destination
++    const int mode = ggml_get_op_params_i32(rope, 2);
++    return mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX;
++}
++
++// RMS_NORM -> MUL -> ROPE (ported from ggml_cuda_should_fuse_rms_norm_mul_rope)
++static bool ggml_sycl_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm, const ggml_tensor * mul,
++                                                    const ggml_tensor * rope) {
++    if (rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || rope->op != GGML_OP_ROPE) {
++        return false;
++    }
++    if (rms_norm->src[0]->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 ||
++        mul->src[0]->type != GGML_TYPE_F32 || mul->src[1]->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
++        rope->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (rope->src[0] != mul || (mul->src[0] != rms_norm && mul->src[1] != rms_norm)) {
++        return false;
++    }
++    if (!ggml_are_same_shape(rms_norm, mul)) {
++        return false;
++    }
++    // the kernel reads the weight as w[col] of a row it may broadcast over heads, tokens and samples
++    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
++    if (w->ne[0] != rms_norm->ne[0] || w->nb[0] != ggml_type_size(w->type)) {
++        return false;
++    }
++    if (rms_norm->src[0]->nb[0] != ggml_type_size(rms_norm->src[0]->type)) {
++        return false;
++    }
++    const int mode = ggml_get_op_params_i32(rope, 2);
++    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
++        return false;
++    }
++    const int n_dims = ggml_get_op_params_i32(rope, 1);
++    if (n_dims % 2 != 0 || rope->ne[0] % 2 != 0 || n_dims > rope->ne[0]) {
++        return false;
++    }
++    // ggml_rope_set_offset is not handled by the fused kernel
++    return ggml_get_op_params_i32(rope, 15) == 0;
++}
++
++// MUL(experts, router weights) [* MUL(expert scale)] -> one VIEW per expert -> k - 1 ADDs: the expert sum of a
++// MoE layer (ported from ggml_cuda_match_moe_weighted_reduction; the views and ADDs may interleave)
++bool ggml_sycl_match_moe_weighted_reduction(const ggml_cgraph * cgraph, int node_idx,
++                                            ggml_sycl_moe_reduction_match & match) {
++    if (!g_ggml_sycl_enable_fusion) {
++        return false;
++    }
++    const ggml_tensor * first = cgraph->nodes[node_idx];
++    if (first->op != GGML_OP_MUL || first->type != GGML_TYPE_F32 || !ggml_is_contiguous(first)) {
++        return false;
++    }
++
++    auto split_mul = [](const ggml_tensor * mul, const ggml_tensor *& full, const ggml_tensor *& broadcast) {
++        auto is_weights = [mul](const ggml_tensor * t) {
++            return t && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[0] == 1 && t->ne[1] == mul->ne[1] &&
++                   t->ne[2] == mul->ne[2] && t->ne[3] == mul->ne[3];
++        };
++        auto is_experts = [mul](const ggml_tensor * t) {
++            return t && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_are_same_shape(t, mul);
++        };
++        if (is_experts(mul->src[0]) && is_weights(mul->src[1])) {
++            full      = mul->src[0];
++            broadcast = mul->src[1];
++            return true;
++        }
++        if (is_experts(mul->src[1]) && is_weights(mul->src[0])) {
++            full      = mul->src[1];
++            broadcast = mul->src[0];
++            return true;
++        }
++        return false;
++    };
++
++    const ggml_tensor * weighted     = first;
++    const ggml_tensor * experts      = nullptr;
++    const ggml_tensor * expert_scale = nullptr;
++    const ggml_tensor * weights      = nullptr;
++    int                 mul_count    = 1;
++
++    // (experts * expert_scale) * router_weight, or experts * router_weight
++    if (node_idx + 1 < cgraph->n_nodes) {
++        const ggml_tensor * second = cgraph->nodes[node_idx + 1];
++        const ggml_tensor * scaled = nullptr;
++        const ggml_tensor * route  = nullptr;
++        const ggml_tensor * raw    = nullptr;
++        const ggml_tensor * scale  = nullptr;
++        if (second->op == GGML_OP_MUL && second->type == GGML_TYPE_F32 && ggml_is_contiguous(second) &&
++            split_mul(second, scaled, route) && scaled == first && split_mul(first, raw, scale)) {
++            weighted     = second;
++            experts      = raw;
++            expert_scale = scale;
++            weights      = route;
++            mul_count    = 2;
++        }
++    }
++    if (experts == nullptr && !split_mul(first, experts, weights)) {
++        return false;
++    }
++
++    const int     n_expert_used = (int) weighted->ne[1];
++    const int64_t n_tokens      = weighted->ne[2] * weighted->ne[3];
++    if (n_expert_used < 2 || n_expert_used > GGML_SYCL_MOE_REDUCTION_MAX_EXPERTS) {
++        return false;
++    }
++    const int node_count = 2 * n_expert_used + mul_count - 1;
++    if (node_idx + node_count > cgraph->n_nodes) {
++        return false;
++    }
++
++    std::vector<ggml_op> ops(node_count, GGML_OP_VIEW);
++    ops[0] = GGML_OP_MUL;
++    if (mul_count == 2) {
++        ops[1] = GGML_OP_MUL;
++    }
++    std::vector<const ggml_tensor *> views;
++    views.reserve(n_expert_used);
++    const ggml_tensor * previous = nullptr;
++    int                 n_adds   = 0;
++    for (int offset = mul_count; offset < node_count; ++offset) {
++        const ggml_tensor * c = cgraph->nodes[node_idx + offset];
++        ops[offset]           = c->op;
++        if (c->op == GGML_OP_VIEW) {
++            const int expert = (int) views.size();
++            if (expert >= n_expert_used || c->src[0] != weighted || c->view_src != weighted ||
++                c->type != GGML_TYPE_F32 || c->ne[0] != weighted->ne[0] || c->ne[1] != n_tokens || c->ne[2] != 1 ||
++                c->ne[3] != 1 || c->nb[0] != weighted->nb[0] || c->nb[1] != weighted->nb[2] ||
++                c->view_offs != (size_t) expert * weighted->nb[1]) {
++                return false;
++            }
++            views.push_back(c);
++            continue;
++        }
++        if (c->op != GGML_OP_ADD || views.size() < 2 || n_adds + 1 >= (int) views.size()) {
++            return false;
++        }
++        const ggml_tensor * lhs = n_adds == 0 ? views[0] : previous;
++        const ggml_tensor * rhs = views[n_adds + 1];
++        if (c->src[0] != lhs || c->src[1] != rhs || c->type != GGML_TYPE_F32) {
++            return false;
++        }
++        previous = c;
++        ++n_adds;
++    }
++    if ((int) views.size() != n_expert_used || n_adds != n_expert_used - 1 || previous == nullptr) {
++        return false;
++    }
++    if (!ggml_is_contiguous(previous) || previous->ne[0] != weighted->ne[0] || previous->ne[1] != n_tokens ||
++        previous->ne[2] != 1 || previous->ne[3] != 1) {
++        return false;
++    }
++
++    const int output_idx = node_idx + node_count - 1;
++    if (!ggml_can_fuse_subgraph(cgraph, node_idx, node_count, ops.data(), &output_idx, 1)) {
++        return false;
++    }
++
++    match.experts      = experts;
++    match.expert_scale = expert_scale;
++    match.weights      = weights;
++    match.dst          = cgraph->nodes[output_idx];
++    match.node_count   = node_count;
++    return true;
++}
++
++// a chain of 3..8 same-shape contiguous F32 ADDs, each consuming the previous as src[0] (the CUDA and Vulkan
++// multi-add; pairs keep the broadcasting ADD + ADD kernel). Every work-item reads all operands at its own index
++// before writing it, so an operand may share the destination's memory only at the same address.
++int ggml_sycl_match_multi_add(const ggml_cgraph * cgraph, int node_idx) {
++    if (!g_ggml_sycl_enable_fusion) {
++        return 0;
++    }
++    constexpr int max_adds = 8;
++    ggml_op       ops[max_adds];
++    std::fill(ops, ops + max_adds, GGML_OP_ADD);
++
++    auto operand_ok = [](const ggml_tensor * t, const ggml_tensor * ref) {
++        return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_are_same_shape(t, ref);
++    };
++
++    const ggml_tensor * first = cgraph->nodes[node_idx];
++    if (first->op != GGML_OP_ADD || !operand_ok(first, first) || !operand_ok(first->src[0], first) ||
++        !operand_ok(first->src[1], first) || ggml_nelements(first) >= ((int64_t) 1 << 31)) {
++        return 0;
++    }
++    int n = 1;
++    while (n < max_adds && ggml_can_fuse(cgraph, node_idx, ops, n + 1)) {
++        const ggml_tensor * next = cgraph->nodes[node_idx + n];
++        if (next->src[0] != cgraph->nodes[node_idx + n - 1] || !operand_ok(next, first) ||
++            !operand_ok(next->src[1], first)) {
++            break;
++        }
++        ++n;
++    }
++    if (n < 3) {
++        return 0;
++    }
++
++    const ggml_tensor * dst  = cgraph->nodes[node_idx + n - 1];
++    const size_t        size = ggml_nbytes(dst);
++    auto disjoint_or_same = [&](const ggml_tensor * t) {
++        const char * a = (const char *) t->data;
++        const char * b = (const char *) dst->data;
++        return a == b || a + ggml_nbytes(t) <= b || b + size <= a;
++    };
++    if (!disjoint_or_same(first->src[0])) {
++        return 0;
++    }
++    for (int j = 0; j < n; ++j) {
++        if (!disjoint_or_same(cgraph->nodes[node_idx + j]->src[1])) {
++            return 0;
++        }
++    }
++    return n;
++}
++
+ // the unary ops the fused unary chains in element_wise.cpp have a functor for
+ static bool ggml_sycl_fused_unary_has_kernel(ggml_unary_op unary_op) {
+     return unary_op == GGML_UNARY_OP_SILU || unary_op == GGML_UNARY_OP_SIGMOID ||
+@@ -121,10 +405,38 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
+         return ggml_sycl_should_fuse_mul_mat_glu(gate, up, glu);
+     }
+ 
++    if (ops.size() == 5 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL &&
++        ops.begin()[2] == GGML_OP_ROPE && ops.begin()[3] == GGML_OP_VIEW && ops.begin()[4] == GGML_OP_SET_ROWS) {
++        const int out[] = { node_idx + 4 };
++        return ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 4 }) &&
++               ggml_sycl_should_fuse_rms_norm_mul_rope(cgraph->nodes[node_idx], cgraph->nodes[node_idx + 1],
++                                                       cgraph->nodes[node_idx + 2]) &&
++               ggml_sycl_should_fuse_rope_set_rows(cgraph->nodes[node_idx + 2], cgraph->nodes[node_idx + 3],
++                                                   cgraph->nodes[node_idx + 4]) &&
++               ggml_sycl_fusion_ranges_ok(cgraph, node_idx, 5, out, 1);
++    }
++
++    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ROPE && ops.begin()[1] == GGML_OP_VIEW &&
++        ops.begin()[2] == GGML_OP_SET_ROWS) {
++        const int out[] = { node_idx + 2 };
++        return ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 }) &&
++               ggml_sycl_should_fuse_rope_set_rows(cgraph->nodes[node_idx], cgraph->nodes[node_idx + 1],
++                                                   cgraph->nodes[node_idx + 2]) &&
++               ggml_sycl_fusion_ranges_ok(cgraph, node_idx, 3, out, 1);
++    }
++
+     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
+         return false;
+     }
+ 
++    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL &&
++        ops.begin()[2] == GGML_OP_ROPE) {
++        const int out[] = { node_idx + 2 };
++        return ggml_sycl_should_fuse_rms_norm_mul_rope(cgraph->nodes[node_idx], cgraph->nodes[node_idx + 1],
++                                                       cgraph->nodes[node_idx + 2]) &&
++               ggml_sycl_fusion_ranges_ok(cgraph, node_idx, 3, out, 1);
++    }
++
+     if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
+         if (ops.size() == 3 && ops.begin()[2] != GGML_OP_ADD) {
+             return false;
+diff --git a/ggml/src/ggml-sycl/fusion.hpp b/ggml/src/ggml-sycl/fusion.hpp
+index 94e74088..c8f6650b 100644
+--- a/ggml/src/ggml-sycl/fusion.hpp
++++ b/ggml/src/ggml-sycl/fusion.hpp
+@@ -14,4 +14,28 @@
+ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops,
+                         std::initializer_list<enum ggml_unary_op> unary_ops);
+ 
++// false when a node the fused group [node_idx, node_idx + node_count) writes (out_nodes) overlaps a source
++// the group reads that is not one of its own intermediates
++bool ggml_sycl_fusion_ranges_ok(const ggml_cgraph * cgraph, int node_idx, int node_count, const int * out_nodes,
++                                int out_count);
++
++// The MoE expert sum: MUL by the router weights (optionally after a MUL by a per-expert scale), one VIEW per
++// expert and the k - 1 ADDs over them. k <= GGML_SYCL_MOE_REDUCTION_MAX_EXPERTS keeps the group within the 31
++// nodes ggml_can_fuse_subgraph() takes.
++static constexpr int GGML_SYCL_MOE_REDUCTION_MAX_EXPERTS = 15;
++
++struct ggml_sycl_moe_reduction_match {
++    const ggml_tensor * experts      = nullptr;
++    const ggml_tensor * expert_scale = nullptr;
++    const ggml_tensor * weights      = nullptr;
++    ggml_tensor *       dst          = nullptr;
++    int                 node_count   = 0;
++};
++
++bool ggml_sycl_match_moe_weighted_reduction(const ggml_cgraph * cgraph, int node_idx,
++                                            ggml_sycl_moe_reduction_match & match);
++
++// number of ADDs from node_idx the multi-add kernel takes (3..8), or 0
++int ggml_sycl_match_multi_add(const ggml_cgraph * cgraph, int node_idx);
++
+ #endif  // GGML_SYCL_FUSION_HPP
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index c50f3bdb..b4146abd 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -67,6 +67,7 @@
+ #include "ggml-sycl/element_wise.hpp"
+ #include "ggml-sycl/fwht.hpp"
+ #include "ggml-sycl/fused-gemm.hpp"
++#include "ggml-sycl/fused-add.hpp"
+ #include "ggml-sycl/gemm.hpp"
+ #include "ggml-sycl/getrows.hpp"
+ #include "ggml-sycl/mem.hpp"
+@@ -6915,6 +6916,53 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+                 continue;
+             }
+         }
++        // MUL by the router weights + VIEWs + ADDs: the expert sum of a MoE layer in one launch
++        if (node->op == GGML_OP_MUL) {
++            ggml_sycl_moe_reduction_match match;
++            if (ggml_sycl_match_moe_weighted_reduction(cgraph, i, match)) {
++                const int out = i + match.node_count - 1;
++                if (ggml_sycl_fusion_ranges_ok(cgraph, i, match.node_count, &out, 1)) {
++                    ggml_sycl_op_moe_weighted_reduction(*sycl_ctx, match.experts, match.expert_scale, match.weights,
++                                                        match.dst);
++                    i += match.node_count - 1;
++                    continue;
++                }
++            }
++        }
++        // a chain of 3..8 ADDs (pairs keep the broadcasting ADD + ADD kernel below)
++        if (node->op == GGML_OP_ADD) {
++            const int n_adds = ggml_sycl_match_multi_add(cgraph, i);
++            if (n_adds > 0) {
++                ggml_sycl_op_multi_add(*sycl_ctx, cgraph->nodes + i, n_adds);
++                i += n_adds - 1;
++                continue;
++            }
++        }
++        // RMS_NORM + MUL + ROPE (+ VIEW + SET_ROWS): the Q / K norms of Qwen3, Gemma 3 and OLMo 2, K written
++        // straight into the KV cache
++        if (node->op == GGML_OP_RMS_NORM && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 2]->op == GGML_OP_ROPE) {
++            if (i + 4 < cgraph->n_nodes &&
++                ggml_sycl_can_fuse(cgraph, i,
++                                   { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
++                ggml_sycl_op_rms_norm_mul_rope_fused(*sycl_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2],
++                                                     cgraph->nodes[i + 4]);
++                i += 4;
++                continue;
++            }
++            if (ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {})) {
++                ggml_sycl_op_rms_norm_mul_rope_fused(*sycl_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2],
++                                                     nullptr);
++                i += 2;
++                continue;
++            }
++        }
++        // ROPE + VIEW + SET_ROWS: rope K straight into the KV cache
++        if (node->op == GGML_OP_ROPE && i + 2 < cgraph->n_nodes &&
++            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
++            ggml_sycl_rope_fused(*sycl_ctx, node, cgraph->nodes[i + 2]);
++            i += 2;
++            continue;
++        }
+         if (node->op == GGML_OP_RMS_NORM &&
+             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
+             ggml_sycl_op_rms_norm_fused_add(*sycl_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+@@ -7370,6 +7418,20 @@ static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_ev
+ static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph,
+                                               ggml_backend_graph_optimize_params * params) {
+     GGML_UNUSED(backend);
++    // keep the inputs of the fused MoE expert sum alive until its output, so the allocator cannot hand the
++    // output the memory of the expert results it reads (ggml_sycl_fusion_ranges_ok would then decline it)
++    for (int i = 0; i < cgraph->n_nodes; ++i) {
++        ggml_sycl_moe_reduction_match match;
++        if (cgraph->nodes[i]->op != GGML_OP_MUL || !ggml_sycl_match_moe_weighted_reduction(cgraph, i, match)) {
++            continue;
++        }
++        for (const ggml_tensor * t : { match.experts, match.weights, match.expert_scale }) {
++            if (t != nullptr) {
++                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(t), match.dst);
++            }
++        }
++        i += match.node_count - 1;
++    }
+     for (int i = 0; i < cgraph->n_nodes; ++i) {
+         ggml_sycl_conv_window_match match;
+         if (cgraph->nodes[i]->op != GGML_OP_CONCAT || !ggml_sycl_match_conv_window(cgraph, i, match)) {
+diff --git a/ggml/src/ggml-sycl/rope.cpp b/ggml/src/ggml-sycl/rope.cpp
+index f2ca6034..969c509b 100644
+--- a/ggml/src/ggml-sycl/rope.cpp
++++ b/ggml/src/ggml-sycl/rope.cpp
+@@ -649,3 +649,221 @@ void ggml_sycl_rope_fused(ggml_backend_sycl_context &ctx, ggml_tensor *rope,
+     scope_op_debug_print scope_dbg_print(__func__, rope, /*num_src=*/3);
+     ggml_sycl_op_rope_impl<true>(ctx, rope, set_rows);
+ }
++
++// RMS_NORM + MUL + ROPE (+ VIEW + SET_ROWS), ported from CUDA's rms_norm_mul_rope_f32: one sub-group per
++// (head, token) row. The norm sums the row in the same order as the single-sub-group rms_norm kernel,
++// then each work-item scales, weights and rotates the pairs it owns, writing straight into the KV cache
++// row when a SET_ROWS follows.
++template <bool has_ff, bool is_neox, typename D>
++static void rms_norm_mul_rope_f32(const float * x, D * dst, const int ncols, const int64_t s01, const int64_t s02,
++                                  const int64_t s03, const int64_t s1, const int64_t s2, const int64_t s3,
++                                  const float eps, const float * mul, const int64_t mul_s01, const int64_t mul_s02,
++                                  const int64_t mul_s03, const int mul_nrows, const int mul_nchannels,
++                                  const int mul_nsamples, const int n_dims, const int32_t * pos,
++                                  const float freq_scale, const float ext_factor, const float attn_factor,
++                                  const rope_corr_dims corr_dims, const float theta_scale, const float * freq_factors,
++                                  const int64_t * row_indices, const int64_t set_rows_stride,
++                                  const sycl::nd_item<3> & it) {
++    const int sample  = it.get_group(0);
++    const int channel = it.get_group(1);
++    const int row     = it.get_group(2);
++    const int tid     = it.get_local_id(2);
++
++    const float * xc   = x + sample * s03 + channel * s02 + row * s01;
++    const float * mulc = mul + (sample % mul_nsamples) * mul_s03 + (channel % mul_nchannels) * mul_s02 +
++                         (row % mul_nrows) * mul_s01;
++
++    float tmp = 0.0f;
++    for (int col = tid; col < ncols; col += WARP_SIZE) {
++        const float xi = xc[col];
++        tmp += xi * xi;
++    }
++    tmp = warp_reduce_sum(tmp, it);
++
++    const float mean  = tmp / ncols;
++    const float scale = sycl::rsqrt(mean + eps);
++
++    int64_t idst = sample * s3 + channel * s2 + row * s1;
++    if (set_rows_stride != 0) {
++        idst = row * s1 + row_indices[channel] * set_rows_stride;
++    }
++    D * dstc = dst + idst;
++
++    for (int i0 = 2 * tid; i0 < ncols; i0 += 2 * WARP_SIZE) {
++        int ix0 = i0;
++        int ix1 = i0 + 1;
++        if (is_neox && i0 < n_dims) {
++            ix0 = i0 / 2;
++            ix1 = i0 / 2 + n_dims / 2;
++        }
++
++        const float x0 = scale * xc[ix0] * mulc[ix0];
++        const float x1 = scale * xc[ix1] * mulc[ix1];
++
++        if (i0 >= n_dims) {
++            dstc[ix0] = ggml_sycl_cast<D>(x0);
++            dstc[ix1] = ggml_sycl_cast<D>(x1);
++            continue;
++        }
++
++        const float theta_base  = pos[channel] * dpct::pow(theta_scale, i0 / 2.0f);
++        const float freq_factor = has_ff ? freq_factors[i0 / 2] : 1.0f;
++
++        float cos_theta;
++        float sin_theta;
++        rope_yarn<true>(theta_base / freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, cos_theta,
++                        sin_theta);
++
++        dstc[ix0] = ggml_sycl_cast<D>(x0 * cos_theta - x1 * sin_theta);
++        dstc[ix1] = ggml_sycl_cast<D>(x0 * sin_theta + x1 * cos_theta);
++    }
++}
++
++template <bool has_ff, bool is_neox, typename D>
++static void rms_norm_mul_rope_sycl(const float * x, D * dst, const int ncols, const int nrows, const int nchannels,
++                                   const int nsamples, const int64_t s01, const int64_t s02, const int64_t s03,
++                                   const int64_t s1, const int64_t s2, const int64_t s3, const float eps,
++                                   const float * mul, const int64_t mul_s01, const int64_t mul_s02,
++                                   const int64_t mul_s03, const int mul_nrows, const int mul_nchannels,
++                                   const int mul_nsamples, const int n_dims, const int32_t * pos,
++                                   const float freq_scale, const float ext_factor, const float attn_factor,
++                                   const rope_corr_dims corr_dims, const float theta_scale,
++                                   const float * freq_factors, const int64_t * row_indices,
++                                   const int64_t set_rows_stride, dpct::queue_ptr stream) {
++    const sycl::range<3> block_dims(1, 1, WARP_SIZE);
++    const sycl::range<3> global_dims(nsamples, nchannels, nrows * WARP_SIZE);
++    stream->parallel_for(sycl::nd_range<3>(global_dims, block_dims),
++                         [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                             rms_norm_mul_rope_f32<has_ff, is_neox, D>(
++                                 x, dst, ncols, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
++                                 mul_nrows, mul_nchannels, mul_nsamples, n_dims, pos, freq_scale, ext_factor,
++                                 attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride, it);
++                         });
++}
++
++template <typename D>
++static void rms_norm_mul_rope_dispatch(bool has_ff, bool is_neox, const float * x, D * dst, const int ncols,
++                                       const int nrows, const int nchannels, const int nsamples, const int64_t s01,
++                                       const int64_t s02, const int64_t s03, const int64_t s1, const int64_t s2,
++                                       const int64_t s3, const float eps, const float * mul, const int64_t mul_s01,
++                                       const int64_t mul_s02, const int64_t mul_s03, const int mul_nrows,
++                                       const int mul_nchannels, const int mul_nsamples, const int n_dims,
++                                       const int32_t * pos, const float freq_scale, const float ext_factor,
++                                       const float attn_factor, const rope_corr_dims corr_dims,
++                                       const float theta_scale, const float * freq_factors,
++                                       const int64_t * row_indices, const int64_t set_rows_stride,
++                                       dpct::queue_ptr stream) {
++#define GGML_SYCL_NMR_LAUNCH(FF, NEOX)                                                                              \
++    rms_norm_mul_rope_sycl<FF, NEOX, D>(x, dst, ncols, nrows, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps, \
++                                        mul, mul_s01, mul_s02, mul_s03, mul_nrows, mul_nchannels, mul_nsamples,     \
++                                        n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,   \
++                                        freq_factors, row_indices, set_rows_stride, stream)
++    if (has_ff) {
++        if (is_neox) {
++            GGML_SYCL_NMR_LAUNCH(true, true);
++        } else {
++            GGML_SYCL_NMR_LAUNCH(true, false);
++        }
++    } else {
++        if (is_neox) {
++            GGML_SYCL_NMR_LAUNCH(false, true);
++        } else {
++            GGML_SYCL_NMR_LAUNCH(false, false);
++        }
++    }
++#undef GGML_SYCL_NMR_LAUNCH
++}
++
++void ggml_sycl_op_rms_norm_mul_rope_fused(ggml_backend_sycl_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul,
++                                          ggml_tensor * rope, ggml_tensor * set_rows) {
++    scope_op_debug_print scope_dbg_print(__func__, rope, /*num_src=*/3,
++                                         set_rows ? " : fused with rms_norm + mul and set_rows"
++                                                  : " : fused with rms_norm + mul");
++    const ggml_tensor * x       = rms_norm->src[0];
++    const ggml_tensor * mul_src = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
++
++    float eps = 0.0f;
++    memcpy(&eps, rms_norm->op_params, sizeof(float));
++    GGML_ASSERT(eps >= 0.0f);
++
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(mul_src->type == GGML_TYPE_F32);
++    GGML_ASSERT(rope->type == GGML_TYPE_F32);
++
++    void *          dst_d           = rope->data;
++    ggml_type       dst_type        = rope->type;
++    const int64_t * row_indices     = nullptr;
++    int64_t         set_rows_stride = 0;
++
++    if (set_rows != nullptr) {
++        dst_d           = set_rows->data;
++        dst_type        = set_rows->type;
++        row_indices     = (const int64_t *) set_rows->src[1]->data;
++        set_rows_stride = set_rows->nb[1] / ggml_type_size(set_rows->type);
++    }
++
++    const int n_dims     = ((const int32_t *) rope->op_params)[1];
++    const int mode       = ((const int32_t *) rope->op_params)[2];
++    const int n_ctx_orig = ((const int32_t *) rope->op_params)[4];
++
++    float freq_base;
++    float freq_scale;
++    float ext_factor;
++    float attn_factor;
++    float beta_fast;
++    float beta_slow;
++
++    memcpy(&freq_base, (const int32_t *) rope->op_params + 5, sizeof(float));
++    memcpy(&freq_scale, (const int32_t *) rope->op_params + 6, sizeof(float));
++    memcpy(&ext_factor, (const int32_t *) rope->op_params + 7, sizeof(float));
++    memcpy(&attn_factor, (const int32_t *) rope->op_params + 8, sizeof(float));
++    memcpy(&beta_fast, (const int32_t *) rope->op_params + 9, sizeof(float));
++    memcpy(&beta_slow, (const int32_t *) rope->op_params + 10, sizeof(float));
++
++    const bool is_neox = mode & GGML_ROPE_TYPE_NEOX;
++
++    const int32_t * pos          = (const int32_t *) rope->src[1]->data;
++    const float *   freq_factors = rope->src[2] != nullptr ? (const float *) rope->src[2]->data : nullptr;
++
++    // as ggml_sycl_op_rope_impl: supports_op only admits truncated YaRN correction dims
++    rope_corr_dims corr_dims;
++    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, true, corr_dims.v);
++
++    const float theta_scale = powf(freq_base, -2.0f / n_dims);
++
++    const size_t ts0 = ggml_type_size(x->type);
++    GGML_ASSERT(x->nb[0] == ts0);
++    const int64_t s01 = x->nb[1] / ts0;
++    const int64_t s02 = x->nb[2] / ts0;
++    const int64_t s03 = x->nb[3] / ts0;
++
++    const size_t ts_mul = ggml_type_size(mul_src->type);
++    GGML_ASSERT(mul_src->nb[0] == ts_mul);
++    const int64_t mul_s01 = mul_src->nb[1] / ts_mul;
++    const int64_t mul_s02 = mul_src->nb[2] / ts_mul;
++    const int64_t mul_s03 = mul_src->nb[3] / ts_mul;
++
++    const size_t  ts_dst = ggml_type_size(rope->type);
++    const int64_t s1     = rope->nb[1] / ts_dst;
++    const int64_t s2     = rope->nb[2] / ts_dst;
++    const int64_t s3     = rope->nb[3] / ts_dst;
++
++    dpct::queue_ptr stream = ctx.stream();
++    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
++
++    if (dst_type == GGML_TYPE_F32) {
++        rms_norm_mul_rope_dispatch<float>(
++            freq_factors != nullptr, is_neox, (const float *) x->data, (float *) dst_d, x->ne[0], x->ne[1], x->ne[2],
++            x->ne[3], s01, s02, s03, s1, s2, s3, eps, (const float *) mul_src->data, mul_s01, mul_s02, mul_s03,
++            mul_src->ne[1], mul_src->ne[2], mul_src->ne[3], n_dims, pos, freq_scale, ext_factor, attn_factor,
++            corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride, stream);
++    } else if (dst_type == GGML_TYPE_F16) {
++        rms_norm_mul_rope_dispatch<sycl::half>(
++            freq_factors != nullptr, is_neox, (const float *) x->data, (sycl::half *) dst_d, x->ne[0], x->ne[1],
++            x->ne[2], x->ne[3], s01, s02, s03, s1, s2, s3, eps, (const float *) mul_src->data, mul_s01, mul_s02,
++            mul_s03, mul_src->ne[1], mul_src->ne[2], mul_src->ne[3], n_dims, pos, freq_scale, ext_factor,
++            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride, stream);
++    } else {
++        GGML_ABORT("fatal error");
++    }
++}
+diff --git a/ggml/src/ggml-sycl/rope.hpp b/ggml/src/ggml-sycl/rope.hpp
+index 94a76989..59ae6fde 100644
+--- a/ggml/src/ggml-sycl/rope.hpp
++++ b/ggml/src/ggml-sycl/rope.hpp
+@@ -21,4 +21,8 @@ void ggml_sycl_rope_back(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_sycl_rope_fused(ggml_backend_sycl_context & ctx, ggml_tensor * dst, ggml_tensor * set_rows);
+ 
++// RMS_NORM + MUL + ROPE, and with set_rows != nullptr the VIEW + SET_ROWS into the KV cache as well
++void ggml_sycl_op_rms_norm_mul_rope_fused(ggml_backend_sycl_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul,
++                                          ggml_tensor * rope, ggml_tensor * set_rows);
++
+ #endif // GGML_SYCL_ROPE_HPP
+diff --git a/ggml/src/ggml-sycl/topk-moe.cpp b/ggml/src/ggml-sycl/topk-moe.cpp
+index 3dd92d26..bf451390 100644
+--- a/ggml/src/ggml-sycl/topk-moe.cpp
++++ b/ggml/src/ggml-sycl/topk-moe.cpp
+@@ -7,10 +7,11 @@
+ #include "ggml-backend-impl.h"
+ #include "topk-moe.hpp"
+ 
+-// SYCL port of ggml-cuda/topk-moe.cu. The kernel is a translation of the CUDA no-bias, no-PDL
+-// path of topk_moe_cuda; the fusion-detection helpers below are ported near-verbatim from
+-// ggml-cuda.cu (pure graph / pointer inspection, backend-agnostic). Bias is not implemented here:
+-// if a routing bias is detected, the fusion is declined and the eager path runs unchanged.
++// SYCL port of ggml-cuda/topk-moe.cu. The kernel is a translation of the CUDA no-PDL path of
++// topk_moe_cuda, including the routing bias (DeepSeek-V3-style selection on probs + bias with the
++// unbiased probs as weights); the fusion-detection helpers below are ported near-verbatim from
++// ggml-cuda.cu (pure graph / pointer inspection, backend-agnostic). CUDA's expert-group masking and
++// sqrt(softplus) gating are not ported: those graphs do not match here and run unfused.
+ 
+ struct ggml_sycl_topk_moe_args {
+     bool sigmoid{};
+@@ -86,10 +87,11 @@ static inline void sigmoid_warp_inplace(float (&vals)[experts_per_thread], const
+     It is intended as a fusion of the softmax->top-k->get_rows pipeline for MoE models.
+     One sub-group handles one row/token, mirroring topk_moe_cuda's one-warp-per-row layout.
+ */
+-template <int n_experts>
++template <int n_experts, bool has_bias>
+ static void topk_moe_kernel(const float * __restrict__ logits,
+                             float * __restrict__       weights,
+                             int32_t * __restrict__     ids,
++                            const float * __restrict__ bias,
+                             const int                  n_rows,
+                             const int                  n_expert_used,
+                             const float                clamp_val,
+@@ -136,6 +138,21 @@ static void topk_moe_kernel(const float * __restrict__ logits,
+         }
+     }
+ 
++    // with a routing bias the experts are selected on probs + bias, but weighted by the probs alone
++    [[maybe_unused]] float selection_wt[has_bias ? experts_per_thread : 1];
++    if constexpr (has_bias) {
++#pragma unroll
++        for (int i = 0; i < experts_per_thread; i++) {
++            selection_wt[i] = -INFINITY;
++        }
++#pragma unroll
++        for (int i = 0; i < n_experts; i += WARP_SIZE) {
++            const int expert = i + lane;
++            selection_wt[i / WARP_SIZE] =
++                (n_experts % WARP_SIZE == 0 || expert < n_experts) ? wt[i / WARP_SIZE] + bias[expert] : -INFINITY;
++        }
++    }
++
+     // each thread now holds either a portion of the softmax distribution or the raw logits. Do the
+     // argmax reduce over n_expert_used, each time marking the selected expert as -inf to exclude it
+     // from the next iteration.
+@@ -152,26 +169,54 @@ static void topk_moe_kernel(const float * __restrict__ logits,
+     for (int k = 0; k < n_expert_used; k++) {
+         float max_val    = wt[0];
+         int   max_expert = lane;
++        if constexpr (has_bias) {
++            float max_val_s = selection_wt[0];
+ #pragma unroll
+-        for (int i = 1; i < experts_per_thread; i++) {
+-            const int expert = lane + i * WARP_SIZE;
+-            if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && wt[i] > max_val) {
+-                max_val    = wt[i];
+-                max_expert = expert;
++            for (int i = 1; i < experts_per_thread; i++) {
++                const int expert = lane + i * WARP_SIZE;
++                if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && selection_wt[i] > max_val_s) {
++                    max_val    = wt[i];
++                    max_val_s  = selection_wt[i];
++                    max_expert = expert;
++                }
+             }
+-        }
+ #pragma unroll
+-        for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+-            const float val    = dpct::permute_sub_group_by_xor(sg, max_val, mask);
+-            const int   expert = dpct::permute_sub_group_by_xor(sg, max_expert, mask);
+-            if (val > max_val || (val == max_val && expert < max_expert)) {
+-                max_val    = val;
+-                max_expert = expert;
++            for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
++                const float val    = dpct::permute_sub_group_by_xor(sg, max_val, mask);
++                const float val_s  = dpct::permute_sub_group_by_xor(sg, max_val_s, mask);
++                const int   expert = dpct::permute_sub_group_by_xor(sg, max_expert, mask);
++                if (val_s > max_val_s || (val_s == max_val_s && expert < max_expert)) {
++                    max_val    = val;
++                    max_val_s  = val_s;
++                    max_expert = expert;
++                }
+             }
+-        }
+ 
+-        if ((max_expert & (WARP_SIZE - 1)) == lane) {
+-            wt[max_expert / WARP_SIZE] = -INFINITY;
++            if ((max_expert & (WARP_SIZE - 1)) == lane) {
++                selection_wt[max_expert / WARP_SIZE] = -INFINITY;
++            }
++        } else {
++#pragma unroll
++            for (int i = 1; i < experts_per_thread; i++) {
++                const int expert = lane + i * WARP_SIZE;
++                if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && wt[i] > max_val) {
++                    max_val    = wt[i];
++                    max_expert = expert;
++                }
++            }
++#pragma unroll
++            for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
++                const float val    = dpct::permute_sub_group_by_xor(sg, max_val, mask);
++                const int   expert = dpct::permute_sub_group_by_xor(sg, max_expert, mask);
++                if (val > max_val || (val == max_val && expert < max_expert)) {
++                    max_val    = val;
++                    max_expert = expert;
++                }
++            }
++
++            if ((max_expert & (WARP_SIZE - 1)) == lane) {
++                wt[max_expert / WARP_SIZE] = -INFINITY;
++            }
+         }
+         if ((k & (WARP_SIZE - 1)) == lane) {
+             output_weights[k / WARP_SIZE] = max_val;
+@@ -207,25 +252,53 @@ static void topk_moe_kernel(const float * __restrict__ logits,
+     }
+ }
+ 
+-template <int n_experts>
+-static void launch_topk_moe(queue_ptr stream, const float * logits, float * weights, int32_t * ids, int n_rows,
+-                            int n_expert_used, float clamp_val, float scale_val, const topk_moe_config & config) {
++template <int n_experts, bool has_bias>
++static void launch_topk_moe(queue_ptr stream, const float * logits, float * weights, int32_t * ids, const float * bias,
++                            int n_rows, int n_expert_used, float clamp_val, float scale_val,
++                            const topk_moe_config & config) {
+     const sycl::range<1> block_dims(WARP_SIZE);
+     const sycl::range<1> block_nums(n_rows);
+     stream->parallel_for(sycl::nd_range<1>(block_nums * block_dims, block_dims),
+                          [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+-                             topk_moe_kernel<n_experts>(logits, weights, ids, n_rows, n_expert_used, clamp_val,
+-                                                        scale_val, config);
++                             topk_moe_kernel<n_experts, has_bias>(logits, weights, ids, bias, n_rows, n_expert_used,
++                                                                  clamp_val, scale_val, config);
+                              GGML_UNUSED(item_ct1);
+                          });
+ }
+ 
++template <bool has_bias>
++static void launch_topk_moe_n(queue_ptr stream, int n_experts, const float * logits, float * weights, int32_t * ids,
++                              const float * bias, int n_rows, int n_expert_used, float clamp_val, float scale_val,
++                              const topk_moe_config & config) {
++    switch (n_experts) {
++#define GGML_SYCL_TOPK_MOE_CASE(N)                                                                                \
++    case N:                                                                                                       \
++        launch_topk_moe<N, has_bias>(stream, logits, weights, ids, bias, n_rows, n_expert_used, clamp_val,     \
++                                     scale_val, config);                                                        \
++        break;
++        GGML_SYCL_TOPK_MOE_CASE(1)
++        GGML_SYCL_TOPK_MOE_CASE(2)
++        GGML_SYCL_TOPK_MOE_CASE(4)
++        GGML_SYCL_TOPK_MOE_CASE(8)
++        GGML_SYCL_TOPK_MOE_CASE(16)
++        GGML_SYCL_TOPK_MOE_CASE(32)
++        GGML_SYCL_TOPK_MOE_CASE(64)
++        GGML_SYCL_TOPK_MOE_CASE(128)
++        GGML_SYCL_TOPK_MOE_CASE(256)
++        GGML_SYCL_TOPK_MOE_CASE(512)
++#undef GGML_SYCL_TOPK_MOE_CASE
++        default:
++            GGML_ASSERT(false && "fatal error");
++    }
++}
++
+ static void ggml_sycl_op_topk_moe(ggml_backend_sycl_context &     ctx,
+                                   const ggml_tensor *             logits,
+                                   ggml_tensor *                   weights,
+                                   ggml_tensor *                   ids,
+                                   const ggml_tensor *             clamp,
+                                   const ggml_tensor *             scale,
++                                  const ggml_tensor *             bias,
+                                   const ggml_sycl_topk_moe_args & args) {
+     GGML_ASSERT(logits->type  == GGML_TYPE_F32);
+     GGML_ASSERT(weights->type == GGML_TYPE_F32);
+@@ -253,49 +326,12 @@ static void ggml_sycl_op_topk_moe(ggml_backend_sycl_context &     ctx,
+     queue_ptr stream = ctx.stream();
+     ggml_sycl_set_device(ctx.device);
+ 
+-    switch (n_experts) {
+-        case 1:
+-            launch_topk_moe<1>(stream, logits_d, weights_d, ids_d, n_rows, n_expert_used, clamp_val, scale_val,
+-                               config);
+-            break;
+-        case 2:
+-            launch_topk_moe<2>(stream, logits_d, weights_d, ids_d, n_rows, n_expert_used, clamp_val, scale_val,
+-                               config);
+-            break;
+-        case 4:
+-            launch_topk_moe<4>(stream, logits_d, weights_d, ids_d, n_rows, n_expert_used, clamp_val, scale_val,
+-                               config);
+-            break;
+-        case 8:
+-            launch_topk_moe<8>(stream, logits_d, weights_d, ids_d, n_rows, n_expert_used, clamp_val, scale_val,
+-                               config);
+-            break;
+-        case 16:
+-            launch_topk_moe<16>(stream, logits_d, weights_d, ids_d, n_rows, n_expert_used, clamp_val, scale_val,
+-                                config);
+-            break;
+-        case 32:
+-            launch_topk_moe<32>(stream, logits_d, weights_d, ids_d, n_rows, n_expert_used, clamp_val, scale_val,
+-                                config);
+-            break;
+-        case 64:
+-            launch_topk_moe<64>(stream, logits_d, weights_d, ids_d, n_rows, n_expert_used, clamp_val, scale_val,
+-                                config);
+-            break;
+-        case 128:
+-            launch_topk_moe<128>(stream, logits_d, weights_d, ids_d, n_rows, n_expert_used, clamp_val, scale_val,
+-                                 config);
+-            break;
+-        case 256:
+-            launch_topk_moe<256>(stream, logits_d, weights_d, ids_d, n_rows, n_expert_used, clamp_val, scale_val,
+-                                 config);
+-            break;
+-        case 512:
+-            launch_topk_moe<512>(stream, logits_d, weights_d, ids_d, n_rows, n_expert_used, clamp_val, scale_val,
+-                                 config);
+-            break;
+-        default:
+-            GGML_ASSERT(false && "fatal error");
++    if (bias != nullptr) {
++        launch_topk_moe_n<true>(stream, n_experts, logits_d, weights_d, ids_d, (const float *) bias->data, n_rows,
++                                n_expert_used, clamp_val, scale_val, config);
++    } else {
++        launch_topk_moe_n<false>(stream, n_experts, logits_d, weights_d, ids_d, nullptr, n_rows, n_expert_used,
++                                 clamp_val, scale_val, config);
+     }
+ }
+ 
+@@ -558,25 +594,31 @@ int ggml_sycl_fuse_topk_moe(ggml_backend_sycl_context & ctx, ggml_cgraph * cgrap
+         return 0;
+     }
+ 
+-    // this kernel implements the no-bias path only; decline anything with a routing bias
+-    if (args.prob_bias) {
+-        return 0;
+-    }
+-
+     const ggml_tensor * logits  = node->src[0];
+     ggml_tensor *       weights = nullptr;
+     ggml_tensor *       ids     = nullptr;
+     const ggml_tensor * clamp   = nullptr;
+     const ggml_tensor * scale   = nullptr;
++    const ggml_tensor * bias    = nullptr;
+ 
+     std::vector<ggml_op> ops;
+     int                  out_nodes[2];
+ 
+     if (!args.delayed_softmax) {
+         const ggml_op gating_op = args.sigmoid ? GGML_OP_UNARY : GGML_OP_SOFT_MAX;
+-        ops.insert(ops.end(), { gating_op, GGML_OP_RESHAPE, GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS });
+-        out_nodes[0] = i + 3;
+-        ids          = cgraph->nodes[i + 3];
++        ops.insert(ops.end(), { gating_op, GGML_OP_RESHAPE });
++        if (args.prob_bias) {
++            // selection on probs + bias: the bias must be one F32 value per expert
++            ops.push_back(GGML_OP_ADD);
++            bias = cgraph->nodes[i + 2]->src[1];
++            if (bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias) || bias->ne[0] != logits->ne[0] ||
++                ggml_nelements(bias) != bias->ne[0]) {
++                return 0;
++            }
++        }
++        ops.insert(ops.end(), { GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS });
++        out_nodes[0] = i + (int) ops.size() - 2;
++        ids          = cgraph->nodes[out_nodes[0]];
+ 
+         if (args.norm) {
+             ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE });
+@@ -593,7 +635,7 @@ int ggml_sycl_fuse_topk_moe(ggml_backend_sycl_context & ctx, ggml_cgraph * cgrap
+         if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
+             ggml_sycl_should_use_topk_moe(node, weights, logits, ids) &&
+             ggml_sycl_check_fusion_memory_ranges(cgraph, i, (int) ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
+-            ggml_sycl_op_topk_moe(ctx, logits, weights, ids, clamp, scale, args);
++            ggml_sycl_op_topk_moe(ctx, logits, weights, ids, clamp, scale, bias, args);
+             return (int) ops.size() - 1;
+         }
+     } else if (!args.norm && !args.prob_bias) {
+@@ -610,7 +652,7 @@ int ggml_sycl_fuse_topk_moe(ggml_backend_sycl_context & ctx, ggml_cgraph * cgrap
+         if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
+             ggml_sycl_should_use_topk_moe(softmax, weights, logits, ids) &&
+             ggml_sycl_check_fusion_memory_ranges(cgraph, i, (int) ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
+-            ggml_sycl_op_topk_moe(ctx, logits, weights, ids, clamp, scale, args);
++            ggml_sycl_op_topk_moe(ctx, logits, weights, ids, clamp, scale, bias, args);
+             return (int) ops.size() - 1;
+         }
+     }

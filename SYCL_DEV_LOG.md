@@ -153,6 +153,109 @@ oneAPI came from conda-forge into `/opt/oneapi` on a GPU-less cloud box:
   floating point exception, likely from GPU-only device properties. The only
   numeric test of SYCL kernels here is C60's standalone emulation above.
 
+## Fusions ported from CUDA, Vulkan and Metal (2026-11-03, `ZZ-LOCAL-0011` to `ZZ-LOCAL-0014`)
+
+A survey of the CUDA, Vulkan and Metal backends against the patched SYCL backend found the gap was graph
+fusion, not kernels: the three backends fold decode-time ops into the mat-vec or into one launch where
+SYCL launched several. Four local patches port eight of them. Speed on the A770 is not measured; the
+counts below are from the graph structure.
+
+| Patch | Fusion | Source | Launches saved (decode) |
+|---|---|---|---|
+| 0011 | ROPE + VIEW + SET_ROWS | CUDA, Vulkan; SYCL had the kernel (`ggml_sycl_rope_fused`) and no caller | 1 per layer |
+| 0011 | RMS_NORM + MUL + ROPE (+ VIEW + SET_ROWS) | CUDA, Vulkan | 2 more per layer with Q / K norms (Qwen3, Gemma 3, OLMo 2) |
+| 0011 | MoE expert sum: MUL (router weights) + VIEWs + k - 1 ADDs, k <= 15 | CUDA, Metal | 4 per MoE layer at k = 8 (was 1 MUL + 4 ADD / ADD + ADD) |
+| 0011 | 3..8 same-shape ADDs | CUDA, Vulkan | model-dependent |
+| 0011 | topk-moe with a routing bias | CUDA, Vulkan | about 10 routing ops per layer (GLM-4.5+, DeepSeek-V3-style) |
+| 0012 | MoE MMVQ for 2..8 tokens | CUDA | spec-decode verify / parallel slots stay on the MMVQ |
+| 0012 | MUL_MAT_ID gate + up + GLU (+ ADD_ID biases), MUL_MAT_ID + ADD_ID | CUDA | 3 per MoE layer (5 with gpt-oss biases) |
+| 0013 | MUL_MAT (one column) + ADD | CUDA, Vulkan, Metal | 2 per layer (residuals), more with biases |
+| 0014 | one q8_1 / f16 copy of an activation for Q, K, V | Vulkan (`prealloc_y`) | 2 per layer on MMVQ / f16-DMMV types |
+
+For Qwen3-30B-A3B (48 layers) 0011 to 0013 remove about 11 of roughly 30 kernels per layer, about 530 per
+token; for a dense Qwen3-8B, about 5 of 20 per layer. To turn that into time on the card, compare
+`llama-bench -n 128` with `GGML_SYCL_ENABLE_FUSION=0` and `=1`: every fusion here, 0014 included, follows
+that switch. The 2..8-token MoE MMVQ is not a fusion; `GGML_SYCL_MMID_MMVQ_MAX_TOKENS=1` turns it off.
+
+How each one works:
+
+- **0011:** the predicates are CUDA's, cut down to what the SYCL kernels take. The rope set_rows path
+  takes f32 in, an f32 / f16 cache, I64 row ids, the norm and neox modes, and a cache whose element index fits
+  in 32 bits (the rope kernels index in `int`). The norm + rope kernel is one sub-group per (head, token) row
+  and sums the row in the order of the one-sub-group rms_norm kernel. The expert-sum matcher is CUDA's;
+  `graph_optimize` keeps the expert results, router weights and scales alive until the sum, so the
+  allocator cannot place the sum over them. The topk-moe bias path is `topk_moe_cuda<has_bias>`: selection
+  on probs + bias, weights from the probs. CUDA's expert-group masking and sqrt(softplus) gating are not
+  ported; those graphs do not match and run unfused.
+- **0012:** one `ggml_sycl_moe_mmvq_ext` threads three options through both MoE kernels: a token
+  dimension in the grid (strides for the q8_1 rows, the dst rows and the ids), a gate weight with a GLU
+  epilogue (SWIGLU, GEGLU, SWIGLU_OAI, SWIGLU_CLAMP, the formulas of the standalone GLU kernels), and
+  per-expert row biases. The token cap per type is CUDA's RDNA3 table (k-quants and IQ2 / IQ3: 4, IQ1 /
+  IQ4: 6, others: 8); it is a guess for Intel, `GGML_SYCL_MMID_MMVQ_MAX_TOKENS` overrides it. The routing
+  ids are read while the fused output is written, so `graph_optimize` keeps them alive until it and the
+  dispatcher declines an overlap.
+- **0013:** `ggml_sycl_mul_mat_add_fused` points the mat-vec at the ADD's memory and puts the addend in
+  the context. The DMMV kernels add it in their store and say so: the A770's ESIMD kernels (q2_K..q6_K,
+  q8_0) through a separate policy, the generic plain / reorder kernels (q4_0, q4_1, q5_0, q5_1, q8_0, q1_0)
+  through a parameter. Anything else (MMVQ, the non-ESIMD k-quant DMMV) leaves its plain result there and
+  one in-place ADD follows, so the fusion never adds a launch. The ESIMD addend needed its own policy:
+  with a run-time null test around the load, IGC's ESIMD back end crashes building `dmmv.cpp` for
+  `acm-g10` ("Internal Compiler Error: Abnormal termination", oneAPI 2026.2), the same kind of failure
+  candidate C40 hit with its in-kernel mask test. An unconditional gather builds, so the add policy
+  gathers the addend and the plain policy is unchanged.
+- **0014:** the context keeps the last converted activation, keyed by the graph node's src1 tensor, its data
+  pointer, the layout (q8_1, reordered q8_1, f16) and the size. Only the node the graph loop is running may
+  use it, which keeps the MUL_MAT_ID per-expert loop's stack tensors out. The graph loop drops it when a node
+  writes the activation's memory, and at the start and end of every graph. The pool buffer it holds is host
+  bookkeeping over persistent device memory, as every other pool temporary is, so SYCL graph replay is
+  unaffected. The A770's ESIMD DMMV for the k-quants and q8_0 reads f32 activations and gains nothing.
+
+Verification (CPU OpenCL device, `tools/cpu-device-test`, icpx 2026.2):
+
+| Test | Result |
+|---|---|
+| `ROPE_SET_ROWS` | 73/73 |
+| `RMS_NORM_MUL_ROPE` | 260/260 |
+| `MOE_REDUCE` | 6/6 (the 16-expert case is above the cap and runs unfused) |
+| `ADD_ADD`, `ADD` with 16 chained adds | 12/12, 2/2 |
+| `TOPK_MOE`, power-of-two expert counts | 351/352: one expert-group case (not fused) failed once and passed 16 reruns with fusion on and off |
+| `MUL_MAT_VEC_FUSION` | 1754/1754, and 1754/1754 with the reorder forced on |
+| `MUL_MAT_ID` | 1205/1205, and 1205/1205 with the reorder forced on |
+| `MUL_MAT`, one column, the DMMV types | 182/214: all 32 failures are f16 weights viewed with a wider row stride in batches (`k_v`, `bs=[*,3]`), which take `ggml_sycl_mul_mat_batched_sycl`, untouched here; they fail the same with fusion off |
+
+With `GGML_SYCL_DEBUG=1` each fusion shows up running: the rope set_rows and norm + rope launches, 5 of the
+6 expert sums, two 8-add chains for the 16-add test, the MUL_MAT + ADD epilogue applied on q4_0 and the in-place
+fallback on q4_K, and one q8_1 and one f16 conversion instead of two for a gate / up pair that the GLU
+fusion does not take. The full-run timeout on `TOPK_MOE` was the unfused 288-expert cases, whose argsort is
+slow on the CPU device; the rerun covered the power-of-two counts the fused kernel takes.
+
+`acm-g10` AOT: `rope.cpp` (53 kernels), `fused-add.cpp` (6), `topk-moe.cpp` (24), `dmmv.cpp` (53) and the
+MoE kernels of `mmvq.cpp` (100, gate variants included) build without spills, except the plain-layout
+q3_K MoE kernel with the gate (672 B). The dispatcher keeps that one case as two launches. Each of the
+four patches passes a device-side syntax check (`-fsycl-device-only -fsyntax-only`) at its own stage. All candidates apply on top with plain `git apply`, and their
+`mmvq.cpp`, `ggml-sycl.cpp`, `dmmv.cpp` and `fusion.cpp` pass the same check. The round trip with the Vulkan stack
+returns a clean tree.
+
+Not covered: the MoE gate + up fusion for gate and up of different types; the MUL_MAT + ADD epilogue in
+the MMVQ kernels (i-quants, 2..8 columns), whose many per-type launchers would need it one by one;
+CUDA's shared-expert fusion; the opt-in multi-stream Q/K/V concurrency (`GGML_CUDA_GRAPH_OPT=1`).
+Prompt processing is unchanged. Dense k-quant / q8_0 batches still dequantize every weight to f16 before
+oneDNN, since `ggml_sycl_supports_mmq()` keeps 0016's int8 XMX MMQ unreachable and the fused dequant GEMM
+stops at 64 columns.
+
+To measure on the A770 (JIT build, so the ESIMD kernels get their 256 GRF):
+
+```bash
+GGML_SYCL_ENABLE_FUSION=0 ./build/bin/llama-bench -m MODEL -p 0 -n 128 -r 3
+```
+```bash
+GGML_SYCL_ENABLE_FUSION=1 ./build/bin/llama-bench -m MODEL -p 0 -n 128 -r 3
+```
+
+Run one dense model (Qwen3-8B Q4_K_M: QK-norm rope and residual epilogues) and one MoE model
+(Qwen3-30B-A3B or gpt-oss-20b: expert sum, gate + up, biases). Also run `test-backend-ops -b SYCL0 -o
+MUL_MAT_VEC_FUSION` on the card, since the ESIMD epilogue only runs there.
+
 ## DG2 register spills (2026-11-02, `ZZ-LOCAL-0010`)
 
 The part-2 AOT check below found spills on `acm-g10` in kernels the A770 runs. Every number here is

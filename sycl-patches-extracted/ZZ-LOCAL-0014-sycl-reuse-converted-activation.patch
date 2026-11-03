@@ -1,0 +1,176 @@
+Subject: [PATCH] sycl: reuse the q8_1 / f16 copy of an activation across sibling mat-muls
+
+Local port of Vulkan's prealloc_y cache. Q, K and V (and other mat-muls of one activation) each
+converted the same activation: q8_1 for MMVQ, f16 for DMMV of q4_0 / q4_1 / q5_x / q8_0 / f16. The context
+keeps the last converted copy, keyed by the graph node's src1 tensor, its data pointer, the layout and
+the size, and only the graph node being run may use it. The graph loop drops it when any node writes
+the activation's memory and at the start and end of every graph. The A770's ESIMD DMMV for the k-quants
+and q8_0 reads f32 activations and gains nothing; MMVQ types (i-quants, 2..8 columns) and q4_0 do.
+
+diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
+index 289f91e9..7b00a6d4 100644
+--- a/ggml/src/ggml-sycl/common.hpp
++++ b/ggml/src/ggml-sycl/common.hpp
+@@ -608,6 +608,33 @@ struct ggml_backend_sycl_context {
+     const float * mmv_add         = nullptr;
+     bool          mmv_add_applied = false;
+ 
++    // The converted copy (q8_1 for MMVQ, f16 for DMMV) of the last mat-mul activation, for the sibling mat-muls
++    // that read the same activation in one graph: Q, K and V (Vulkan's prealloc_y cache). Only the graph node in
++    // src1_cache_node may use it; the graph loop drops it when a node writes the activation's memory and at the
++    // end of every graph.
++    struct src1_cache_entry {
++        const ggml_tensor * src         = nullptr;
++        const void *        data        = nullptr;
++        int                 kind        = 0;
++        size_t              size        = 0;
++        void *              ptr         = nullptr;
++        size_t              actual_size = 0;
++        ggml_sycl_pool *    pool        = nullptr;
++    } src1_cache;
++    const ggml_tensor * src1_cache_node = nullptr;
++
++    void * src1_cache_find(const ggml_tensor * src, int kind, size_t size) const {
++        const src1_cache_entry & c = src1_cache;
++        return c.ptr && c.src == src && c.data == src->data && c.kind == kind && c.size == size ? c.ptr : nullptr;
++    }
++
++    void src1_cache_drop() {
++        if (src1_cache.ptr) {
++            src1_cache.pool->free(src1_cache.ptr, src1_cache.actual_size);
++        }
++        src1_cache = {};
++    }
++
+     explicit ggml_backend_sycl_context(int device) :
+         device(device),
+         name(GGML_SYCL_NAME + std::to_string(device)) {
+@@ -694,6 +721,19 @@ struct ggml_backend_sycl_context {
+         return pool(device);
+     }
+ 
++    // replaces the cached activation copy with a new buffer of size bytes the caller fills
++    void * src1_cache_put(const ggml_tensor * src, int kind, size_t size) {
++        src1_cache_drop();
++        ggml_sycl_pool & p = pool();
++        src1_cache.src     = src;
++        src1_cache.data    = src->data;
++        src1_cache.kind    = kind;
++        src1_cache.size    = size;
++        src1_cache.pool    = &p;
++        src1_cache.ptr     = p.alloc(size, &src1_cache.actual_size);
++        return src1_cache.ptr;
++    }
++
+ #ifdef GGML_SYCL_GRAPH
+     // Map from first node pointer to graph - allows multiple graphs per context when the
+     // computation is split across CPU/GPU (e.g. with --n-cpu-moe)
+diff --git a/ggml/src/ggml-sycl/dmmv.cpp b/ggml/src/ggml-sycl/dmmv.cpp
+index 9ce8ba48..ca6b9bcb 100644
+--- a/ggml/src/ggml-sycl/dmmv.cpp
++++ b/ggml/src/ggml-sycl/dmmv.cpp
+@@ -1987,12 +1987,20 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
+         src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F8_E4M3;
+ 
+     if (src1_convert_f16) {
+-        scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
+-                                             " : converting src1 to fp16");
+-        src1_dfloat = src1_dfloat_a.alloc(ne00);
+-        const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src1->type, dst);
+-        GGML_ASSERT(to_fp16_sycl != nullptr);
+-        to_fp16_sycl(src1_ddf_i, src1_dfloat, ne00, stream);
++        // sibling mat-muls of one activation (Q, K, V) share its f16 copy in this graph
++        const bool f16_cache = g_ggml_sycl_enable_fusion && dst == ctx.src1_cache_node && src1_ddf_i == src1->data &&
++                               ggml_is_contiguous(src1);
++        constexpr int f16_kind = 3;
++        src1_dfloat = f16_cache ? (sycl::half *) ctx.src1_cache_find(src1, f16_kind, ne00 * sizeof(sycl::half)) : nullptr;
++        if (src1_dfloat == nullptr) {
++            scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
++                                                 " : converting src1 to fp16");
++            src1_dfloat = f16_cache ? (sycl::half *) ctx.src1_cache_put(src1, f16_kind, ne00 * sizeof(sycl::half))
++                                    : src1_dfloat_a.alloc(ne00);
++            const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src1->type, dst);
++            GGML_ASSERT(to_fp16_sycl != nullptr);
++            to_fp16_sycl(src1_ddf_i, src1_dfloat, ne00, stream);
++        }
+     }
+ #else
+     const dfloat * src1_dfloat = (const dfloat *) src1_ddf_i; // dfloat == float, no conversion
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 13d0e206..75f3a50c 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -3830,9 +3830,22 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
+         }
+ 
+         if constexpr(quantize_enabled) {
+-            dev[i].src1_ddq = dev[i].src1_ddq_alloc.alloc(ctx.pool(i), nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs);
++            // sibling mat-muls of one activation (Q, K, V) share its q8_1 copy in this graph
++            constexpr int q_kind  = std::is_same_v<quantize_f<QK8_1 / WARP_SIZE>,
++                                                   quantize_and_reorder_q8_1_soa<QK8_1 / WARP_SIZE>> ? 2 : 1;
++            const size_t  q_size  = nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs;
++            const bool    q_cache = g_ggml_sycl_enable_fusion && !split && dst == ctx.src1_cache_node &&
++                                    src1_on_device && src1_is_contiguous;
++            char *        q_hit   = q_cache ? (char *) ctx.src1_cache_find(src1, q_kind, q_size) : nullptr;
++            if (q_hit) {
++                dev[i].src1_ddq = q_hit;
++            } else if (q_cache) {
++                dev[i].src1_ddq = (char *) ctx.src1_cache_put(src1, q_kind, q_size);
++            } else {
++                dev[i].src1_ddq = dev[i].src1_ddq_alloc.alloc(ctx.pool(i), q_size);
++            }
+ 
+-            if (src1_on_device && src1_is_contiguous) {
++            if (src1_on_device && src1_is_contiguous && !q_hit) {
+                 scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
+                                                      /*num_src=*/2, " : converting src1 to Q8_1");
+                 try {
+@@ -6999,10 +7012,39 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
+     return skip;
+ }
+ 
++// drops the cached activation copy (ggml_backend_sycl_context::src1_cache) once a node in [first, last) writes
++// the memory it was made from
++static void ggml_sycl_src1_cache_check(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph, int first,
++                                       int last) {
++    const auto & c = ctx->src1_cache;
++    if (c.ptr == nullptr) {
++        return;
++    }
++    const char * lo = (const char *) c.data;
++    const char * hi = lo + ggml_nbytes(c.src);
++    for (int j = first; j < last; ++j) {
++        const ggml_tensor * t = cgraph->nodes[j];
++        if (t->data == nullptr || ggml_sycl_is_view_or_noop(t) || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++            continue;
++        }
++        const char * b = (const char *) t->data;
++        if (b < hi && lo < b + ggml_nbytes(t)) {
++            ctx->src1_cache_drop();
++            return;
++        }
++    }
++}
++
+ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
+     ggml_sycl_conv_window_match conv_window;
++    sycl_ctx->src1_cache_drop();
++    int src1_cache_checked = 0;
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         ggml_tensor * node = cgraph->nodes[i];
++        // the nodes run since the last check may have written the cached activation
++        ggml_sycl_src1_cache_check(sycl_ctx, cgraph, src1_cache_checked, i);
++        src1_cache_checked        = i;
++        sycl_ctx->src1_cache_node = node;
+         if (ggml_sycl_is_view_or_noop(node)) {
+             continue;
+         }
+@@ -7192,6 +7234,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+         }
+         GGML_ASSERT(ok);
+     }
++    sycl_ctx->src1_cache_node = nullptr;
++    sycl_ctx->src1_cache_drop();
+ }
+ 
+ #ifdef GGML_SYCL_GRAPH

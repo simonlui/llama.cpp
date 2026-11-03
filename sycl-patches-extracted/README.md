@@ -17,8 +17,8 @@ extractable as idiomatic backend code and is intentionally excluded — see
 Local work on top of the stack goes in the separate `ZZ-LOCAL-*` group in this
 directory: repairs the current upstream tree needs, and gap fills for quant types
 the carried PRs leave out. They are not folded into the numbered extracted
-history and remain independently reversible. Eight are active, `ZZ-LOCAL-0003` to
-`ZZ-LOCAL-0010` (see the patch index). They apply in number order, and every candidate in
+history and remain independently reversible. Twelve are active, `ZZ-LOCAL-0003` to
+`ZZ-LOCAL-0014` (see the patch index); 0011 to 0014 port graph fusions from the CUDA, Vulkan and Metal backends. They apply in number order, and every candidate in
 `../sycl-patches-candidates/` applies on top of them with plain `git apply`.
 
 ## Patch index
@@ -35,6 +35,10 @@ history and remain independently reversible. Eight are active, `ZZ-LOCAL-0003` t
 | ZZ-LOCAL-0008 | `ZZ-LOCAL-0008-sycl-moe-reorder-iq3.patch` | Reorders IQ3_XXS and IQ3_S MoE experts per slice (the existing 2D IQ3 layout) for the MoE reorder MMVQ, and adds SoA stages for both types to the fused / grouped XMX dequant GEMM; the block and SoA stages share one decode. MoE prompt batches therefore keep the grouped GEMM after the reorder. The same stages let dense IQ3 weights keep the fused GEMM once the existing 2D reorder is installed; before, those fell back to dequantize plus oneDNN. Candidates C20 / C21 read the same layout. | perf (gap fill) |
 | ZZ-LOCAL-0009 | `ZZ-LOCAL-0009-sycl-getrows-q2_0.patch` | Q2_0 in GET_ROWS, through the generic `get_rows_sycl` and the existing `dequantize_q2_0`. Q2_0 had a dequantizer and MMVQ but fell back to the CPU for row lookups. | feature (gap fill) |
 | ZZ-LOCAL-0010 | `ZZ-LOCAL-0010-sycl-dg2-register-spills.patch` | Stops register spills on Arc A-series (Xe-HPG) in kernels the A770 runs. The XMX dequant GEMM (prompt batches of the i-quants, and of every MoE type it covers) spilled 1.9-3.5 KB per thread in all 72 DG2 kernels; at sub-group 8 a sub-group now owns 8 rows instead of 16 (still 32 columns) and the two k halves of a step are not unrolled, and none spills. The reorder gate + up MMVQ no longer pairs rows on the A-series, where every paired variant spilled 0.5-3.6 KB (q4_K at 2..4 columns; also iq4_xs with C10, q4_K at 5..8 with C30, q5_K). | perf (DG2) |
+| ZZ-LOCAL-0011 | `ZZ-LOCAL-0011-sycl-fuse-rope-norm-moe-sum.patch` | Graph fusions SYCL lacked: ROPE + VIEW + SET_ROWS (the rope kernels' existing set_rows destination, which nothing called), RMS_NORM + MUL + ROPE (+ VIEW + SET_ROWS) for the Q / K norms of Qwen3, Gemma 3 and OLMo 2, the MoE expert sum (MUL by the router weights, the per-expert VIEWs and k - 1 ADDs, up to 15 experts) in one kernel, chains of 3..8 same-shape ADDs, and topk-moe with a routing bias (DeepSeek-V3-style selection on probs + bias). Ported from CUDA (`ggml_cuda_should_fuse_rope_set_rows`, `rms_norm_mul_rope_f32`, `ggml_cuda_match_moe_weighted_reduction`, multi-add, `topk_moe_cuda<has_bias>`). | perf (port) |
+| ZZ-LOCAL-0012 | `ZZ-LOCAL-0012-sycl-moe-mmvq-tokens-glu-bias.patch` | The MoE MMVQ (plain and reorder layout) takes 2..8 tokens (per-type cap, CUDA's RDNA3 table, `GGML_SYCL_MMID_MMVQ_MAX_TOKENS` overrides), runs MUL_MAT_ID gate + MUL_MAT_ID up + GLU in one launch (SWIGLU, GEGLU, SWIGLU_OAI, SWIGLU_CLAMP; with the ADD_ID bias of each lane for gpt-oss), and adds a lone MUL_MAT_ID's ADD_ID bias in its store. Ported from CUDA's `mul_mat_vec_q` with ids and fusion args. | perf (port) |
+| ZZ-LOCAL-0013 | `ZZ-LOCAL-0013-sycl-fuse-mul-mat-add.patch` | MUL_MAT (one activation column) + ADD of a same-shape tensor, i.e. the residual after the attention output and the FFN down projection, or a bias: the mat-vec writes the ADD's memory and the DMMV kernels add the addend in their store (the A770's ESIMD kernels for q2_K..q6_K and q8_0, the generic kernels for q4_0, q4_1, q5_0, q5_1, q8_0, q1_0). Kernels without the epilogue fall back to one in-place ADD. CUDA, Vulkan and Metal all run this fusion. | perf (port) |
+| ZZ-LOCAL-0014 | `ZZ-LOCAL-0014-sycl-reuse-converted-activation.patch` | Sibling mat-muls of one activation (Q, K, V) share its q8_1 (MMVQ) or f16 (DMMV) copy within a graph instead of converting it once each; Vulkan's `prealloc_y` cache. Dropped when a node writes the activation and at the end of every graph. | perf (port) |
 
 The former `ZZ-LOCAL-0001` made direct SYCL `CONV_2D` index input, kernel, and
 output by their real strides. It was retired on 2026-11-01 as superseded by
@@ -125,6 +129,17 @@ is gone, so runtime behavior/perf differs from the research tree.
   any more (before: all 72 GEMM kernels, and q4_K's gate + up at 2..4 columns). Tested on the CPU OpenCL device with the one-row gate + up
   forced on (`MUL_MAT_VEC_FUSION` q4_K 140/140) and off (140/140); the GEMM tiles cannot run there.
   Speed not measured.
+- **`ZZ-LOCAL-0011` to `ZZ-LOCAL-0014` (2026-11-03):** built with `icpx` 2026.2 and tested on the CPU OpenCL
+  device: `ROPE_SET_ROWS` 73/73, `RMS_NORM_MUL_ROPE` 260/260, `MOE_REDUCE` 6/6, `ADD_ADD` 12/12,
+  `MUL_MAT_VEC_FUSION` 1754/1754 and `MUL_MAT_ID` 1205/1205, each with and without the reorder forced on,
+  `TOPK_MOE` 351/352 on the power-of-two expert counts (the one failure, an expert-group case that is
+  not fused, passed 16 reruns with fusion on and off). The SYCL debug log shows each fusion running. Every new or changed kernel builds
+  for `acm-g10` (AOT) without spills except the plain-layout q3_K MoE kernel with the gate (672 B), which
+  the dispatcher keeps off. The four patches apply in order with plain `git apply`, each stage passes a device-side syntax check,
+  all candidates still apply on top with plain `git apply`, and the full round trip with the Vulkan
+  stack returns a clean tree. Not verified: speed on the A770 and the ESIMD epilogue at run time
+  (ESIMD does not run on the CPU device). Details in `SYCL_DEV_LOG.md` ("Fusions ported from CUDA, Vulkan
+  and Metal").
 - The scripts snapshot pre-existing untracked paths in the worktree's Git
   administrative directory. Files introduced by an apply are removed on
   unapply, while paths present before apply are protected. The state file is
