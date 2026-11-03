@@ -1,26 +1,154 @@
-From 4f4fc42025376c19e7315252353898aa9e52ae89 Mon Sep 17 00:00:00 2001
-From: Kyle Hagy <59183061+KyleHagy@users.noreply.github.com>
-Date: Tue, 27 Oct 2026 16:25:17 -0700
-Subject: [PATCH] sycl : refuse device buffers that would exceed VRAM
-
----
- ggml/src/ggml-sycl/ggml-sycl.cpp | 22 ++++++++++++++++++++++
- 1 file changed, 22 insertions(+)
-
+diff --git a/docs/backend/SYCL.md b/docs/backend/SYCL.md
+index c19ba211..49905764 100644
+--- a/docs/backend/SYCL.md
++++ b/docs/backend/SYCL.md
+@@ -857,7 +857,7 @@ User can use the device management in [docs/multi-gpu.md](https://github.com/ggm
+ | GGML_SYCL_ENABLE_MKL_FA | 1 (default) or 0 | Enable oneMKL GEMM flash attention for XMX-accelerated prompt processing with quantized KV cache. Automatically activates during prefill (prompt processing) when all conditions are met: (1) flash-attn enabled (`-fa` or `--flash-attn on`), (2) KV cache quantized (`--cache-type-k q8_0 --cache-type-v q8_0` or other `*_0/*_1` types), (3) batch size ≥ 1024 (`--batch-size 1024`), (4) prompt length ≥ 1024 tokens. Set to 0 to force the TILE kernel for A/B testing. Example minimum command: `llama-cli -m model.gguf -fa -ngl 99 --cache-type-k q8_0 --cache-type-v q8_0 --batch-size 1024 -p "your prompt"` |
+ | GGML_SYCL_MKL_FA_DEBUG | 0 (default) or 1 | Enable per-call diagnostic logging for MKL flash attention: GEMM/softmax timings, interleaved-head detection, and buffer memory usage. |
+ | GGML_SYCL_FA_TILE_DEBUG | 0 (default) or 1 | Enable per-call diagnostic logging for the flash-attention TILE kernel dispatcher: head dims (DKQ/DV), GQA ratio, query rows, KV length, and whether the GQA-optimized variant is selected. |
+-| GGML_SYCL_MEMTRACE | 0 (default), 1, 2 | Enable record and output memory allocation diagnostics. Requires `-lv 4`. <br>0 -  Disable<br>1 - Basic memory info, including current and peak allocations, as well allocations from other sources, around 50 lines per model load.<br>2 - More verbose, logging around 900 specific allocations and deallocations. |
++| GGML_SYCL_MEMTRACE | 0 (default), 1, 2 | Enable record and output memory allocation diagnostics. Requires `-lv 4`. <br>0 -  Disable<br>1 - Basic memory info, including current and peak allocations, as well allocations from other sources, and the device free memory before each model buffer allocation, around 50 lines per model load.<br>2 - More verbose, logging around 900 specific allocations and deallocations. |
+ | GGML_SYCL_MEMTRACE_STEP | 64 (default) or positive integer | With GGML_SYCL_MEMTRACE=1, the minimum growth in memory usage to trigger another log record. |
+ | GGML_SYCL_MKL_FA_DIAG | 0 (default) or 1 | Enable output fingerprinting for MKL flash attention. Dumps the first 64 float output values for the first 6 FA calls with n_kv ≥ 1024, labeled with kernel type (MKL/TILE/VEC) for cross-kernel comparison. |
+ | GGML_SYCL_ENABLE_FUSION | 0 or 1 (default) | Enable fused-kernel dispatch in graph compute. Unsupported types and layouts fall back to the standalone op kernels. See `ggml_sycl_can_fuse()`. |
+@@ -877,6 +877,7 @@ User can use the device management in [docs/multi-gpu.md](https://github.com/ggm
+ | ZES_ENABLE_SYSMAN | 0 (default) or 1 | Support to get free memory of GPU by sycl::aspect::ext_intel_free_memory.<br>Recommended to use when --split-mode = layer |
+ | UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS | 0 (default) or 1 | Allow SYCL/Unified Runtime Level Zero device allocations larger than 4 GiB. llama.cpp's direct Level Zero allocation path requests the relaxed maximum-size limit itself when GGML_SYCL_ENABLE_LEVEL_ZERO=1. |
+ | GGML_SYCL_USM_SYSTEM | 0 (default) or 1 | Enable experimental support for [USM system allocations](https://github.khronos.org/SYCL_Reference/iface/usm_basic_concept.html#system-allocations) for large GPU buffers. This requires enough host memory for model weights and caches, an Intel Xe2+ GPU such as BMG or newer and supported on Linux only, with CONFIG_DRM_XE_GPUSVM enabled. |
++| GGML_SYCL_ALLOW_VRAM_OVERCOMMIT | 0 (default) or 1 | On BMG (Arc B-series) GPUs, by default a model or split buffer is refused if it does not fit in the device's free memory, or if the device memory already allocated by llama.cpp plus the buffer would exceed the device's total memory. Set to 1 to skip this check. |
+ 
+ 1. <a id="sycl-graph-footnote"></a>SYCL Graph support (`GGML_SYCL_ENABLE_GRAPH=1`) is limited to single-GPU workloads and may also depend on the model architecture and kernels in use.
+    Performance depends on how often a recorded graph can be reused, which will vary by workload.
+diff --git a/ggml/src/ggml-sycl/common.cpp b/ggml/src/ggml-sycl/common.cpp
+index 048397cd..e1c47fd8 100644
+--- a/ggml/src/ggml-sycl/common.cpp
++++ b/ggml/src/ggml-sycl/common.cpp
+@@ -11,6 +11,8 @@
+ //
+ 
+ #include "common.hpp"
++#include <mutex>
++#include <unordered_map>
+ #include <sycl/backend.hpp>
+ #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
+ #include <level_zero/ze_api.h>
+@@ -98,9 +100,16 @@ static bool ggml_sycl_use_level_zero_device_alloc(sycl::queue &q) {
+ }
+ #endif
+ 
++// Device bytes allocated through ggml_sycl_malloc_device, per device and per pointer
++static std::mutex g_ggml_sycl_dev_alloc_mutex;
++static std::unordered_map<void *, std::pair<int, size_t>> g_ggml_sycl_dev_allocs;
++static size_t g_ggml_sycl_dev_alloc_bytes[GGML_SYCL_MAX_DEVICES] = {};
++// free memory reported when we had nothing allocated (0 = not taken yet)
++static size_t g_ggml_sycl_dev_free_baseline[GGML_SYCL_MAX_DEVICES] = {};
++
+ // Use Level Zero zeMemAllocDevice to avoid sycl::malloc_device triggering
+ // DMA-buf/TTM system RAM staging in the xe kernel driver during multi-GPU inference.
+-void * ggml_sycl_malloc_device(size_t size, sycl::queue &q, ggml_sycl_mem_type type) {
++static void * ggml_sycl_malloc_device_impl(size_t size, sycl::queue &q, ggml_sycl_mem_type type) {
+ #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
+     if (ggml_sycl_use_level_zero_device_alloc(q)) {
+         void *ptr = nullptr;
+@@ -140,8 +149,72 @@ void * ggml_sycl_malloc_device(size_t size, sycl::queue &q, ggml_sycl_mem_type t
+     return ptr;
+ }
+ 
++void * ggml_sycl_malloc_device(size_t size, sycl::queue &q, ggml_sycl_mem_type type) {
++    const int device = (int) dpct::dev_mgr::instance().get_device_id(q.get_device());
++    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
++        return ggml_sycl_malloc_device_impl(size, q, type);
++    }
++
++    std::lock_guard<std::mutex> lock(g_ggml_sycl_dev_alloc_mutex);
++    const size_t allocated = g_ggml_sycl_dev_alloc_bytes[device];
++
++    // TODO: remove once zeMemAllocDevice refuses allocations beyond VRAM on BMG
++    // (https://github.com/intel/compute-runtime/issues/1047). Only model/split buffers are checked.
++    const gpu_arch arch = ggml_sycl_info().devices[device].hw_info.arch;
++    const bool is_bmg   = arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31;
++    const bool check    = is_bmg && type == GGML_SYCL_MEM_BUFFER && !g_ggml_sycl_allow_vram_overcommit;
++    const bool trace    = type == GGML_SYCL_MEM_BUFFER && ggml_sycl_memtrace_enabled();
++    size_t free_mem = 0, total_mem = 0;
++    if (check || trace) {
++        if (!sycl_get_mem_info(device, &free_mem, &total_mem)) {
++            // not expected (with no working query it reports free = total), but never leave the limits at 0
++            total_mem = q.get_device().get_info<sycl::info::device::global_mem_size>();
++            free_mem  = total_mem > allocated ? total_mem - allocated : 0;
++        }
++    }
++    if (trace) {
++        ggml_sycl_memtrace_report_device("before buffer alloc", device, free_mem, total_mem);
++    }
++    if (check) {
++        size_t & baseline = g_ggml_sycl_dev_free_baseline[device];
++        if (allocated == 0) {
++            baseline = free_mem;
++        }
++        // the drop in free memory since the baseline is ours once written, the rest of ours is not counted yet
++        const size_t written   = baseline > free_mem ? baseline - free_mem : 0;
++        const size_t unwritten = baseline && allocated > written ? allocated - written : 0;
++        const size_t usable    = free_mem > unwritten ? free_mem - unwritten : 0;
++        if (allocated + size > total_mem || size > usable) {
++            GGML_LOG_ERROR("%s: SYCL%d: cannot allocate %zu MiB: %zu MiB already allocated, %zu MiB usable "
++                           "(%zu MiB free of %zu MiB), set GGML_SYCL_ALLOW_VRAM_OVERCOMMIT=1 to allow\n",
++                           __func__, device, size >> 20, allocated >> 20, usable >> 20, free_mem >> 20, total_mem >> 20);
++            ggml_sycl_memtrace_fail(type, size);
++            return nullptr;
++        }
++    }
++
++    void * ptr = ggml_sycl_malloc_device_impl(size, q, type);
++    if (ptr) {
++        g_ggml_sycl_dev_allocs[ptr] = { device, size };
++        g_ggml_sycl_dev_alloc_bytes[device] += size;
++    }
++    return ptr;
++}
++
+ void ggml_sycl_free_device(void *ptr, sycl::queue &q) {
+     if (!ptr) return;
++    {
++        std::lock_guard<std::mutex> lock(g_ggml_sycl_dev_alloc_mutex);
++        auto it = g_ggml_sycl_dev_allocs.find(ptr);
++        if (it != g_ggml_sycl_dev_allocs.end()) {
++            const int device = it->second.first;
++            g_ggml_sycl_dev_alloc_bytes[device] -= it->second.second;
++            if (g_ggml_sycl_dev_alloc_bytes[device] == 0) {
++                g_ggml_sycl_dev_free_baseline[device] = 0;
++            }
++            g_ggml_sycl_dev_allocs.erase(it);
++        }
++    }
+     ggml_sycl_memtrace_del(ptr);
+ #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
+     if (ggml_sycl_use_level_zero_device_alloc(q)) {
+diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
+index 8694c040..6f2100d4 100644
+--- a/ggml/src/ggml-sycl/common.hpp
++++ b/ggml/src/ggml-sycl/common.hpp
+@@ -436,6 +436,8 @@ struct ggml_tensor_extra_gpu {
+ };
+ 
+ extern int g_ggml_sycl_use_level_zero_api;
++extern int g_ggml_sycl_allow_vram_overcommit;
++bool sycl_get_mem_info(int device, size_t * free, size_t * total);
+ void * ggml_sycl_malloc_device(size_t size, sycl::queue &q,
+                                ggml_sycl_mem_type type = GGML_SYCL_MEM_DIRECT);
+ void ggml_sycl_free_device(void *ptr, sycl::queue &q);
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 97ad492e..331e199b 100644
+index 3b5c0907..1ae8e7df 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -145,6 +145,8 @@ int g_ggml_sycl_use_level_zero_api = 0;
+@@ -148,6 +148,7 @@ int g_ggml_sycl_use_level_zero_api = 0;
  int g_ggml_sycl_enable_flash_attention = 1;
  int g_ggml_sycl_dev2dev_memcpy = DEV2DEV_MEMCPY_SYCL;
  int g_ggml_sycl_usm_system = 0;
 +int g_ggml_sycl_allow_vram_overcommit = 0;
-+static std::atomic<size_t> g_ggml_sycl_buffer_bytes[GGML_SYCL_MAX_DEVICES] = {};
  int g_ggml_sycl_enable_host_pinned_mem = 1;
  int g_ggml_sycl_host_pinned_mem_2g = 0;
  int g_ggml_sycl_upload_staging_slots = 4;
-@@ -473,6 +475,7 @@ static void ggml_check_sycl() try {
+@@ -479,6 +480,7 @@ static void ggml_check_sycl() try {
  #endif
  
          g_ggml_sycl_usm_system = ggml_sycl_get_env("GGML_SYCL_USM_SYSTEM", 0);
@@ -28,53 +156,20 @@ index 97ad492e..331e199b 100644
          g_ggml_sycl_enable_host_pinned_mem =
              ggml_sycl_get_env("GGML_SYCL_ENABLE_HOST_PINNED_MEM", 1);
  
-@@ -724,6 +727,7 @@ struct ggml_backend_sycl_buffer_context {
-     std::vector<ggml_tensor_extra_gpu *> tensor_extras;
-     host_staging staging;
-     bool is_usm_system;
-+    size_t device_bytes = 0; // counted in g_ggml_sycl_buffer_bytes[device]
+@@ -618,6 +620,7 @@ static void ggml_check_sycl() try {
+ #endif
  
-     ggml_backend_sycl_buffer_context(int device, void * dev_ptr, queue_ptr stream, bool is_usm_system) :
-         device(device), dev_ptr(dev_ptr), stream(stream), is_usm_system(is_usm_system) {
-@@ -755,6 +759,7 @@ struct ggml_backend_sycl_buffer_context {
-             else
-                 SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_free_device(dev_ptr, *stream)));
-         }
-+        g_ggml_sycl_buffer_bytes[device] -= device_bytes;
+         GGML_LOG_INFO("  GGML_SYCL_USM_SYSTEM: %d\n", g_ggml_sycl_usm_system);
++        GGML_LOG_INFO("  GGML_SYCL_ALLOW_VRAM_OVERCOMMIT: %d\n", g_ggml_sycl_allow_vram_overcommit);
+         GGML_LOG_INFO("  GGML_SYCL_ENABLE_HOST_PINNED_MEM: %d\n", g_ggml_sycl_enable_host_pinned_mem);
+         GGML_LOG_INFO("  GGML_SYCL_HOST_PINNED_MEM_2G: %d\n", g_ggml_sycl_host_pinned_mem_2g);
  
-         //release extra used by tensors
-         for (ggml_tensor_extra_gpu * extra : tensor_extras) {
-@@ -1240,6 +1245,19 @@ ggml_backend_sycl_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
-             return nullptr;
-         }
-     } else {
-+        // The Level Zero GPU driver only checks each allocation against max_mem_alloc_size, not the
-+        // device memory already allocated. On BMG it also defers backing, so allocations that
-+        // together exceed VRAM succeed and are evicted to system RAM on first GPU access, where
-+        // they are not charged to this process and can exhaust host memory.
-+        // Refuse them here, like the Vulkan backend's out-of-device-memory error.
-+        const size_t allocated = g_ggml_sycl_buffer_bytes[buft_ctx->device];
-+        const size_t total     = dpct::get_device(buft_ctx->device).get_info<sycl::info::device::global_mem_size>();
-+        if (!g_ggml_sycl_allow_vram_overcommit && allocated + size > total) {
-+            GGML_LOG_ERROR("%s: SYCL%d: allocating %zu MiB would exceed device memory "
-+                           "(%zu MiB already allocated, %zu MiB total), set GGML_SYCL_ALLOW_VRAM_OVERCOMMIT=1 to allow\n",
-+                           __func__, buft_ctx->device, size >> 20, allocated >> 20, total >> 20);
-+            return nullptr;
-+        }
-         SYCL_CHECK(CHECK_TRY_ERROR(dev_ptr = (void *)ggml_sycl_malloc_device(size, *stream, GGML_SYCL_MEM_BUFFER)));
-         if (!dev_ptr) {
-           GGML_LOG_ERROR("%s: can't allocate %zu Bytes of memory on device\n", __func__, size);
-@@ -1247,6 +1265,10 @@ ggml_backend_sycl_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
-         }
-     }
-     ggml_backend_sycl_buffer_context * ctx = new  ggml_backend_sycl_buffer_context(buft_ctx->device, dev_ptr, buft_ctx->stream, use_usm_system);
-+    if (!use_usm_system) {
-+        ctx->device_bytes = size;
-+        g_ggml_sycl_buffer_bytes[buft_ctx->device] += size;
-+    }
-     return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);
+@@ -6493,7 +6496,7 @@ catch (sycl::exception const &exc) {
+   std::exit(1);
  }
- catch (sycl::exception const &exc) {
--- 
-2.43.0
-
+ 
+-static bool sycl_get_mem_info(int device, size_t * free, size_t * total) {
++bool sycl_get_mem_info(int device, size_t * free, size_t * total) {
+     GGML_SYCL_DEBUG("[SYCL] [%s] g_ggml_sycl_get_mem_api=%d\n",
+         __func__, g_ggml_sycl_get_mem_api);
+ 

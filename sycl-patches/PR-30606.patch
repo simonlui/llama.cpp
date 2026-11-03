@@ -1,7 +1,7 @@
-From 4f645e0b86f9354e95b27625cb134a8038a5b30c Mon Sep 17 00:00:00 2001
+From f43e754e21d0cb778b69993e569c4689c9fede06 Mon Sep 17 00:00:00 2001
 From: Anant Shrivastava <anant@anantshri.info>
 Date: Thu, 15 Oct 2026 20:12:51 +0530
-Subject: [PATCH 1/2] sycl: route BMG D=256 single-query decode to the FA
+Subject: [PATCH 1/3] sycl: route BMG D=256 single-query decode to the FA
  vector kernel
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -101,10 +101,10 @@ index dcdcad88..f4b35452 100644
      if constexpr (DV == 512) {
          if (use_gqa_opt && gqa_ratio % 16 == 0) {
 diff --git a/ggml/src/ggml-sycl/fattn.cpp b/ggml/src/ggml-sycl/fattn.cpp
-index 8bd946e0..ca1f95e8 100644
+index 6f5f8a83..042858ec 100644
 --- a/ggml/src/ggml-sycl/fattn.cpp
 +++ b/ggml/src/ggml-sycl/fattn.cpp
-@@ -127,7 +127,9 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
+@@ -129,7 +129,9 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
      float logit_softcap = 0.0f;
      memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
  
@@ -115,7 +115,7 @@ index 8bd946e0..ca1f95e8 100644
  
      // XMX-accelerated path: oneDNN SDPA (native F16 and dequant+non-F16).
      // ONEDNN requires min 32 query tokens — short-circuit decode to avoid
-@@ -260,7 +262,15 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
+@@ -267,7 +269,15 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
      if (can_use_vector_kernel) {
          if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
              if (Q->ne[1] == 1) {
@@ -133,10 +133,10 @@ index 8bd946e0..ca1f95e8 100644
                  }
              }
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index ba7f7eb4..fb10553c 100644
+index eec0423c..6a608df8 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11804,6 +11804,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12447,6 +12447,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                          GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      }
  
@@ -161,7 +161,7 @@ index ba7f7eb4..fb10553c 100644
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},   512, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  4096,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  4096,  16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-@@ -12315,8 +12333,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -13034,8 +13052,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
      test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
  
@@ -179,14 +179,11 @@ index ba7f7eb4..fb10553c 100644
      test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
      // gemma-4-26b-a4b global-attn layers: head_count_kv=2, 16 query heads (gqa_ratio=8)
      test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, { 8, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,    0));
--- 
-2.43.0
 
-
-From d8d7400b33723a06248daef722844dd8c4929705 Mon Sep 17 00:00:00 2001
+From ac3af02ebfe8eb6a1cd1ec15fa5395d5f72be5af Mon Sep 17 00:00:00 2001
 From: Anant Shrivastava <anant@anantshri.info>
 Date: Mon, 19 Oct 2026 11:29:45 +0000
-Subject: [PATCH 2/2] sycl: wire GGML_SYCL_FA_TILE_DEBUG like
+Subject: [PATCH 2/3] sycl: wire GGML_SYCL_FA_TILE_DEBUG like
  GGML_SYCL_DEV_DEBUG
 
 Address review feedback on the FA TILE dispatch instrumentation added in
@@ -211,10 +208,10 @@ site. Follow the GGML_SYCL_DEV_DEBUG pattern instead:
  4 files changed, 13 insertions(+), 8 deletions(-)
 
 diff --git a/docs/backend/SYCL.md b/docs/backend/SYCL.md
-index 81d293e4..2170547d 100644
+index fb800025..34e64d2e 100644
 --- a/docs/backend/SYCL.md
 +++ b/docs/backend/SYCL.md
-@@ -814,6 +814,7 @@ User can use the device management in [docs/multi-gpu.md](https://github.com/ggm
+@@ -817,6 +817,7 @@ User can use the device management in [docs/multi-gpu.md](https://github.com/ggm
  | GGML_SYCL_ENABLE_VMM | 0 or 1 (default) | Enable the virtual-memory device pool. |
  | GGML_SYCL_ENABLE_MKL_FA | 1 (default) or 0 | Enable oneMKL GEMM flash attention for XMX-accelerated prompt processing with quantized KV cache. Automatically activates during prefill (prompt processing) when all conditions are met: (1) flash-attn enabled (`-fa` or `--flash-attn on`), (2) KV cache quantized (`--cache-type-k q8_0 --cache-type-v q8_0` or other `*_0/*_1` types), (3) batch size ≥ 1024 (`--batch-size 1024`), (4) prompt length ≥ 1024 tokens. Set to 0 to force the TILE kernel for A/B testing. Example minimum command: `llama-cli -m model.gguf -fa -ngl 99 --cache-type-k q8_0 --cache-type-v q8_0 --batch-size 1024 -p "your prompt"` |
  | GGML_SYCL_MKL_FA_DEBUG | 0 (default) or 1 | Enable per-call diagnostic logging for MKL flash attention: GEMM/softmax timings, interleaved-head detection, and buffer memory usage. |
@@ -274,10 +271,10 @@ index f4b35452..efd7fdc6 100644
      if constexpr (DV == 512) {
          if (use_gqa_opt && gqa_ratio % 16 == 0) {
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 6759af0e..e335b404 100644
+index 9ee16423..fd3c6229 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -94,6 +94,7 @@
+@@ -99,6 +99,7 @@
  static bool g_sycl_loaded = false;
  int g_ggml_sycl_debug = 0;
  int g_ggml_sycl_dev_debug = 0;
@@ -285,7 +282,7 @@ index 6759af0e..e335b404 100644
  int g_ggml_sycl_enable_optimize = 1;
  int g_ggml_sycl_enable_graph = 0;
  int g_ggml_sycl_enable_dnn = 1;
-@@ -415,6 +416,7 @@ static void ggml_check_sycl() try {
+@@ -430,6 +431,7 @@ static void ggml_check_sycl() try {
  
          g_ggml_sycl_debug = ggml_sycl_get_env("GGML_SYCL_DEBUG", 0);
          g_ggml_sycl_dev_debug = ggml_sycl_get_env("GGML_SYCL_DEV_DEBUG", 0);
@@ -293,7 +290,7 @@ index 6759af0e..e335b404 100644
          g_ggml_sycl_enable_optimize = ggml_sycl_get_env("GGML_SYCL_ENABLE_OPT", 1);
          g_ggml_sycl_enable_graph = ggml_sycl_get_env("GGML_SYCL_ENABLE_GRAPH", 0);
          g_ggml_sycl_enable_dnn = ggml_sycl_get_env("GGML_SYCL_ENABLE_DNN", 1);
-@@ -507,6 +509,7 @@ static void ggml_check_sycl() try {
+@@ -534,6 +536,7 @@ static void ggml_check_sycl() try {
          GGML_LOG_INFO("Running with Environment Variables:\n");
          GGML_LOG_INFO("  GGML_SYCL_DEBUG: %d\n", g_ggml_sycl_debug);
          GGML_LOG_INFO("  GGML_SYCL_DEV_DEBUG: %d\n", g_ggml_sycl_dev_debug);
@@ -301,6 +298,26 @@ index 6759af0e..e335b404 100644
  
  #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
          GGML_LOG_INFO("  GGML_SYCL_DEV2DEV_MEMCPY: %d (%s)\n", g_ggml_sycl_dev2dev_memcpy, dev2dev_int2str(g_ggml_sycl_dev2dev_memcpy));
--- 
-2.43.0
 
+From c514a386e39f74bdff610059719bbb6624e90c6a Mon Sep 17 00:00:00 2001
+From: Anant Shrivastava <anant@anantshri.info>
+Date: Mon, 2 Nov 2026 23:58:46 +0530
+Subject: [PATCH 3/3] fixing the typo
+
+---
+ tests/test-backend-ops.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 6a608df8..d93f4756 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -13061,7 +13061,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     }
+ 
+     // sparse decode at long context
+-    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,    0));;
++    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,    0));
+     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
+     // gemma-4-26b-a4b global-attn layers: head_count_kv=2, 16 query heads (gqa_ratio=8)
+     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, { 8, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,    0));

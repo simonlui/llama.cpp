@@ -13,7 +13,7 @@ Tested on: Intel OpenCL CPU device only
 Assisted-by: Codex
 
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index c7e7c47a7..312713dab 100644
+index d852c390..27239e40 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -8940,7 +8940,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
@@ -26,16 +26,16 @@ index c7e7c47a7..312713dab 100644
              memset(VKQ16, 0, DV*sizeof(ggml_fp16_t));
          } else {
              memset(VKQ32, 0, DV*sizeof(float));
-@@ -8989,7 +8990,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+@@ -8996,7 +8997,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
  
-             const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
+             const char * v_data = ((const char *) v->data + (ik1*nbv1 + iv2*nbv2 + iv3*nbv3));
  
 -            if (v->type == GGML_TYPE_F16) {
 +            if (v->type == GGML_TYPE_F16 && !params->use_ref) {
                  if (s > M) {
                      // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
                      M = s;
-@@ -9030,7 +9031,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+@@ -9037,7 +9038,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
              S = S*ms + vs; // scale and increment sum with partial sum
          }
  
@@ -45,10 +45,10 @@ index c7e7c47a7..312713dab 100644
                  VKQ32[d] = GGML_CPU_FP16_TO_FP32(VKQ16[d]);
              }
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 4e3c6942b..cfb303ca2 100644
+index 6b153fa1..90fa41b3 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -8350,9 +8350,14 @@ struct test_flash_attn_ext : public test_case {
+@@ -8799,9 +8799,14 @@ struct test_flash_attn_ext : public test_case {
      const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
      const bool v_is_view_of_k;
      const int64_t n_kv_max;
@@ -64,7 +64,7 @@ index 4e3c6942b..cfb303ca2 100644
      }
  
      double max_nmse_err() override {
-@@ -8369,9 +8374,9 @@ struct test_flash_attn_ext : public test_case {
+@@ -8818,9 +8823,9 @@ struct test_flash_attn_ext : public test_case {
      test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                          bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                          ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
@@ -76,7 +76,7 @@ index 4e3c6942b..cfb303ca2 100644
  
      ggml_tensor * build_graph(ggml_context * ctx) override {
          const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
-@@ -8453,6 +8458,39 @@ struct test_flash_attn_ext : public test_case {
+@@ -8902,6 +8907,39 @@ struct test_flash_attn_ext : public test_case {
                  init_tensor_uniform(t);
              }
          }
@@ -116,7 +116,7 @@ index 4e3c6942b..cfb303ca2 100644
      }
  
      bool grad_precise() override {
-@@ -11551,6 +11589,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12505,6 +12543,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  

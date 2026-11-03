@@ -1,0 +1,99 @@
+From: local
+Subject: [PATCH] sycl: give the lightning-indexer vector kernel 256 registers on Arc A-series (on C75)
+
+C75's lightning_indexer_vec_sycl keeps 8 keys x 8 floats of K per lane (k_reg)
+live across its head loop. At sub-group 16 that is 128 of DG2's 32-byte
+registers, the whole default file: the acm-g10 AOT build spills 1632 B (F16,
+BF16) and 1760 B (F32) per thread. This launches it through a functor with
+grf_size<256> on ACM-G10/G11/G12 (numGRF=256, no spill in the same AOT build)
+and with the default file elsewhere: on Xe2 and Xe-HPC the registers are
+64 bytes and k_reg fits in 128. The sub-group size moves from the lambda
+attribute into the functor's properties, so one lambda type is not launched
+with two property sets. The XMX indexer kernels do not spill and are unchanged.
+
+Only affects GGML_SYCL_LIGHTNING_INDEXER=1 (off by default), batches below 8
+tokens or with the XMX path turned off.
+
+---
+ ggml/src/ggml-sycl/lightning-indexer.cpp | 47 ++++++++++++++++++++++++++++----
+ 1 file changed, 41 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-sycl/lightning-indexer.cpp b/ggml/src/ggml-sycl/lightning-indexer.cpp
+index 31dd708e..6a4dad1b 100644
+--- a/ggml/src/ggml-sycl/lightning-indexer.cpp
++++ b/ggml/src/ggml-sycl/lightning-indexer.cpp
+@@ -2,6 +2,8 @@
+ #include "dequantize.hpp"
+ #include "xmx.hpp"
+ 
++#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
++
+ static void lightning_indexer_f32_sycl(
+         const char * q, const char * k, const char * w, const char * m, float * dst,
+         int64_t n_embd, int64_t n_head, int64_t n_batch, int64_t n_stream, int64_t n_kv,
+@@ -153,6 +155,35 @@ static constexpr int LI_VEC_SG     = 4;
+ static constexpr int LI_VEC_LANE_E = LI_EMBD / WARP_SIZE;
+ static_assert(LI_VEC_LANE_E == 8 && LI_VEC_KEYS == 8, "the transposed reduction maps lane pair 2j, 2j+1 to key j");
+ 
++// lightning_indexer_vec_sycl keeps LI_VEC_KEYS x LI_VEC_LANE_E floats of K per lane (k_reg) live across the head
++// loop. At sub-group 16 that is 128 registers of 32 bytes on Xe-HPG (Arc A-series), the whole default register
++// file, and the acm-g10 AOT build spills about 1.6 KB per thread. Xe-HPG has the 256-register mode; on Xe2 and
++// Xe-HPC the registers are 64 bytes, k_reg takes 64 of them and the default 128 fits.
++static bool li_vec_large_grf() {
++    const gpu_arch arch = ggml_sycl_info().devices[ggml_sycl_get_device()].hw_info.arch;
++    return arch == gpu_arch::intel_gpu_acm_g10 || arch == gpu_arch::intel_gpu_acm_g11 ||
++           arch == gpu_arch::intel_gpu_acm_g12;
++}
++
++// one kernel type per register-file size: a lambda launched with two property sets would be two kernels of one
++// name. The sub-group size comes from these properties, not from an attribute on the lambda.
++template <typename Kernel, bool LG> struct li_vec_kernel {
++    Kernel k;
++
++    void operator()(sycl::nd_item<3> item) const { k(item); }
++
++    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
++        if constexpr (LG) {
++            return sycl::ext::oneapi::experimental::properties{
++                sycl::ext::intel::experimental::grf_size<256>,
++                sycl::ext::oneapi::experimental::sub_group_size<WARP_SIZE> };
++        } else {
++            return sycl::ext::oneapi::experimental::properties{
++                sycl::ext::oneapi::experimental::sub_group_size<WARP_SIZE> };
++        }
++    }
++};
++
+ template <typename k_t>
+ static inline void li_load8(const k_t * src, float * out) {
+     if constexpr (std::is_same_v<k_t, float>) {
+@@ -188,11 +219,10 @@ static void lightning_indexer_vec_sycl(
+     constexpr int KEYS_PER_WG = LI_VEC_KEYS * LI_VEC_SG;
+     const int n_kv_groups = (n_kv + KEYS_PER_WG - 1) / KEYS_PER_WG;
+ 
+-    stream->parallel_for(
+-        sycl::nd_range<3>(
+-            sycl::range<3>(n_stream, n_batch, (size_t) n_kv_groups * LI_VEC_SG * WARP_SIZE),
+-            sycl::range<3>(1, 1, LI_VEC_SG * WARP_SIZE)),
+-        [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++    const sycl::nd_range<3> range(
++        sycl::range<3>(n_stream, n_batch, (size_t) n_kv_groups * LI_VEC_SG * WARP_SIZE),
++        sycl::range<3>(1, 1, LI_VEC_SG * WARP_SIZE));
++    const auto kernel = [=](sycl::nd_item<3> item) {
+             const auto sg       = item.get_sub_group();
+             const int  lane     = sg.get_local_linear_id();
+             const int  i_stream = item.get_group(0);
+@@ -255,7 +285,12 @@ static void lightning_indexer_vec_sycl(
+                 const size_t dst_idx = i_kv + (size_t) i_batch*(nb1/sizeof(float)) + (size_t) i_stream*(nb3/sizeof(float));
+                 ((float *) dst)[dst_idx] = score + static_cast<float>(m_row[i_kv]);
+             }
+-        });
++        };
++    if (li_vec_large_grf()) {
++        stream->parallel_for(range, li_vec_kernel<decltype(kernel), true>{ kernel });
++    } else {
++        stream->parallel_for(range, li_vec_kernel<decltype(kernel), false>{ kernel });
++    }
+ }
+ 
+ // Keep the native tile separate from the indexer work-group tuning.

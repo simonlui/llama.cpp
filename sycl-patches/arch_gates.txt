@@ -1,4 +1,4 @@
-# ggml-sycl architecture gates at dde879bc (2026-11-01)
+# ggml-sycl architecture gates at fac3a894 (2026-11-03)
 # regenerate: bash sycl-patches/check_arch_gates.sh --update [REF]
    CMakeLists.txt: target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_XMX_AOT_SG=${_ggml_sycl_xmx_sg})
    fattn-onednn.cpp: arch == gpu_arch::intel_gpu_dg2_g11 ||

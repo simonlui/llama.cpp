@@ -344,10 +344,10 @@ index 8e1f1d50..c488ef9c 100644
              sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
                                sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
 diff --git a/ggml/src/ggml-sycl/dmmv.cpp b/ggml/src/ggml-sycl/dmmv.cpp
-index d720bc1f..8ff4d4f3 100644
+index 19af72c0..5d848285 100644
 --- a/ggml/src/ggml-sycl/dmmv.cpp
 +++ b/ggml/src/ggml-sycl/dmmv.cpp
-@@ -227,9 +227,6 @@ static void convert_mul_mat_vec_f16_sycl(const void *vx, const dfloat *y,
+@@ -228,9 +228,6 @@ static void convert_mul_mat_vec_f16_sycl(const void *vx, const dfloat *y,
      const sycl::range<3> block_nums(1, 1, block_num_y);
      const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
      {
@@ -357,7 +357,7 @@ index d720bc1f..8ff4d4f3 100644
          stream->parallel_for(
              sycl::nd_range<3>(block_nums * block_dims, block_dims),
              [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-@@ -1497,9 +1494,6 @@ static void dequantize_mul_mat_vec_q4_0_sycl_reorder(const void *vx, const dfloa
+@@ -1498,9 +1495,6 @@ static void launch_dequantize_mul_mat_vec(const void *vx, const dfloat *y, float
      const sycl::range<3> block_nums(1, 1, block_num_y);
      const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
      {
@@ -367,47 +367,7 @@ index d720bc1f..8ff4d4f3 100644
          stream->parallel_for(
              sycl::nd_range<3>(block_nums * block_dims, block_dims),
              [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-@@ -1520,9 +1514,6 @@ static void dequantize_mul_mat_vec_q4_0_sycl(const void *vx, const dfloat *y,
-     const sycl::range<3> block_nums(1, 1, block_num_y);
-     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
-     {
--        dpct::has_capability_or_fail(stream->get_device(),
--                                     {sycl::aspect::fp16});
--
-         stream->parallel_for(
-             sycl::nd_range<3>(block_nums * block_dims, block_dims),
-             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-@@ -1542,9 +1533,6 @@ static void dequantize_mul_mat_vec_q1_0_sycl_reorder(const void *vx, const dfloa
-     const sycl::range<3> block_nums(1, 1, block_num_y);
-     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
-     {
--        dpct::has_capability_or_fail(stream->get_device(),
--                                     {sycl::aspect::fp16});
--
-         stream->parallel_for(
-             sycl::nd_range<3>(block_nums * block_dims, block_dims),
-             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-@@ -1564,9 +1552,6 @@ static void dequantize_mul_mat_vec_q1_0_sycl(const void *vx, const dfloat *y,
-     const sycl::range<3> block_nums(1, 1, block_num_y);
-     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
-     {
--        dpct::has_capability_or_fail(stream->get_device(),
--                                     {sycl::aspect::fp16});
--
-         stream->parallel_for(
-             sycl::nd_range<3>(block_nums * block_dims, block_dims),
-             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-@@ -1585,9 +1570,6 @@ static void dequantize_mul_mat_vec_q4_1_sycl(const void *vx, const dfloat *y,
-     const sycl::range<3> block_nums(1, 1, block_num_y);
-     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
-     {
--        dpct::has_capability_or_fail(stream->get_device(),
--                                     {sycl::aspect::fp16});
--
-         stream->parallel_for(
-             sycl::nd_range<3>(block_nums * block_dims, block_dims),
-             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-@@ -1606,9 +1588,6 @@ static void dequantize_mul_mat_vec_q5_0_sycl(const void *vx, const dfloat *y,
+@@ -1520,9 +1514,6 @@ static void launch_dequantize_mul_mat_vec_reorder(const void *vx, const dfloat *
      const sycl::range<3> block_nums(1, 1, block_num_y);
      const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
      {
@@ -445,7 +405,7 @@ index 7b53e3dc..60903216 100644
              sycl::nd_range<3>(block_nums * block_dims, block_dims),
              [=](sycl::nd_item<3> item_ct1) {
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index caaafc95..01ad7be4 100644
+index 9ee16423..ea8f2ed5 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
 @@ -2549,9 +2549,6 @@ static void ggml_mul_mat_p021_f16_f32_sycl(const void *vx, const float *y,

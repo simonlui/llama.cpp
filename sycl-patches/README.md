@@ -23,50 +23,67 @@ This directory contains a series of patches for the SYCL backend of `llama.cpp`,
 | ~~0016~~ | ~~quant: use `n_layer_all` for MoE ffn counts~~ | ~~Bugfix (non-SYCL)~~ | Merged upstream as `b3ce5cedf` (`quant : fix quantizing moe with mtp (#24986)`) — retired |
 | 0017 | Gate the ternary types out of `supports_op` | Correctness | The SYCL backend implements no kernel for `TQ1_0`/`TQ2_0` anywhere, but `supports_op` only checks operand types per op, so the `TQ2_0` entry in test-backend-ops' `all_types` aborts the run three times over - `set_rows.cpp:547 Unsupported tensor type!`, then `cpy.cpp:1409 fatal error`, then `mmvq.cpp:2681 unsupport data type=tq2_0`. One central type gate (metadata-only ops excepted) replaces what would otherwise be three per-op gates; the types fall back to CPU. Local patch `ZZ-LOCAL-0005` (in `sycl-patches-extracted/`) adds TQ1_0 / TQ2_0 / PTQ1_0 kernels and narrows this gate to everything but the weight operand of MUL_MAT, MUL_MAT_ID and GET_ROWS |
 
-### Fetched upstream PRs (`PR-*.patch`) - checked 2026-11-01
+### Fetched upstream PRs (`PR-*.patch`) - checked 2026-11-03
 
 `pull_prs.sh` uses the `SYCL` label as its scope and does not require `SYCL` in
 the title. It carries open, non-draft PRs created in the last 60 days. This
-snapshot uses upstream `dde879bc1` (`sycl: Try PkgConfig for LevelZero includes
-/ libs (#31076)`) and a creation-date window starting 2026-09-02.
+snapshot uses upstream `fac3a894` (`vulkan: skip maxStorageBufferRange
+pre-check for non-compute tensors (#31114)`) and a creation-date window starting
+2026-09-04. GitHub's `pull/N.patch` download returned 403 through this
+environment's proxy, so the unpinned files were written with
+`git format-patch` from the fetched PR heads (`pull/N/head`), which gives the
+same mbox series.
 
 | PR | What | State |
 |----|------|-------|
 | 29506 | build the SYCL backend with a separate compiler | open; re-anchored on the upstream F16 footnote anchor in `docs/backend/SYCL.md` (pinned) |
 | 29672 | add PTQ1_0 ternary type | open; re-anchored next to upstream `GGML_TYPE_F8_E4M3` (pinned) |
-| 30156 | device-side MoE scheduler | open; was explicitly skipped for its overlap with PR 28725, which has merged; applies cleanly on the current stack |
+| 30156 | device-side MoE scheduler | open |
 | 30206 | support `truncate=false` for YaRN | open; re-anchored: `test_rope_set_rows` keeps upstream `n_dims` and adds the PR's `yarn`/`truncate` (pinned) |
-| 30606 | route BMG D=256 single-query decode to the FA vector kernel | open |
+| 30606 | route BMG D=256 single-query decode to the FA vector kernel | open; refreshed to the 2026-11-03 head (3 commits) |
 | 30857 | f16 support for SWIGLU_OAI | open |
-| 30956 | fast `ggml_sycl_comm_exchange()` for `-sm tensor` | open; carries two trailing-whitespace lines from the PR |
 | 31109 | bound CONV_TRANSPOSE_1D input iteration | open |
 | 31126 | cache the current device id | open |
 | 31138 | thread-safe oneDNN FA cache, memoized runtime failures | open |
 | 31208 | drop the fattn-mkl host-wait check from graph checks | open |
-| 31285 | refuse device buffers that would exceed VRAM | open |
-| 31325 | dmmv launcher cleanup | open; re-anchored after fork patches 0002/0008 (pinned) |
-| 31355 | fuse recurrent convolution windows | open |
+| 31285 | refuse device buffers that would exceed VRAM | open; reworked upstream: the check now runs on BMG-G21/G31 only (no effect on the A770 beyond `GGML_SYCL_MEMTRACE` output), with a free-memory baseline and `GGML_SYCL_ALLOW_VRAM_OVERCOMMIT`; re-anchored after PR 30606, whose `GGML_SYCL_FA_TILE_DEBUG` row sits in its docs context (pinned) |
+| 31355 | fuse recurrent convolution windows | open; no longer matches delta-net models after upstream `b74298c1`, see below |
 | 31460 | accept only implemented types in MUL_MAT, SET_ROWS and CPY | open; re-anchored after PR 29672: its whitelist replaces the per-op TQ1_0/TQ2_0/PTQ1_0 blocklists (pinned) |
 | 31465 | exact rounding in CPY to Q4_1, Q5_1 and Q8_0 | open |
+| 31536 | oneMKL flash attention with a mask broadcast over heads or batches; `cache-ram` argument for the example server scripts | open, new; re-anchored: its test struct goes before upstream's new `test_flash_attn_ext_kv_rows` (#29510) and its cases after PR 30606's GQA decode loop (pinned) |
+| 31542 | attention sinks (gpt-oss, Flint) may take the oneMKL FA path instead of TILE; the author measures 1.87x / 1.32x per attention op | open, new; re-anchored after PR 31536's test cases (pinned) |
 
-Retired in this refresh because upstream merged them: `28725`, `29107`,
-`29337`, `29338`, `29696`, `29864`, `29889`, `30271`, and `30286`. PR 30226
-closed without merging and was retired. Their pins and the `SKIP_PRS` entries
-for merged PR 26631 and now-carried PR 30156 were removed. The retired files
-are in this branch's Git history; no `../patch-backups/` copy was made because
-the refresh ran outside the usual checkout.
+Retired in this refresh because upstream merged them on 2026-11-02: `30956`
+(fast `ggml_sycl_comm_exchange()`) and `31325` (dmmv launcher cleanup). Fork
+patches 0002 and 0008 were re-anchored onto the merged dmmv launcher templates.
+Their files are in this branch's Git history.
+The `SKIP_PRS` entry for `29510` was removed: it merged.
+
+Upstream `b74298c1` (`delta_net_base: refactor conv state`, merged
+2026-11-03) writes the rollback conv-state windows of delta-net models
+(Qwen3.5, Qwen3-Next) with one `SET_ROWS` instead of one `CPY` per slot.
+Carried PR 31355 still matches the old `CPY` chain, which its own
+test-backend-ops case builds, so its tests pass but it no longer fires on those
+models. SYCL runs the new `SET_ROWS` itself (strided source, F32). Carry it
+until the PR follows upstream.
 
 New open, non-draft PRs in the window that are explicitly skipped in
-`SKIP_PRS` because they are not SYCL-primary: `29510` (llama + CUDA
-`flash_attn_ext_rows`), `29676` (CUDA PTQ1_0), `30559` (CUDA IQ4_NL
-GET_ROWS), `30715` (CPU JQ*_K types), `30743` (cross-backend argsort/top-k),
-`30967` (docs only), `31066` (nix only), `31139` (cross-backend max
-allocation size), and `31236` (CPU reference MXFP4/NVFP4 rounding).
+`SKIP_PRS` because they are not SYCL-primary: `29676` (CUDA PTQ1_0), `30559`
+(CUDA IQ4_NL GET_ROWS), `30715` (CPU JQ*_K types), `30743` (cross-backend
+argsort/top-k), `30967` (docs only), `31066` (nix only), `31139` (cross-backend
+max allocation size; the SYCL buffer types report no limit, so nothing changes
+on SYCL), `31236` (CPU reference MXFP4/NVFP4 rounding), and `31540` (CI, Dockerfile
+and docs: oneAPI 2026.2, oneDNN 2026.1, Level Zero 1.34.0; its changelog
+reports Qwen3.8-9B Q6_K pp512 565 vs 378 t/s on an Arc B570 from oneAPI
+2026.2 alone, against the 2026.1 build).
 
-The query skipped drafts `31428`, `31379`, `31313`, `30802`, `30718`, `30717`,
-`30716`, `29896`, `29801`, `29367`, `29247`, and `28898`. PR 29367's draft
-status still keeps the archived extracted 0013 and local repairs 0002/0004
-inactive.
+The query skips drafts automatically. Four SYCL drafts are carried by hand as
+opt-in candidates in `../sycl-patches-candidates/`: `31428` (C20), `31574`
+(C62), `31379` (C70) and `31313` (C75). Other drafts in the window: `30802`,
+`30716`, `30717`, `30718` (not SYCL-primary). PR 31528 (reorder-layout wide
+mat-vec kernels for q4_K/q5_K/q6_K) closed unmerged as a draft on 2026-11-02.
+PR 29367's draft status still keeps the archived extracted 0013 and local
+repairs 0002/0004 inactive.
 
 `PINNED` is reserved for carried, locally re-anchored patches. `SKIP_PRS`
 records explicit open-PR exclusions with reasons. Drafts are skipped

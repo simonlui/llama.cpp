@@ -26,17 +26,17 @@ title filter is applied client-side (jq `test("Intel"; "i")`) inside `pull_prs.s
 Draft PRs are skipped and are not downloaded or applied. If a previously
 carried PR becomes a draft, its patch is archived out of the active directory.
 
-## Carried set (checked 2026-11-01)
+## Carried set (checked 2026-11-03)
 
 `pull_prs.sh` downloads open, non-draft Vulkan PRs whose title contains `Intel`.
-This snapshot uses upstream `dde879bc1` and a 365-day creation-date window
-starting 2025-11-01.
+This snapshot uses upstream `fac3a894` and a 365-day creation-date window
+starting 2025-11-03.
 
 | PR | What | State |
 |----|------|-------|
-| 29357 | Intel Vulkan flash-attention prefill kernel | open; now 3 commits, collapsed into one cumulative diff and pinned |
+| 29357 | Intel Vulkan flash-attention prefill kernel | open; now 5 commits plus a master merge, collapsed into one cumulative diff and pinned. Refreshed 2026-11-03 for `06e3843a` (shader and host refinement, "accuracy issues fixes") and `c083edcc` (prefill FA shared memory capped at 48 KiB) |
 
-PR 29357's third commit edits `flash_attn_prefill.comp`, which its first commit
+PR 29357's later commits edit `flash_attn_prefill.comp`, which its first commit
 creates. `git apply -R` of that multi-commit series reverses the edit but leaves
 the new shader behind, so `unapply.sh` no longer returned a clean tree. The
 collapsed single diff creates the file once and reverses cleanly. `PINNED`

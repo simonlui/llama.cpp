@@ -1,0 +1,890 @@
+From: cwriter <https://github.com/ggml-org/llama.cpp/pull/31313>
+Subject: [PATCH] SYCL: lightning indexer VEC and XMX optimization (PR 31313, draft)
+
+PR commit 11e34732 ("WIP K1: faster SYCL lightning indexer kernels", draft),
+without its fused-gemm.cpp deduplication. The PR moves fused-gemm.cpp's
+joint_matrix element traits, combination list and picker into a new xmx.hpp
+under xmx_* names and makes fused-gemm.cpp use it. Here xmx.hpp is added for
+the indexer only and fused-gemm.cpp keeps its own fg_* copy, because local
+0010 and 0017 and candidates C20/C21 edit that code. The names do not overlap,
+so both copies build side by side. Dropped with the dedup: the common.hpp
+comment that points GGML_SYCL_XMX_GATHER_SHAPES at xmx.hpp and the docs rename
+of the logged picker to xmx_pick_combo (fused-gemm.cpp still logs
+fg_pick_combo). The PR's trailing blank line at the end of xmx.hpp is trimmed.
+
+Vector kernels for F32/F16/BF16 keys and, for batches of 8+ tokens, a
+joint_matrix kernel that uses the device's listed combinations (sub-group 8
+8x8x16 on Xe-HPG / Arc A-series). DeepSeek-V3.2-style sparse attention.
+Off by default: GGML_SYCL_LIGHTNING_INDEXER=1 turns it on;
+GGML_SYCL_LIGHTNING_INDEXER_XMX_TYPES / _XMX_SHAPES restrict the XMX path.
+
+---
+ docs/backend/SYCL.md                     |   3 +
+ ggml/src/ggml-sycl/common.hpp            |   9 +
+ ggml/src/ggml-sycl/ggml-sycl.cpp         |   9 +
+ ggml/src/ggml-sycl/lightning-indexer.cpp | 377 +++++++++++++++++++++++++++++++
+ ggml/src/ggml-sycl/xmx.hpp               | 299 ++++++++++++++++++++++++
+ tests/test-backend-ops.cpp               |  47 +++-
+ 6 files changed, 739 insertions(+), 5 deletions(-)
+
+diff --git a/docs/backend/SYCL.md b/docs/backend/SYCL.md
+index 60e7937c..c25f60ad 100644
+--- a/docs/backend/SYCL.md
++++ b/docs/backend/SYCL.md
+@@ -855,6 +855,9 @@ User can use the device management in [docs/multi-gpu.md](https://github.com/ggm
+ | GGML_SYCL_FA_DPAS | 1 (default) or 0 | Enable the XMX flash-attention kernel for a q4_0 or q8_0 KV cache (`-ctk q4_0 -ctv q4_0` or `-ctk q8_0 -ctv q8_0`) on Xe2 or newer GPUs (Arc B-series, Lunar Lake, Panther Lake, Wildcat Lake). It reads the quantized cache directly for decode and batches of up to 31 tokens, head sizes 64, 96, 128, 256 and 512, up to 32 query heads per KV head. Set to 0 to use the native SYCL flash-attention kernels. |
+ | GGML_SYCL_ENABLE_VMM | 0 or 1 (default) | Enable the virtual-memory device pool. |
+ | GGML_SYCL_ENABLE_MKL_FA | 1 (default) or 0 | Enable oneMKL GEMM flash attention for XMX-accelerated prompt processing with quantized KV cache. Automatically activates during prefill (prompt processing) when all conditions are met: (1) flash-attn enabled (`-fa` or `--flash-attn on`), (2) KV cache quantized (`--cache-type-k q8_0 --cache-type-v q8_0` or other `*_0/*_1` types), (3) batch size ≥ 1024 (`--batch-size 1024`), (4) prompt length ≥ 1024 tokens. Set to 0 to force the TILE kernel for A/B testing. Example minimum command: `llama-cli -m model.gguf -fa -ngl 99 --cache-type-k q8_0 --cache-type-v q8_0 --batch-size 1024 -p "your prompt"` |
++| GGML_SYCL_LIGHTNING_INDEXER | 0 (default) or 1 | Enable vectorized lightning-indexer kernels for floating-point keys. For batches of at least 8 tokens on supported devices, XMX uses the hardware-supported combinations and the operand precision selected by `GGML_SYCL_DYNAMIC_PRECISION`, with f32 accumulation (`F32` uses the vector kernel). Unsupported types and layouts use the existing kernel. |
++| GGML_SYCL_LIGHTNING_INDEXER_XMX_TYPES | decimal bitmask, 7 (default) | Input key types allowed to use lightning-indexer XMX: 1: F32, 2: F16, 4: BF16. Add bits to combine types; clearing a bit keeps that type on the vector kernel. |
++| GGML_SYCL_LIGHTNING_INDEXER_XMX_SHAPES | decimal bitmask, 255 (default) | Allowed lightning-indexer XMX combinations, with the same eight bits as `GGML_SYCL_XMX_GATHER_SHAPES`. Hardware support and `GGML_SYCL_DYNAMIC_PRECISION` still apply. f16 16x16x16 (bit 2) is preferred when allowed. `0` uses the vector kernel for all key types. This mask is independent of the gather mask. |
+ | GGML_SYCL_MKL_FA_DEBUG | 0 (default) or 1 | Enable per-call diagnostic logging for MKL flash attention: GEMM/softmax timings, interleaved-head detection, and buffer memory usage. |
+ | GGML_SYCL_FA_TILE_DEBUG | 0 (default) or 1 | Enable per-call diagnostic logging for the flash-attention TILE kernel dispatcher: head dims (DKQ/DV), GQA ratio, query rows, KV length, and whether the GQA-optimized variant is selected. |
+ | GGML_SYCL_MEMTRACE | 0 (default), 1, 2 | Enable record and output memory allocation diagnostics. Requires `-lv 4`. <br>0 -  Disable<br>1 - Basic memory info, including current and peak allocations, as well allocations from other sources, and the device free memory before each model buffer allocation, around 50 lines per model load.<br>2 - More verbose, logging around 900 specific allocations and deallocations. |
+diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
+index dc533346..09982c53 100644
+--- a/ggml/src/ggml-sycl/common.hpp
++++ b/ggml/src/ggml-sycl/common.hpp
+@@ -146,6 +146,15 @@ extern int g_ggml_sycl_dev2dev_memcpy;
+ extern int g_ggml_sycl_fa_onednn;
+ extern int g_ggml_sycl_fa_onednn_max_kv;
+ extern int g_ggml_sycl_enable_mkl_fa;
++extern int g_ggml_sycl_lightning_indexer;
++enum ggml_sycl_lightning_indexer_xmx_type {
++    GGML_SYCL_LIGHTNING_INDEXER_XMX_F32  = 1 << 0,
++    GGML_SYCL_LIGHTNING_INDEXER_XMX_F16  = 1 << 1,
++    GGML_SYCL_LIGHTNING_INDEXER_XMX_BF16 = 1 << 2,
++};
++static constexpr int GGML_SYCL_LIGHTNING_INDEXER_XMX_TYPES_DEFAULT = 7;
++extern int g_ggml_sycl_lightning_indexer_xmx_types;
++extern int g_ggml_sycl_lightning_indexer_xmx_shapes;
+ extern int g_ggml_sycl_fa_dpas;
+ extern int g_ggml_sycl_memtrace;
+ extern int g_ggml_sycl_memtrace_step;
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index e4560894..b3da2820 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -111,6 +111,9 @@ int g_ggml_sycl_enable_dnn = 1;
+ int g_ggml_sycl_fa_onednn = 1;
+ int g_ggml_sycl_fa_onednn_max_kv = 0;
+ int g_ggml_sycl_enable_mkl_fa = 1;
++int g_ggml_sycl_lightning_indexer = 0;
++int g_ggml_sycl_lightning_indexer_xmx_types = GGML_SYCL_LIGHTNING_INDEXER_XMX_TYPES_DEFAULT;
++int g_ggml_sycl_lightning_indexer_xmx_shapes = GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT;
+ int g_ggml_sycl_fa_dpas = 1;
+ int g_ggml_sycl_memtrace = 0;
+ int g_ggml_sycl_memtrace_step = 64;
+@@ -447,6 +450,9 @@ static void ggml_check_sycl() try {
+         g_ggml_sycl_fa_onednn = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN", 1);
+         g_ggml_sycl_fa_onednn_max_kv = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_MAX_KV", 0);
+         g_ggml_sycl_enable_mkl_fa = ggml_sycl_get_env("GGML_SYCL_ENABLE_MKL_FA", 1);
++        g_ggml_sycl_lightning_indexer = ggml_sycl_get_env("GGML_SYCL_LIGHTNING_INDEXER", 0);
++        g_ggml_sycl_lightning_indexer_xmx_types = ggml_sycl_get_env("GGML_SYCL_LIGHTNING_INDEXER_XMX_TYPES", GGML_SYCL_LIGHTNING_INDEXER_XMX_TYPES_DEFAULT);
++        g_ggml_sycl_lightning_indexer_xmx_shapes = ggml_sycl_get_env("GGML_SYCL_LIGHTNING_INDEXER_XMX_SHAPES", GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT);
+         g_ggml_sycl_fa_dpas = ggml_sycl_get_env("GGML_SYCL_FA_DPAS", 1);
+         g_ggml_sycl_memtrace = ggml_sycl_get_env("GGML_SYCL_MEMTRACE", 0);
+         g_ggml_sycl_memtrace_step = ggml_sycl_get_env("GGML_SYCL_MEMTRACE_STEP", 64);
+@@ -570,6 +576,9 @@ static void ggml_check_sycl() try {
+ #endif
+         GGML_LOG_INFO("  GGML_SYCL_FA_ONEDNN_MAX_KV: %d\n", g_ggml_sycl_fa_onednn_max_kv);
+         GGML_LOG_INFO("  GGML_SYCL_ENABLE_MKL_FA: %d\n", g_ggml_sycl_enable_mkl_fa);
++        GGML_LOG_INFO("  GGML_SYCL_LIGHTNING_INDEXER: %d\n", g_ggml_sycl_lightning_indexer);
++        GGML_LOG_INFO("  GGML_SYCL_LIGHTNING_INDEXER_XMX_TYPES: %d\n", g_ggml_sycl_lightning_indexer_xmx_types);
++        GGML_LOG_INFO("  GGML_SYCL_LIGHTNING_INDEXER_XMX_SHAPES: %d\n", g_ggml_sycl_lightning_indexer_xmx_shapes);
+         GGML_LOG_INFO("  GGML_SYCL_FA_DPAS: %d\n", g_ggml_sycl_fa_dpas);
+         GGML_LOG_INFO("  GGML_SYCL_MEMTRACE: %d\n", g_ggml_sycl_memtrace);
+         GGML_LOG_INFO("  GGML_SYCL_MEMTRACE_STEP: %d\n", g_ggml_sycl_memtrace_step);
+diff --git a/ggml/src/ggml-sycl/lightning-indexer.cpp b/ggml/src/ggml-sycl/lightning-indexer.cpp
+index 823b713c..31dd708e 100644
+--- a/ggml/src/ggml-sycl/lightning-indexer.cpp
++++ b/ggml/src/ggml-sycl/lightning-indexer.cpp
+@@ -1,5 +1,6 @@
+ #include "lightning-indexer.hpp"
+ #include "dequantize.hpp"
++#include "xmx.hpp"
+ 
+ static void lightning_indexer_f32_sycl(
+         const char * q, const char * k, const char * w, const char * m, float * dst,
+@@ -144,6 +145,359 @@ static void lightning_indexer_f32_sycl(
+         });
+ }
+ 
++static constexpr int LI_EMBD = 128;
++
++// Reuse each key across heads and score eight keys per sub-group.
++static constexpr int LI_VEC_KEYS   = 8;
++static constexpr int LI_VEC_SG     = 4;
++static constexpr int LI_VEC_LANE_E = LI_EMBD / WARP_SIZE;
++static_assert(LI_VEC_LANE_E == 8 && LI_VEC_KEYS == 8, "the transposed reduction maps lane pair 2j, 2j+1 to key j");
++
++template <typename k_t>
++static inline void li_load8(const k_t * src, float * out) {
++    if constexpr (std::is_same_v<k_t, float>) {
++        const sycl::float4 a = *(const sycl::float4 *) src;
++        const sycl::float4 b = *(const sycl::float4 *) (src + 4);
++        out[0] = a.x(); out[1] = a.y(); out[2] = a.z(); out[3] = a.w();
++        out[4] = b.x(); out[5] = b.y(); out[6] = b.z(); out[7] = b.w();
++    } else if constexpr (std::is_same_v<k_t, sycl::half>) {
++        const sycl::vec<sycl::half, 8> v = *(const sycl::vec<sycl::half, 8> *) src;
++#pragma unroll
++        for (int j = 0; j < 8; ++j) {
++            out[j] = static_cast<float>(v[j]);
++        }
++    } else {
++#pragma unroll
++        for (int j = 0; j < 8; ++j) {
++            out[j] = static_cast<float>(src[j]);
++        }
++    }
++}
++
++template <typename k_t>
++static void lightning_indexer_vec_sycl(
++        const char * q, const char * k, const char * w, const char * m, char * dst,
++        int n_head, int n_batch, int n_stream, int n_kv, int nem3,
++        size_t nbq1, size_t nbq2, size_t nbq3,
++        size_t nbk2, size_t nbk3,
++        size_t nbw1, size_t nbw3,
++        size_t nbm1, size_t nbm3,
++        size_t nb1, size_t nb3,
++        queue_ptr stream) {
++
++    constexpr int KEYS_PER_WG = LI_VEC_KEYS * LI_VEC_SG;
++    const int n_kv_groups = (n_kv + KEYS_PER_WG - 1) / KEYS_PER_WG;
++
++    stream->parallel_for(
++        sycl::nd_range<3>(
++            sycl::range<3>(n_stream, n_batch, (size_t) n_kv_groups * LI_VEC_SG * WARP_SIZE),
++            sycl::range<3>(1, 1, LI_VEC_SG * WARP_SIZE)),
++        [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++            const auto sg       = item.get_sub_group();
++            const int  lane     = sg.get_local_linear_id();
++            const int  i_stream = item.get_group(0);
++            const int  i_batch  = item.get_group(1);
++            const int  kv0      = item.get_group(2) * KEYS_PER_WG + sg.get_group_linear_id() * LI_VEC_KEYS;
++
++            float k_reg[LI_VEC_KEYS][LI_VEC_LANE_E];
++#pragma unroll
++            for (int j = 0; j < LI_VEC_KEYS; ++j) {
++                if (kv0 + j < n_kv) {
++                    const k_t * k_row = (const k_t *) (k + (size_t) (kv0 + j)*nbk2 + (size_t) i_stream*nbk3);
++                    li_load8(k_row + lane*LI_VEC_LANE_E, k_reg[j]);
++                } else {
++#pragma unroll
++                    for (int e = 0; e < LI_VEC_LANE_E; ++e) {
++                        k_reg[j][e] = 0.0f;
++                    }
++                }
++            }
++
++            const char  * q_base = q + (size_t) i_batch*nbq2 + (size_t) i_stream*nbq3;
++            const float * w_base = (const float *) (w + (size_t) i_batch*nbw1 + (size_t) i_stream*nbw3);
++
++            // after the reduction lanes 2j and 2j+1 hold the dot product of key j
++            float score = 0.0f;
++            for (int h = 0; h < n_head; ++h) {
++                float q_reg[LI_VEC_LANE_E];
++                li_load8((const float *) (q_base + (size_t) h*nbq1) + lane*LI_VEC_LANE_E, q_reg);
++
++                float dot[LI_VEC_KEYS];
++#pragma unroll
++                for (int j = 0; j < LI_VEC_KEYS; ++j) {
++                    dot[j] = 0.0f;
++#pragma unroll
++                    for (int e = 0; e < LI_VEC_LANE_E; ++e) {
++                        dot[j] += q_reg[e] * k_reg[j][e];
++                    }
++                }
++
++                // each step halves the values per lane: the lower lane keeps the lower keys
++#pragma unroll
++                for (int n = LI_VEC_KEYS, o = WARP_SIZE / 2; n > 1; n /= 2, o /= 2) {
++                    const bool hi = lane & o;
++#pragma unroll
++                    for (int j = 0; j < n / 2; ++j) {
++                        const float keep = hi ? dot[j + n/2] : dot[j];
++                        const float send = hi ? dot[j] : dot[j + n/2];
++                        dot[j] = keep + sycl::permute_group_by_xor(sg, send, o);
++                    }
++                }
++                const float sum = dot[0] + sycl::permute_group_by_xor(sg, dot[0], 1);
++
++                score += sycl::max(sum, 0.0f) * w_base[h];
++            }
++
++            const int i_kv = kv0 + lane/2;
++            if (lane % 2 == 0 && i_kv < n_kv) {
++                const sycl::half * m_row = (const sycl::half *) (m + (size_t) i_batch*nbm1 + (size_t) (i_stream % nem3)*nbm3);
++                // flat-index store, as in lightning_indexer_f32_sycl
++                const size_t dst_idx = i_kv + (size_t) i_batch*(nb1/sizeof(float)) + (size_t) i_stream*(nb3/sizeof(float));
++                ((float *) dst)[dst_idx] = score + static_cast<float>(m_row[i_kv]);
++            }
++        });
++}
++
++// Keep the native tile separate from the indexer work-group tuning.
++template <typename S, int NSG = (S::TN <= 16 ? 4 : 1), int MT = (S::TM < 32 ? 32 / S::TM : 1), int NT = 4>
++struct li_xmx_config : S {
++    static constexpr int SUBGROUPS = NSG;
++    static constexpr int KEYS      = NSG * S::TN;
++    static constexpr int TOK       = MT * S::TM;
++    static constexpr int WG_TOK    = NT * TOK;
++    static constexpr int THREADS   = NSG * S::SG;
++    static constexpr int COLS      = S::TN / S::SG;
++    static_assert(NSG > 0 && MT > 0 && NT > 0 && S::TN % S::SG == 0 && LI_EMBD % S::TK == 0, "bad indexer tile");
++};
++
++// DIRECT_B: K is stored in the B type, so full key tiles load B from K as column-major and skip the pack
++template <typename k_t, typename S, bool DIRECT_B>
++static void lightning_indexer_xmx_sycl(
++        ggml_backend_sycl_context & ctx,
++        const char * q, const char * k, const char * w, const char * m, char * dst,
++        int n_head, int n_batch, int n_stream, int n_kv, int nem3,
++        size_t nbq1, size_t nbq2, size_t nbq3,
++        size_t nbk2, size_t nbk3,
++        size_t nbw1, size_t nbw3,
++        size_t nbm1, size_t nbm3,
++        size_t nb1, size_t nb3,
++        queue_ptr stream) {
++
++    namespace mx = sycl::ext::oneapi::experimental::matrix;
++    using EA = typename S::EA;
++    using EB = typename S::EB;
++    // Queries are padded to whole tiles: [stream][head][token][embd].
++    const int n_batch_pad = (n_batch + S::TOK - 1) / S::TOK * S::TOK;
++    ggml_sycl_pool_alloc<typename S::tsa> q_stage(ctx.pool(), (size_t) n_stream * n_head * n_batch_pad * LI_EMBD);
++    typename S::tsa * q_packed = q_stage.get();
++
++    stream->parallel_for(
++        sycl::range<3>(n_stream, n_head, (size_t) n_batch_pad * LI_EMBD),
++        [=](sycl::id<3> id) {
++            const int s = id[0];
++            const int h = id[1];
++            const int t = id[2] / LI_EMBD;
++            const int e = id[2] % LI_EMBD;
++            float v = 0.0f;
++            if (t < n_batch) {
++                v = ((const float *) (q + (size_t) h*nbq1 + (size_t) t*nbq2 + (size_t) s*nbq3))[e];
++            }
++            q_packed[(((size_t) s*n_head + h)*n_batch_pad + t)*LI_EMBD + e] = EA::cvt(v);
++        });
++
++    const int n_kv_groups  = (n_kv + S::KEYS - 1) / S::KEYS;
++    const int n_tok_groups = (n_batch + S::WG_TOK - 1) / S::WG_TOK;
++
++    stream->submit([&](sycl::handler & cgh) {
++        // Pack K according to the operand storage width.
++        sycl::local_accessor<typename S::tsb, 1> k_tile(LI_EMBD * S::KEYS, cgh);
++        sycl::local_accessor<float, 1> c_tile(S::SUBGROUPS * S::TOK * S::TN, cgh);
++        cgh.parallel_for(
++            sycl::nd_range<3>(
++                sycl::range<3>(n_stream, n_tok_groups, (size_t) n_kv_groups * S::THREADS),
++                sycl::range<3>(1, 1, S::THREADS)),
++            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(S::SG)]] {
++                if constexpr (xmx_built<S::SG>()) {
++                    const auto sg       = item.get_sub_group();
++                    const int  sg_id    = sg.get_group_linear_id();
++                    const int  lane     = sg.get_local_linear_id();
++                    const int  i_stream = item.get_group(0);
++                    const int  t_wg     = item.get_group(1) * S::WG_TOK;
++                    const int  kv0      = item.get_group(2) * S::KEYS;
++
++                    const bool direct_b = DIRECT_B && kv0 + S::KEYS <= n_kv;
++                    for (int key = item.get_local_linear_id(); !direct_b && key < S::KEYS; key += S::THREADS) {
++                        const int i_kv = kv0 + key;
++#pragma unroll
++                        for (int e = 0; e < LI_EMBD; e += 8) {
++                            float kf[8] = {};
++                            if (i_kv < n_kv) {
++                                const k_t * k_row = (const k_t *) (k + (size_t) i_kv*nbk2 + (size_t) i_stream*nbk3);
++                                li_load8(k_row + e, kf);
++                            }
++#pragma unroll
++                            for (int j = 0; j < 8; j += S::VNNI) {
++                                if constexpr (S::VNNI == 2) {
++                                    auto * kt = (typename EB::pair *) &k_tile[0];
++                                    kt[((e + j)/2)*S::KEYS + key] = EB::make(kf[j], kf[j + 1]);
++                                } else {
++                                    k_tile[(e + j)*S::KEYS + key] = EB::cvt(kf[j]);
++                                }
++                            }
++                        }
++                    }
++                    if (!direct_b) {
++                        sycl::group_barrier(item.get_group());
++                    }
++
++                    const auto k_ptr = sycl::address_space_cast<sycl::access::address_space::global_space,
++                                                                 sycl::access::decorated::no>((const k_t *) (k + (size_t) i_stream*nbk3));
++                    const size_t k_stride = nbk2 / sizeof(k_t);
++                    const auto q_ptr = sycl::address_space_cast<sycl::access::address_space::global_space,
++                                                                 sycl::access::decorated::no>(q_packed);
++                    const auto b_ptr = k_tile.template get_multi_ptr<sycl::access::decorated::no>() + sg_id * S::TN * S::VNNI;
++                    const auto c_ptr = c_tile.get_multi_ptr<sycl::access::decorated::no>() + sg_id * S::TOK * S::TN;
++                    const float * c_sg = &c_tile[sg_id * S::TOK * S::TN];
++
++                    const char * w_s   = w + (size_t) i_stream*nbw3;
++                    const int    t_end = sycl::min(t_wg + S::WG_TOK, n_batch);
++
++                    // with_b(kk, f) calls f with the B tile of embedding block kk
++                    auto run = [&](auto && with_b) {
++                        for (int t0 = t_wg; t0 < t_end; t0 += S::TOK) {
++                            float score[S::TOK][S::COLS] = {};
++                            for (int h = 0; h < n_head; ++h) {
++                                mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, S::TM, S::TN> acc[S::TOK / S::TM];
++#pragma unroll
++                                for (int mt = 0; mt < S::TOK / S::TM; ++mt) {
++                                    mx::joint_matrix_fill(sg, acc[mt], 0.0f);
++                                }
++
++                                const size_t a_off = (((size_t) i_stream*n_head + h)*n_batch_pad + t0)*LI_EMBD;
++#pragma unroll
++                                for (int kk = 0; kk < LI_EMBD / S::TK; ++kk) {
++                                    auto mad = [&](auto & sub_b) {
++#pragma unroll
++                                        for (int mt = 0; mt < S::TOK / S::TM; ++mt) {
++                                            mx::joint_matrix<sycl::sub_group, typename S::ta, mx::use::a,
++                                                             S::TM, S::TK, mx::layout::row_major> sub_a;
++                                            mx::joint_matrix_load(sg, sub_a,
++                                                q_ptr + a_off + mt * S::TM * LI_EMBD + kk * S::TK, LI_EMBD);
++                                            mx::joint_matrix_mad(sg, acc[mt], sub_a, sub_b, acc[mt]);
++                                        }
++                                    };
++                                    with_b(kk, mad);
++                                }
++
++#pragma unroll
++                                for (int mt = 0; mt < S::TOK / S::TM; ++mt) {
++                                    mx::joint_matrix_store(sg, acc[mt], c_ptr + mt * S::TM * S::TN,
++                                                           S::TN, mx::layout::row_major);
++                                }
++                                sycl::group_barrier(sg);
++
++#pragma unroll
++                                for (int t = 0; t < S::TOK; ++t) {
++                                    const int   i_batch = sycl::min(t0 + t, n_batch - 1);
++                                    const float w_val   = ((const float *) (w_s + (size_t) i_batch*nbw1))[h];
++#pragma unroll
++                                    for (int c = 0; c < S::COLS; ++c) {
++                                        score[t][c] += sycl::max(c_sg[t * S::TN + lane + c*S::SG], 0.0f) * w_val;
++                                    }
++                                }
++                                sycl::group_barrier(sg);
++                            }
++
++#pragma unroll
++                            for (int c = 0; c < S::COLS; ++c) {
++                                const int i_kv = kv0 + sg_id * S::TN + lane + c*S::SG;
++                                if (i_kv >= n_kv) {
++                                    continue;
++                                }
++                                const int n_t = sycl::min(S::TOK, n_batch - t0);
++#pragma unroll
++                                for (int t = 0; t < S::TOK; ++t) {
++                                    if (t < n_t) {
++                                        const size_t i_batch = t0 + t;
++                                        const sycl::half * m_row = (const sycl::half *) (m + i_batch*nbm1 + (size_t) (i_stream % nem3)*nbm3);
++                                        const size_t dst_idx = i_kv + i_batch*(nb1/sizeof(float)) + (size_t) i_stream*(nb3/sizeof(float));
++                                        ((float *) dst)[dst_idx] = score[t][c] + static_cast<float>(m_row[i_kv]);
++                                    }
++                                }
++                            }
++                        }
++                    };
++
++                    if constexpr (DIRECT_B) {
++                        if (direct_b) {
++                            // all B tiles of this work-group stay in registers for every head and token block
++                            mx::joint_matrix<sycl::sub_group, typename S::tb, mx::use::b, S::TK, S::TN, mx::layout::col_major> b_reg[LI_EMBD / S::TK];
++#pragma unroll
++                            for (int kk = 0; kk < LI_EMBD / S::TK; ++kk) {
++                                mx::joint_matrix_load(sg, b_reg[kk], k_ptr + (size_t) (kv0 + sg_id * S::TN) * k_stride + kk * S::TK, k_stride);
++                            }
++                            run([&](int kk, auto && f) { f(b_reg[kk]); });
++                            return;
++                        }
++                    }
++                    run([&](int kk, auto && f) {
++                        mx::joint_matrix<sycl::sub_group, typename S::tb, mx::use::b, S::TK, S::TN, S::b_layout> sub_b;
++                        mx::joint_matrix_load(sg, sub_b, b_ptr + kk * S::TK * S::KEYS, S::KEYS * S::VNNI);
++                        f(sub_b);
++                    });
++                }
++            });
++    });
++}
++
++template <typename k_t>
++static void lightning_indexer_fast_sycl(ggml_backend_sycl_context & ctx, ggml_tensor * dst, int xmx_combo) {
++    const ggml_tensor * q = dst->src[0];
++    const ggml_tensor * k = dst->src[1];
++    const ggml_tensor * w = dst->src[2];
++    const ggml_tensor * m = dst->src[3];
++
++    const int n_head   = q->ne[1];
++    const int n_batch  = q->ne[2];
++    const int n_stream = q->ne[3];
++    const int n_kv     = k->ne[2];
++    const int nem3     = m->ne[3];
++
++    bool launched = false;
++    if (xmx_combo >= 0) {
++        xmx_visit_combo(xmx_combo, [&](auto combo) {
++            using S = li_xmx_config<decltype(combo)>;
++            if (n_batch > INT32_MAX - S::WG_TOK || n_batch > INT32_MAX - S::TOK || n_kv > INT32_MAX - S::KEYS) {
++                return;
++            }
++            const size_t n_batch_pad = (n_batch + S::TOK - 1) / S::TOK * S::TOK;
++            if ((size_t) n_head > SIZE_MAX / sizeof(typename S::tsa) / LI_EMBD / n_stream / n_batch_pad) {
++                return;
++            }
++            // bf16 measured 2-4% slower from K than from the packed tile; IGC has no column-major B load for TN 64,
++            // and SG8 is not tested
++            constexpr bool direct_b = std::is_same_v<k_t, sycl::half> && std::is_same_v<typename S::tsb, sycl::half> &&
++                                      S::TN == 16 && S::SG == 16;
++            lightning_indexer_xmx_sycl<k_t, S, direct_b>(ctx,
++                (const char *) q->data, (const char *) k->data, (const char *) w->data, (const char *) m->data, (char *) dst->data,
++                n_head, n_batch, n_stream, n_kv, nem3,
++                q->nb[1], q->nb[2], q->nb[3], k->nb[2], k->nb[3], w->nb[1], w->nb[3], m->nb[1], m->nb[3], dst->nb[1], dst->nb[3],
++                ctx.stream());
++            launched = true;
++        });
++    }
++    if (!launched) {
++        lightning_indexer_vec_sycl<k_t>(
++            (const char *) q->data, (const char *) k->data, (const char *) w->data, (const char *) m->data, (char *) dst->data,
++            n_head, n_batch, n_stream, n_kv, nem3,
++            q->nb[1], q->nb[2], q->nb[3], k->nb[2], k->nb[3], w->nb[1], w->nb[3], m->nb[1], m->nb[3], dst->nb[1], dst->nb[3],
++            ctx.stream());
++    }
++}
++
++// f16 16x16x16 (bit 2 of GGML_SYCL_LIGHTNING_INDEXER_XMX_SHAPES): B60, 4 heads 8-19% and 64 heads 33-47% faster than 8x16x16
++static constexpr int LI_XMX_PREFER = 1 << 1;
++
+ void ggml_sycl_op_lightning_indexer(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/4);
+     const ggml_tensor * q = dst->src[0];
+@@ -183,6 +537,29 @@ void ggml_sycl_op_lightning_indexer(ggml_backend_sycl_context & ctx, ggml_tensor
+ 
+     GGML_ASSERT(n_embd == WARP_SIZE * 8);
+ 
++    const bool aligned = reinterpret_cast<uintptr_t>(q->data) % 16 == 0 &&
++                         reinterpret_cast<uintptr_t>(k->data) % 16 == 0 &&
++                         nbq1 % 16 == 0 && nbq2 % 16 == 0 && nbq3 % 16 == 0 &&
++                         nbk2 % 16 == 0 && nbk3 % 16 == 0;
++    const int64_t max_index = INT32_MAX - 128;
++    const bool small_shape = n_head > 0 && n_batch > 0 && n_stream > 0 && n_kv > 0 && nem3 > 0 &&
++                             n_head <= max_index && n_batch <= max_index && n_stream <= max_index &&
++                             n_kv <= max_index && nem3 <= max_index;
++    if (g_ggml_sycl_lightning_indexer && aligned && small_shape) {
++        const int type_bit = k->type == GGML_TYPE_F32  ? GGML_SYCL_LIGHTNING_INDEXER_XMX_F32 :
++                             k->type == GGML_TYPE_F16  ? GGML_SYCL_LIGHTNING_INDEXER_XMX_F16 :
++                             k->type == GGML_TYPE_BF16 ? GGML_SYCL_LIGHTNING_INDEXER_XMX_BF16 : 0;
++        const int xmx_combo = n_batch >= 8 && (g_ggml_sycl_lightning_indexer_xmx_types & type_bit) &&
++                              g_ggml_sycl_dynamic_precision != GGML_SYCL_DYNAMIC_PRECISION_F32 ?
++            xmx_pick_combo(ctx.stream(), k->type, GGML_PREC_UNDEFINED, g_ggml_sycl_lightning_indexer_xmx_shapes, LI_XMX_PREFER) : -1;
++        switch (k->type) {
++            case GGML_TYPE_F32:  lightning_indexer_fast_sycl<float>(ctx, dst, xmx_combo); return;
++            case GGML_TYPE_F16:  lightning_indexer_fast_sycl<sycl::half>(ctx, dst, xmx_combo); return;
++            case GGML_TYPE_BF16: lightning_indexer_fast_sycl<sycl::ext::oneapi::bfloat16>(ctx, dst, xmx_combo); return;
++            default: break;
++        }
++    }
++
+     lightning_indexer_f32_sycl(
+             (const char *) q->data, (const char *) k->data,
+             (const char *) w->data, (const char *) m->data, (float *) dst->data,
+diff --git a/ggml/src/ggml-sycl/xmx.hpp b/ggml/src/ggml-sycl/xmx.hpp
+new file mode 100644
+index 00000000..9c374912
+--- /dev/null
++++ b/ggml/src/ggml-sycl/xmx.hpp
+@@ -0,0 +1,299 @@
++#pragma once
++
++#include "common.hpp"
++#include <sycl/ext/oneapi/matrix/matrix.hpp>
++#include <algorithm>
++#include <mutex>
++#include <set>
++#include <string>
++#include <tuple>
++#include <unordered_map>
++
++using xmx_matrix_type = sycl::ext::oneapi::experimental::matrix::matrix_type;
++using xmx_layout      = sycl::ext::oneapi::experimental::matrix::layout;
++using xmx_combination = sycl::ext::oneapi::experimental::matrix::combination;
++using xmx_tf32        = sycl::ext::oneapi::experimental::matrix::precision::tf32;
++
++// Element traits of one joint_matrix operand type. The A stage and the B pack compute in f32 and
++// convert once, in registers, when they write the element, so any type costs the same one pass.
++//   store: storage in SLM (A) and in the packed B buffer
++//   mtype: matrix_type in matrix_combinations
++//   mode:  GGML_SYCL_DYNAMIC_PRECISION value that selects this type
++//   src:   ggml type that needs no conversion into this type (GGML_TYPE_COUNT: none)
++//   slow:  XMX throughput class, 0 is fastest. f16 and bf16 share the DPAS rate; tf32 does half the
++//          K per instruction. B60, Qwen3-30B-A3B pp512: f16 1108, bf16 1000, tf32 751 t/s
++template <typename T> struct xmx_elem;
++
++template <> struct xmx_elem<sycl::half> {
++    using store = sycl::half;
++    using pair  = sycl::half2;
++    static constexpr xmx_matrix_type mtype = xmx_matrix_type::fp16;
++    static constexpr int             mode  = GGML_SYCL_DYNAMIC_PRECISION_F16;
++    static constexpr ggml_type       src   = GGML_TYPE_F16;
++    static constexpr int             mant  = 10;
++    static constexpr int             slow  = 0;
++    static store cvt(float x) { return (store) x; }
++    static pair make(float x, float y) { return pair((store) x, (store) y); }
++};
++
++// tf32 rounds to nearest even with plain bit ops: round_to_tf32 needs a SPIR-V extension that the
++// DG2 AOT target rejects
++static inline uint32_t xmx_round_bits(float x, int drop) {
++    const uint32_t u = sycl::bit_cast<uint32_t>(x);
++    if ((u & 0x7f800000u) == 0x7f800000u) {
++        return (u & 0x7fffffu) ? u | (1u << drop) : u; // nan stays nan
++    }
++    return u + ((1u << (drop - 1)) - 1) + ((u >> drop) & 1);
++}
++
++struct alignas(4) xmx_bf16x2 {
++    sycl::ext::oneapi::bfloat16 x, y;
++};
++
++template <> struct xmx_elem<sycl::ext::oneapi::bfloat16> {
++    using store = sycl::ext::oneapi::bfloat16;
++    using pair  = xmx_bf16x2;
++    static constexpr xmx_matrix_type mtype = xmx_matrix_type::bf16;
++    static constexpr int             mode  = GGML_SYCL_DYNAMIC_PRECISION_BF16;
++    static constexpr ggml_type       src   = GGML_TYPE_BF16;
++    static constexpr int             mant  = 7;
++    static constexpr int             slow  = 0;
++    static store cvt(float x) { return store(x); }
++    static pair make(float x, float y) { return { cvt(x), cvt(y) }; }
++};
++
++// tf32 keeps f32 range and f16 mantissa, in f32 storage
++template <> struct xmx_elem<xmx_tf32> {
++    using store = float;
++    using pair  = sycl::float2;
++    static constexpr xmx_matrix_type mtype = xmx_matrix_type::tf32;
++    static constexpr int             mode  = GGML_SYCL_DYNAMIC_PRECISION_TF32;
++    static constexpr ggml_type       src   = GGML_TYPE_COUNT;
++    static constexpr int             mant  = 10;
++    static constexpr int             slow  = 1;
++    static store cvt(float x) { return sycl::bit_cast<float>(xmx_round_bits(x, 13) & ~0x1fffu); }
++    static pair make(float x, float y) { return pair(cvt(x), cvt(y)); }
++};
++
++template <typename TA, typename TB, int TM_, int TN_, int TK_, int SG_> struct xmx_combo {
++    using ta  = TA;
++    using tb  = TB;
++    using EA  = xmx_elem<TA>;
++    using EB  = xmx_elem<TB>;
++    using tsa = typename EA::store;
++    using tsb = typename EB::store;
++    static constexpr int TM = TM_;
++    static constexpr int TN = TN_;
++    static constexpr int TK = TK_;
++    static constexpr int SG = SG_;
++    static constexpr int VNNI    = 4 / sizeof(tsb);  // K rows of B packed in one 32-bit word
++    static constexpr xmx_layout b_layout = VNNI == 1 ? xmx_layout::row_major : xmx_layout::ext_intel_packed;
++    static constexpr bool efficient = TN <= 32;
++};
++
++using xmx_half = sycl::half;
++using xmx_bf16 = sycl::ext::oneapi::bfloat16;
++
++// One bit of the XMX shape mask per combination. Only combinations some device lists in
++// matrix_combinations are built (appendix of sycl_ext_oneapi_matrix and the runtime's own list).
++template <typename F> inline void xmx_visit_combo(int idx, F && f);
++static constexpr int XMX_N_COMBOS = 8;
++
++// A spir64_gen AOT build (GGML_SYCL_XMX_AOT_SG) drops the combinations of the other sub-group size
++// entirely: ocloc rejects even an empty kernel that asks for a sub-group size it lacks.
++template <int SG> constexpr bool xmx_listed() {
++#if defined(GGML_SYCL_XMX_AOT_SG)
++    return SG == GGML_SYCL_XMX_AOT_SG;
++#else
++    return true;
++#endif
++}
++
++template <typename S, typename F> inline void xmx_call_combo(F && f) {
++    if constexpr (xmx_listed<S::SG>()) {
++        f(S{});
++    }
++}
++
++template <typename F> inline void xmx_visit_combo(int idx, F && f) {
++    switch (idx) {
++        case 0: xmx_call_combo<xmx_combo<xmx_half, xmx_half, 8, 16, 16, 16>>(f);  break; // Xe2, Xe3, Xe-HPC
++        case 1: xmx_call_combo<xmx_combo<xmx_half, xmx_half, 16, 16, 16, 16>>(f); break; // Xe2, Xe3, Xe-HPC
++        case 2: xmx_call_combo<xmx_combo<xmx_half, xmx_half, 32, 64, 16, 16>>(f); break; // Xe2, Xe3, Xe-HPC
++        case 3: xmx_call_combo<xmx_combo<xmx_half, xmx_half, 32, 64, 32, 16>>(f); break; // Xe2, Xe3, Xe-HPC
++        case 4: xmx_call_combo<xmx_combo<xmx_half, xmx_half, 8, 8, 16, 8>>(f);    break; // Xe-HPG (Arc A), ARL-H
++        case 5: xmx_call_combo<xmx_combo<xmx_tf32, xmx_tf32, 8, 16, 8, 16>>(f);   break; // Xe2, Xe3, Xe-HPC
++        case 6: xmx_call_combo<xmx_combo<xmx_bf16, xmx_bf16, 8, 16, 16, 16>>(f);  break; // Xe2, Xe3, Xe-HPC
++        case 7: xmx_call_combo<xmx_combo<xmx_bf16, xmx_bf16, 8, 8, 16, 8>>(f);    break; // Xe-HPG (Arc A), ARL-H
++        default: GGML_ABORT("bad XMX combination %d", idx);
++    }
++}
++
++// AOT with -fsycl-targets=intel_gpu_*: compile each tile body only for targets with its sub-group
++// size, since IGC fails on the other ones. A JIT build keeps them all, but each combination lands in
++// its own device image (joint_matrix is an optional kernel feature) and only a combination the
++// device reports is launched, so the runtime never asks IGC for the others.
++#if defined(__SYCL_DEVICE_ONLY__)
++#    if __SYCL_TARGET_INTEL_GPU_ACM_G10__ || __SYCL_TARGET_INTEL_GPU_ACM_G11__ || __SYCL_TARGET_INTEL_GPU_ACM_G12__ || \
++        __SYCL_TARGET_INTEL_GPU_ARL_H__
++#        define XMX_AOT_SG 8
++#    elif __SYCL_TARGET_INTEL_GPU_PVC__ || __SYCL_TARGET_INTEL_GPU_PVC_VG__ || __SYCL_TARGET_INTEL_GPU_BMG_G21__ || \
++        __SYCL_TARGET_INTEL_GPU_BMG_G31__ || __SYCL_TARGET_INTEL_GPU_LNL_M__ || __SYCL_TARGET_INTEL_GPU_PTL_H__ ||   \
++        __SYCL_TARGET_INTEL_GPU_PTL_U__ || __SYCL_TARGET_INTEL_GPU_WCL__ || __SYCL_TARGET_INTEL_GPU_NVL_S__ ||       \
++        __SYCL_TARGET_INTEL_GPU_NVL_U__ || __SYCL_TARGET_INTEL_GPU_NVL_P__
++#        define XMX_AOT_SG 16
++#    elif __SYCL_TARGET_INTEL_GPU_TGLLP__ || __SYCL_TARGET_INTEL_GPU_RKL__ || __SYCL_TARGET_INTEL_GPU_ADL_S__ || \
++        __SYCL_TARGET_INTEL_GPU_ADL_P__ || __SYCL_TARGET_INTEL_GPU_ADL_N__ || __SYCL_TARGET_INTEL_GPU_DG1__ ||   \
++        __SYCL_TARGET_INTEL_GPU_MTL_U__ || __SYCL_TARGET_INTEL_GPU_MTL_H__
++#        define XMX_AOT_SG 0 // no XMX
++#    endif
++#endif
++
++template <int SG> constexpr bool xmx_built() {
++#if defined(XMX_AOT_SG)
++    return SG == XMX_AOT_SG;
++#else
++    return true;
++#endif
++}
++
++// the device lists S with an f32 accumulator and output
++template <typename S> inline bool xmx_device_has_combo(const std::vector<xmx_combination> & combinations) {
++    for (const auto & c : combinations) {
++        if (c.atype == S::EA::mtype && c.btype == S::EB::mtype && c.ctype == xmx_matrix_type::fp32 &&
++            c.dtype == xmx_matrix_type::fp32 &&
++            (c.max_msize >= (size_t) S::TM || c.msize == (size_t) S::TM) &&
++            (c.max_nsize >= (size_t) S::TN || c.nsize == (size_t) S::TN) &&
++            (c.max_ksize >= (size_t) S::TK || c.ksize == (size_t) S::TK)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++template <typename T> inline const char * xmx_type_name() {
++    return std::is_same_v<T, xmx_half> ? "f16" : std::is_same_v<T, xmx_bf16> ? "bf16" : "tf32";
++}
++
++inline std::string xmx_combo_name(int idx) {
++    std::string name;
++    xmx_visit_combo(idx, [&](auto s) {
++        using S = decltype(s);
++        name = std::string(xmx_type_name<typename S::ta>()) + "x" + xmx_type_name<typename S::tb>() + " " +
++               std::to_string(S::TM) + "x" + std::to_string(S::TN) + "x" + std::to_string(S::TK) + " sg" +
++               std::to_string(S::SG);
++    });
++    return name;
++}
++
++// Combinations this build has kernels for and the device lists, one bit each. Cached per device:
++// on a mixed box the first caller's verdict is not the others'.
++inline int xmx_device_combos(const sycl::device & dev) {
++    static std::mutex                            mtx;
++    static std::unordered_map<sycl::device, int> known;
++    std::lock_guard<std::mutex>                  lock(mtx);
++    const auto                                   it = known.find(dev);
++    if (it != known.end()) {
++        return it->second;
++    }
++    int available = 0;
++    try {
++        const auto combinations = dev.get_info<sycl::ext::oneapi::experimental::info::device::matrix_combinations>();
++        const auto sg_sizes     = dev.get_info<sycl::info::device::sub_group_sizes>();
++        for (int idx = 0; idx < XMX_N_COMBOS; ++idx) {
++            xmx_visit_combo(idx, [&](auto s) {
++                using S = decltype(s);
++                const bool sg_ok = std::find(sg_sizes.begin(), sg_sizes.end(), (size_t) S::SG) != sg_sizes.end();
++                if (sg_ok && xmx_device_has_combo<S>(combinations)) {
++                    available |= 1 << idx;
++                }
++            });
++        }
++    } catch (const sycl::exception &) {
++        available = 0;
++    }
++    GGML_LOG_INFO("%s: %s: XMX combinations available 0x%x\n", __func__,
++                  dev.get_info<sycl::info::device::name>().c_str(), available);
++    known.emplace(dev, available);
++    return available;
++}
++
++// Rank of combination S for a src1 of type src1_type, lower is better. Order:
++//  1. throughput: a tile that does not spill, then the fastest type class of A and B
++//  2. B type equal to the src1 type, so the pack is a plain copy
++//  3. B at least as precise as f16
++//  4. the device's native DPAS tile (8 x SG x 32 bytes of K), then the largest M x K
++// A costs nothing to convert: the A stage emits any type at the same cost.
++template <typename S> inline int64_t xmx_rank(ggml_type src1_type) {
++    const int64_t spills  = !S::efficient;
++    const int64_t slow    = std::max(S::EA::slow, S::EB::slow);
++    const int64_t convert = S::EB::src != src1_type;
++    const int64_t lossy   = S::EB::mant < 10;
++    const int64_t foreign = !(S::TM == 8 && S::TN == S::SG);
++    const int64_t mk      = 1024 - S::TM * S::TK;
++    return ((((spills * 2 + slow) * 2 + convert) * 2 + lossy) * 2 + foreign) * 2048 + mk;
++}
++
++// whether XMX operands of type mode (a GGML_SYCL_DYNAMIC_PRECISION value) meet the src1 request
++// [TAG_GGML_PREC]. f16 lacks the f32 range that BF16 and F32 ask for; an F32 request goes only as far
++// down as GGML_SYCL_DYNAMIC_REQUIRED_PRECISION allows.
++inline bool xmx_mode_meets(int mode, int32_t src1_prec) {
++    if (src1_prec == GGML_PREC_UNDEFINED || src1_prec >= GGML_PREC_F16) {
++        return true;
++    }
++    if (src1_prec >= GGML_PREC_BF16) {
++        return mode != GGML_SYCL_DYNAMIC_PRECISION_F16;
++    }
++    switch (g_ggml_sycl_dynamic_required_precision) {
++        case GGML_SYCL_DYNAMIC_PRECISION_TF32: return mode == GGML_SYCL_DYNAMIC_PRECISION_TF32;
++        case GGML_SYCL_DYNAMIC_PRECISION_BF16: return mode != GGML_SYCL_DYNAMIC_PRECISION_F16;
++        default:                               return false;
++    }
++}
++
++// Best allowed combination for this call, or -1 if none. The type is GGML_SYCL_DYNAMIC_PRECISION if it
++// meets the src1 request; if not, bf16 then tf32 for a BF16 request (fastest first) and tf32 then bf16
++// for an F32 request (most mantissa first). Combinations in the prefer mask rank before the others of the same type.
++inline int xmx_pick_combo(dpct::queue_ptr stream, ggml_type src1_type, int32_t src1_prec, int shapes, int prefer = 0) {
++    const sycl::device dev     = stream->get_device();
++    const int          allowed = xmx_device_combos(dev) & shapes;
++    const bool         f32_req = src1_prec != GGML_PREC_UNDEFINED && src1_prec < GGML_PREC_BF16;
++    const int          modes[] = {
++        g_ggml_sycl_dynamic_precision,
++        f32_req ? GGML_SYCL_DYNAMIC_PRECISION_TF32 : GGML_SYCL_DYNAMIC_PRECISION_BF16,
++        f32_req ? GGML_SYCL_DYNAMIC_PRECISION_BF16 : GGML_SYCL_DYNAMIC_PRECISION_TF32,
++    };
++    int     best      = -1;
++    int64_t best_rank = 0;
++    for (int i = 0; i < 3 && best < 0; ++i) {
++        const int mode = modes[i];
++        if (!xmx_mode_meets(mode, src1_prec)) {
++            continue;
++        }
++        for (int idx = 0; idx < XMX_N_COMBOS; ++idx) {
++            if (!(allowed & (1 << idx))) {
++                continue;
++            }
++            xmx_visit_combo(idx, [&](auto s) {
++                using S = decltype(s);
++                if (S::EA::mode != mode || S::EB::mode != mode) {
++                    return;
++                }
++                const int64_t rank = xmx_rank<S>(src1_type) - ((prefer >> idx) & 1 ? (int64_t) 1 << 40 : 0);
++                if (best < 0 || rank < best_rank) {
++                    best      = idx;
++                    best_rank = rank;
++                }
++            });
++        }
++    }
++    // log each distinct decision once
++    static std::mutex                                         mtx;
++    static std::set<std::tuple<size_t, int, int32_t, int, int>> seen;
++    std::lock_guard<std::mutex>                               lock(mtx);
++    if (seen.emplace(std::hash<sycl::device>{}(dev), (int) src1_type, src1_prec, shapes, best).second) {
++        GGML_LOG_INFO("%s: src1 %s, src1 prec %d -> %s\n", __func__, ggml_type_name(src1_type), src1_prec,
++                      best >= 0 ? xmx_combo_name(best).c_str() : "none (fallback)");
++    }
++    return best;
++}
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 5b5a9d60..85f36185 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9536,9 +9536,10 @@ struct test_lightning_indexer : public test_case {
+     const int64_t nm; // ne[3] of mask
+ 
+     const ggml_type type_K;
++    const int pad;
+ 
+     std::string vars() override {
+-        return VARS_TO_STR7(hsk, nh, kv, nb, ns, nm, type_K);
++        return VARS_TO_STR7(hsk, nh, kv, nb, ns, nm, type_K) + (pad ? ",pad=" + std::to_string(pad) : "");
+     }
+ 
+     double max_nmse_err() override {
+@@ -9550,16 +9551,24 @@ struct test_lightning_indexer : public test_case {
+         return ((2 * hsk + 2) * nh + 1) * kv * nb * ns;
+     }
+ 
+-    test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1, ggml_type type_K = GGML_TYPE_F16)
+-        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K) {}
++    test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1, ggml_type type_K = GGML_TYPE_F16, int pad = 0)
++        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K), pad(pad) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+-        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, ns);
++        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk + pad, nh, nb, ns);
+         ggml_set_param(q);
++        if (pad) {
++            ggml_set_name(q, "q_base");
++            q = ggml_view_4d(ctx, q, hsk, nh, nb, ns, q->nb[1], q->nb[2], q->nb[3], pad * sizeof(float));
++        }
+         ggml_set_name(q, "q");
+ 
+-        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, hsk, 1, kv, ns);
++        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, hsk + pad, 1, kv, ns);
+         ggml_set_param(k);
++        if (pad) {
++            ggml_set_name(k, "k_base");
++            k = ggml_view_4d(ctx, k, hsk, 1, kv, ns, k->nb[1], k->nb[2], k->nb[3], pad * ggml_type_size(type_K));
++        }
+         ggml_set_name(k, "k");
+ 
+         ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, nh, nb, 1, ns);
+@@ -13167,6 +13176,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // Token and key tails of the vector (batch < 8) and XMX indexer kernels; 129 tokens span two work-groups.
++    for (int kv : { 255, 4097 }) {
++        for (int bs : { 1, 7, 8, 33, 129 }) {
++            for (int ns : { 1, 2 }) {
++                test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, ns, ns, GGML_TYPE_F32));
++            }
++        }
++    }
++    for (ggml_type type_K : { GGML_TYPE_F16, GGML_TYPE_BF16 }) {
++        test_cases.emplace_back(new test_lightning_indexer(128, 4, 1000, 33, 2, 1, type_K));
++        test_cases.emplace_back(new test_lightning_indexer(128, 4, 4097, 33, 1, 1, type_K));
++    }
++
++    // Aligned strided views use the fast kernels; unaligned views use the fallback.
++    test_cases.emplace_back(new test_lightning_indexer(128, 4, 65, 1, 2, 1, GGML_TYPE_F32, 16));
++    for (ggml_type type_K : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
++        test_cases.emplace_back(new test_lightning_indexer(128, 4, 65, 33, 2, 1, type_K, 16));
++    }
++    test_cases.emplace_back(new test_lightning_indexer(128, 4, 65, 33, 2, 1, GGML_TYPE_F32, 1));
++
+     return test_cases;
+ }
+ #ifdef _MSC_VER
+@@ -13723,6 +13752,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         }
+     }
+ 
++    for (int kv : { 512, 2048, 4096, 8192, 16384, 26112 }) {
++        for (int bs : { 1, 512, 1024 }) {
++            for (ggml_type type_K : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
++                test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, 1, 1, type_K));
++            }
++        }
++    }
++
+     // top_k_mask, Flash-Next QSA shapes: 512 pools of 4 + a 3-cell tail, and DSA shapes: 2048 cells
+     for (int64_t n_kv : { 18432, 131072 }) {
+         for (int64_t nb : { 1, 2048 }) {

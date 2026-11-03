@@ -1,0 +1,92 @@
+diff --git a/ggml/src/ggml-sycl/fattn-mkl.cpp b/ggml/src/ggml-sycl/fattn-mkl.cpp
+index 09b184cb..319f206e 100644
+--- a/ggml/src/ggml-sycl/fattn-mkl.cpp
++++ b/ggml/src/ggml-sycl/fattn-mkl.cpp
+@@ -216,6 +216,8 @@ static void mkl_fa_normalize_head(
+     float * __restrict dst_batch,
+     const float * __restrict VKQ_accum,
+     const float * __restrict KQ_sum,
++    const float * __restrict KQ_max,
++    const float * sinks,
+     int iqh, int n_queries, int DV, int n_q_heads,
+     int64_t src_offset, int64_t wg_size) {
+ 
+@@ -228,7 +230,12 @@ static void mkl_fa_normalize_head(
+                 if (jc >= n_queries) return;
+ 
+                 int     ksum_idx = (int)(src_offset / DV) + jc;
+-                float   inv_sum  = 1.0f / KQ_sum[ksum_idx];
++                // the sink is one more key with logit sinks[head] and no value: it adds to the denominator only
++                float   denom    = KQ_sum[ksum_idx];
++                if (sinks) {
++                    denom += sycl::native::exp(sinks[iqh] - KQ_max[ksum_idx]);
++                }
++                float   inv_sum  = 1.0f / denom;
+                 const float * __restrict src = VKQ_accum
+                     + src_offset + jc * (int64_t)DV;
+                 // Interleaved dst layout (matching TILE):
+@@ -361,7 +368,10 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
+     const ggml_tensor * K    = dst->src[1];
+     const ggml_tensor * V    = dst->src[2];
+     const ggml_tensor * mask = dst->src[3];
++    const ggml_tensor * sinks = dst->src[4];
+     ggml_tensor * KQV = dst;
++    GGML_ASSERT(!sinks || sinks->type == GGML_TYPE_F32);
++    const float * sinks_ptr = sinks ? (const float *) sinks->data : nullptr;
+ 
+     GGML_ASSERT(Q->type == GGML_TYPE_F32);
+     GGML_ASSERT(KQV->type == GGML_TYPE_F32);
+@@ -646,7 +656,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
+                 int     iqh        = kvh_base_head + iqg;
+                 int64_t src_offset = (int64_t)iqg * n_queries * DV;
+                 mkl_fa_normalize_head(stream,
+-                    dst_batch, VKQ_accum_ptr, KQ_sum_ptr,
++                    dst_batch, VKQ_accum_ptr, KQ_sum_ptr, KQ_max_ptr, sinks_ptr,
+                     iqh, n_queries, DV, n_q_heads,
+                     src_offset, wg_size);
+             }
+diff --git a/ggml/src/ggml-sycl/fattn.cpp b/ggml/src/ggml-sycl/fattn.cpp
+index e76d97ba..ea8ccf45 100644
+--- a/ggml/src/ggml-sycl/fattn.cpp
++++ b/ggml/src/ggml-sycl/fattn.cpp
+@@ -159,7 +159,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
+         V->ne[0] == 512 && gqa_ratio == 20 &&
+         K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
+ 
+-    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && !sinks && gqa_ratio >= 2 &&
++    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && (!sinks || sinks->nb[0] == sizeof(float)) && gqa_ratio >= 2 &&
+         (standard_shape || glm_mla_shape) &&
+         Q->ne[1] >= 32 && K->ne[1] >= 1024 &&
+         max_bias == 0.0f && logit_softcap == 0.0f &&
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 32d06c89..c1a96049 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12745,6 +12745,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // attention sinks at prompt batch sizes, kv up to 2 chunks of SYCL MKL FA
++    for (int64_t kv : { 1024, 16384 }) {
++        for (int64_t nb : { 32, 512 }) {
++            for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
++                test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 8, {8, 1}, kv, nb, true, true, 0, 0, GGML_PREC_F32, type, type)); // gpt-oss
++                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, kv, nb, true, true, 0, 0, GGML_PREC_F32, type, type)); // Flint
++            }
++        }
++    }
++
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},   512, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  4096,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  4096,  16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+@@ -13357,6 +13367,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 8192, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
+     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 8192, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
+ 
++    // attention sinks: prompt of 1024 after 49152 cached tokens (gpt-oss, Flint)
++    test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 8, {8, 1}, 50176, 1024, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16));
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 50176, 1024, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
++
+     // q8_0 KV cases with long context (decode and prompt)
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   128, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));

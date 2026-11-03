@@ -103,12 +103,13 @@ is gone, so runtime behavior/perf differs from the research tree.
 
 ## Status / verification
 
-- **Apply / unapply:** on 2026-11-01, the current stack (7 fork patches, 16
-  upstream PR patches, and 2 numbered extracted patches) applied with plain
-  `git apply` in a clean worktree at upstream `dde879bc1`, with no three-way
-  fallback. `unapply.sh` reversed the exact order and returned the tracked and
-  untracked tree to upstream. The same holds with the Vulkan stack applied on
-  top and reversed first.
+- **Apply / unapply:** on 2026-11-03, the current stack (7 fork patches, 16
+  upstream PR patches, 2 numbered extracted patches and 15 local patches)
+  applied with plain `git apply` in a clean worktree at upstream `fac3a894`,
+  with no three-way fallback, followed by the 13 candidates and the 4 Vulkan
+  patches (57 in all). The three `unapply.sh` scripts, Vulkan first, returned
+  the tracked and untracked tree to upstream. (On 2026-11-01 the same held at
+  `dde879bc1` without the local patches.)
 - **Build:** no SYCL compiler was available for this refresh, so the SYCL
   translation units were not compiled. A GCC build of the same applied tree
   with `GGML_VULKAN=ON` and tests compiled everything outside `ggml-sycl`

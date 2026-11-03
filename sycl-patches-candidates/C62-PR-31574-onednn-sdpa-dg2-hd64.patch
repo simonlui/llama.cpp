@@ -1,0 +1,49 @@
+From ef2a03914ba2d4d4c1a14cc4b8cbec6ebdba8a7b Mon Sep 17 00:00:00 2001
+From: Gotya-OFFCIAL <https://github.com/ggml-org/llama.cpp/pull/31574>
+Subject: [PATCH] sycl: un-gate oneDNN fused SDPA for Alchemist at head_dim=64 (PR 31574, draft)
+
+The dg2 + head_dim==64 block traced back to wrong results reported in
+uxlfoundation/oneDNN#5510, which turned out to be a Linux IGC compute-runtime
+regression (fixed in IGC 2.40), not a hardware or kernel defect.
+
+Re-validated on Windows + Arc A770 (dg2_g11), driver 32.0.101.9150, oneDNN 3.11:
+- test-backend-ops FLASH_ATTN_EXT hsk=64: 1818/1818 OK, 0 FAIL
+- llama-bench Qwen2.5-0.5B (head_dim=64): +49% pp2048, +106% pp4096 with the
+  fused path (ONEDNN_VERBOSE confirms sdp_primitive_kernel_t)
+GGML_SYCL_FA_ONEDNN=0 remains the escape hatch.
+
+Carried unchanged; it applies on top of the stack and C10..C60. On Linux it
+needs IGC 2.40 or newer: older IGC gives wrong head_dim=64 results here.
+
+---
+ ggml/src/ggml-sycl/fattn-onednn.cpp | 17 ++++++-----------
+ 1 file changed, 6 insertions(+), 11 deletions(-)
+
+diff --git a/ggml/src/ggml-sycl/fattn-onednn.cpp b/ggml/src/ggml-sycl/fattn-onednn.cpp
+index 4691c860..0287364b 100644
+--- a/ggml/src/ggml-sycl/fattn-onednn.cpp
++++ b/ggml/src/ggml-sycl/fattn-onednn.cpp
+@@ -69,17 +69,12 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
+             }
+         }
+     }
+-    // This is the improved SPDA gate. Rather than gating Alchemist GPUs from all SPDA features, we instead target only the failing shapes.
+-    // If the GPU being assessed isn't in the grouping below, it has full access to all SPDA shapes. Otherwise, if it's an Alchemist GPU, we block only the shapes with head sizes that fail.
+-    // It is much easier to compare the device to a small list of failing cases than to define all the passing ones.
+-    const gpu_arch arch = ggml_sycl_info().devices[ggml_sycl_get_device()].hw_info.arch;
+-    bool support_spda = !(arch == gpu_arch::intel_gpu_dg2_g10 ||
+-                         arch == gpu_arch::intel_gpu_dg2_g11 ||
+-                         arch == gpu_arch::intel_gpu_dg2_g12);
+-
+-    if (!support_spda && K->ne[0] == 64) {
+-        return false;
+-    }
++    // The former Alchemist (dg2) block for head_dim == 64 traced back to oneDNN reporting
++    // wrong results for that shape (uxlfoundation/oneDNN#5510). The root cause turned out
++    // to be a Linux IGC compute-runtime regression, fixed in IGC 2.40, not a hardware or
++    // kernel defect. Re-validated on Arc A770 (dg2_g11): test-backend-ops FLASH_ATTN_EXT
++    // hsk=64 gives 1818/1818 OK, and llama-bench reports ~1.5x-2x faster prompt
++    // processing with the fused path. GGML_SYCL_FA_ONEDNN=0 remains the escape hatch.
+     // Optional KV-length ceiling (GGML_SYCL_FA_ONEDNN_MAX_KV, 0 = unlimited). Escape hatch:
+     // very long sequences make the fused SDPA slow enough to risk the xe driver watchdog on
+     // some stacks; past the cap we fall back to the native FA kernel instead.

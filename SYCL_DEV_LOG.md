@@ -155,6 +155,98 @@ oneAPI came from conda-forge into `/opt/oneapi` on a GPU-less cloud box:
   floating point exception, likely from GPU-only device properties. The only
   numeric test of SYCL kernels here is C60's standalone emulation above.
 
+## Upstream refresh to `fac3a894`, new upstream PRs and draft candidates (2026-11-03)
+
+Moves the stack from `dde879bc1` to `fac3a894` (43 upstream commits, merged into this branch as
+`500bd505`) and carries the SYCL PRs opened since the last refresh. GitHub's `pull/N.patch` URLs returned
+403 through this environment's proxy, so every PR file was made with `git format-patch` (unpinned) or
+`git diff` (pinned, re-anchored) from `pull/N/head` fetched with git.
+
+| Item | Change |
+|---|---|
+| Upstream PRs 30956, 31325 | merged upstream on 2026-11-02; retired |
+| Fork 0002, 0008 | re-anchored: merged 31325 replaced dmmv's per-type launchers with two templates. 0002 drops the fp16 capability check from both; 0008 turns all 12 remaining `dpct::permute_sub_group_by_xor` calls in `dmmv.cpp` into `select_from_group` |
+| PR 30606 | refreshed to its 2026-11-03 head (3 commits) |
+| PR 31285 | reworked upstream (the VRAM check now runs on BMG-G21/G31 only, against a free-memory baseline); re-anchored after 30606's docs row, pinned. No effect on the A770 beyond `GGML_SYCL_MEMTRACE` output |
+| PR 31536 (new) | oneMKL FA with a mask broadcast over heads or batches; re-anchored after upstream's `test_flash_attn_ext_kv_rows` (#29510) and 30606's GQA test loop, pinned |
+| PR 31542 (new) | attention sinks (gpt-oss, Flint) may take the oneMKL FA path; re-anchored after 31536's tests, pinned |
+| PR 31540 | skipped: CI, Dockerfile and docs only. Its changelog reports oneAPI 2026.2 alone at Qwen3.8-9B Q6_K pp512 565 vs 378 t/s on an Arc B570 against 2026.1; this machine's notes list oneAPI 2025.3, so a compiler upgrade is a free A/B |
+| PR 31139 | still skipped; on reading it, the SYCL buffer types get a NULL `get_max_alloc_size`, so it changes nothing on SYCL |
+| Candidate C51 | re-anchored: #29510 changed the context of the CPU FA loop it edits (`ic` became `ik1`) |
+| Candidate C62 (new) | PR 31574 (draft): oneDNN fused SDPA at head_dim 64 on Alchemist |
+| Candidate C70 (new) | PR 31379 (draft): GDN reads its state through the GET_ROWS ids |
+| Candidate C75 (new) | PR 31313 (draft, WIP): lightning-indexer vector and XMX kernels, without the PR's fused-gemm.cpp dedup |
+| Candidate C76 (new, local) | 256 registers for C75's vector kernel on ACM |
+| Vulkan PR 29357 | refreshed: two new commits (shader and host refinement with accuracy fixes; prefill FA shared memory capped at 48 KiB) |
+
+Findings from the refresh:
+
+- **PR 31355 no longer fires on Qwen3.5 / Qwen3-Next.** Upstream `b74298c1` (merged today) writes the
+  rollback conv-state windows of delta-net models with one `SET_ROWS` over an overlapping 4D view instead
+  of one `CPY` per slot. 31355's matcher looks for the `CPY` chain. Its own test builds that chain, so the
+  test still passes, but real graphs no longer match. SYCL runs the new `SET_ROWS` itself (F32 source,
+  row strides honoured). Kept carried until the PR follows upstream.
+- **Upstream already has an MoE expert cache.** `--moe-cache-mib` (SLRU since #30637, multi-GPU since
+  #30112) keeps hot experts in VRAM. The survey that preceded this refresh said llama.cpp only had static
+  offload; that was wrong. 31139 extends that cache for devices with a per-allocation limit, which SYCL does
+  not report.
+- **C75 without the dedup.** 31313 moves fused-gemm.cpp's joint_matrix traits, combination list and
+  picker into `xmx.hpp` under `xmx_*` names. Local 0010 / 0017 and C20 / C21 edit that code in
+  fused-gemm.cpp, so C75 adds `xmx.hpp` for the indexer alone and fused-gemm.cpp keeps its `fg_*` copy.
+  The names do not overlap. The PR's docs rename of the logged picker (`fg_pick_combo` to
+  `xmx_pick_combo`) was dropped with it.
+- **C70 and 31355 share scaffolding.** Both are cwriter's; 31379 repeats 31355's `graph_optimize` hook and
+  test-backend-ops whole-graph perf mode line for line, so C70 adds only its own parts.
+- **C62's evidence is from another die.** The PR's validation names `dg2_g11` (ACM-G11, the A380 / A310);
+  the A770 is ACM-G10. The block it lifts guarded against wrong results that the PR traces to a Linux IGC
+  regression fixed in IGC 2.40.
+
+Verification so far:
+
+- **Apply / unapply:** on a clean `fac3a894` worktree the stack (40 patches), the candidates and the
+  Vulkan stack apply in script order with plain `git apply`, no three-way fallback, 57 patches in all.
+  Vulkan, candidates and stack `unapply.sh` return the tracked and untracked tree to upstream (run before
+  C76 was added; C76 reverses on its own).
+- **`acm-g10` AOT** (real device flags, `-fsycl-device-code-split=per_kernel`): `lightning-indexer.cpp`
+  (C75 + C76) 198 DPAS, no spill; `gated_delta_net.cpp` (C70) 20 kernels, no spill; `fattn-mkl.cpp`
+  (31536, 31542) 11 kernels, no spill; `dmmv.cpp` (0002, 0008 re-anchored) 53 kernels, no spill.
+- **CPU OpenCL device:** the `icpx` build of the stack with the test hooks and the candidates that do not
+  touch CMake (all but C20 / C21) was still linking at this commit; results follow in the next entry.
+
+### Measuring on the A770 (not done here: no Intel GPU)
+
+SYCL graph replay is compiled in and off by default. Strata-A770 measured +22% decode on an A770 by
+replaying command lists through Level Zero instead of submitting each launch, which says launch overhead
+is worth measuring here. A/B on the same build:
+
+```bash
+for g in 0 1; do GGML_SYCL_ENABLE_GRAPH=$g ./build_sycl/bin/llama-bench -m MODEL -fa 1 -p 0 -n 128 -r 5; done
+```
+
+The log says `enabling SYCL graphs` or `disabling SYCL graphs`, and `GGML_SYCL_DEBUG=1` adds why.
+Graphs turn off for multi-GPU, a MUL_MAT_ID that waits on the host, OUT_PROD / CONV_3D / SOLVE_TRI, and,
+when oneDNN is older than 3.12.3, any graph with a oneDNN MUL_MAT or oneDNN FA. Decode of a single-GPU
+model normally qualifies. A replay needs two
+identical calls first, so use `-n 128` or longer.
+
+To see how far marfrit/arcint's OpenCL kernels are ahead before porting any of them, build its patched
+llama.cpp (pinned at `3e4dfa8`) with the OpenCL backend and run the same `llama-bench` line on both:
+
+```bash
+git clone https://github.com/marfrit/arcint
+git clone https://github.com/ggml-org/llama.cpp llama-arcint
+git -C llama-arcint checkout 3e4dfa8
+git -C llama-arcint apply ../arcint/contrib/llama.cpp/patches/*.patch
+cmake -S llama-arcint -B llama-arcint/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_OPENCL=ON -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF
+cmake --build llama-arcint/build --target llama-bench
+llama-arcint/build/bin/llama-bench -m MODEL -fa 1 -p 512,4096 -n 128 -r 3
+./build_sycl/bin/llama-bench -m MODEL -fa 1 -p 512,4096 -n 128 -r 3
+```
+
+arcint runs only under the `xe` kernel driver (its docs: "i915 is untested"); this machine uses i915.
+A k-quant dense model shows the prompt-processing gap, where this stack still dequantizes to f16 for
+oneDNN.
+
 ## Remaining fusions, MMVQ add epilogue and the register-file audit (2026-11-03, `ZZ-LOCAL-0015` to `ZZ-LOCAL-0017`)
 
 The rest of the survey's list, ported where it pays on an A770 and declined where it does not.

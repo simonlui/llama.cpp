@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
-index fcc97611e..43c150308 100644
+index 668e9bef..bf0e543a 100644
 --- a/ggml/src/ggml-sycl/common.hpp
 +++ b/ggml/src/ggml-sycl/common.hpp
-@@ -479,80 +479,71 @@ struct ggml_backend_sycl_context {
+@@ -611,80 +611,71 @@ struct ggml_backend_sycl_context {
  // common device functions
  
  static __dpct_inline__ float warp_reduce_sum(float x,
@@ -114,7 +114,7 @@ index fcc97611e..43c150308 100644
  }
  
  static constexpr int ggml_sycl_get_physical_warp_size() {
-@@ -560,68 +551,50 @@ static constexpr int ggml_sycl_get_physical_warp_size() {
+@@ -692,68 +683,50 @@ static constexpr int ggml_sycl_get_physical_warp_size() {
    return WARP_SIZE;
  }
  
@@ -200,10 +200,10 @@ index fcc97611e..43c150308 100644
      return x;
  }
 diff --git a/ggml/src/ggml-sycl/dmmv.cpp b/ggml/src/ggml-sycl/dmmv.cpp
-index d0c9e43f1..e16da2ec5 100644
+index 5d848285..06a264e2 100644
 --- a/ggml/src/ggml-sycl/dmmv.cpp
 +++ b/ggml/src/ggml-sycl/dmmv.cpp
-@@ -95,7 +95,7 @@ static void dequantize_mul_mat_vec(const void * __restrict__ vx, const dfloat *
+@@ -100,7 +100,7 @@ static void dequantize_mul_mat_vec(const void * __restrict__ vx, const dfloat *
      const int mask_start = ncols > GGML_SYCL_DMMV_X ? WARP_SIZE >> 1 : WARP_SIZE >> 2;
      for (int mask = mask_start; mask > 0; mask >>= 1) {
          tmp +=
@@ -212,7 +212,7 @@ index d0c9e43f1..e16da2ec5 100644
      }
  
      if (tid == 0) {
-@@ -201,7 +201,7 @@ static void dequantize_mul_mat_vec_reorder(const void * __restrict__ vx, const d
+@@ -207,7 +207,7 @@ static void dequantize_mul_mat_vec_reorder(const void * __restrict__ vx, const d
      const int mask_start = ncols > GGML_SYCL_DMMV_X ? WARP_SIZE >> 1 : WARP_SIZE >> 2;
      for (int mask = mask_start; mask > 0; mask >>= 1) {
          tmp +=
@@ -221,7 +221,7 @@ index d0c9e43f1..e16da2ec5 100644
      }
  
      if (tid == 0) {
-@@ -366,7 +366,7 @@ static void dequantize_mul_mat_vec_q2_k(const void *__restrict__ vx,
+@@ -372,7 +372,7 @@ static void dequantize_mul_mat_vec_q2_k(const void *__restrict__ vx,
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -230,7 +230,7 @@ index d0c9e43f1..e16da2ec5 100644
      }
  
      if (item_ct1.get_local_id(2) == 0) {
-@@ -478,7 +478,7 @@ static void dequantize_mul_mat_vec_q3_k(const void *__restrict__ vx,
+@@ -470,7 +470,7 @@ static void dequantize_mul_mat_vec_q2_k_reorder(const void *__restrict__ vx,
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -239,7 +239,7 @@ index d0c9e43f1..e16da2ec5 100644
      }
  
      if (item_ct1.get_local_id(2) == 0) {
-@@ -576,7 +576,7 @@ static void dequantize_mul_mat_vec_q3_k_reorder(const void *__restrict__ vx,
+@@ -582,7 +582,7 @@ static void dequantize_mul_mat_vec_q3_k(const void *__restrict__ vx,
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -248,7 +248,16 @@ index d0c9e43f1..e16da2ec5 100644
      }
  
      if (item_ct1.get_local_id(2) == 0) {
-@@ -724,7 +724,7 @@ static void dequantize_mul_mat_vec_q4_k(const void *__restrict__ vx,
+@@ -680,7 +680,7 @@ static void dequantize_mul_mat_vec_q3_k_reorder(const void *__restrict__ vx,
+ #pragma unroll
+     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+         tmp +=
+-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
++            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
+     }
+ 
+     if (item_ct1.get_local_id(2) == 0) {
+@@ -828,7 +828,7 @@ static void dequantize_mul_mat_vec_q4_k(const void *__restrict__ vx,
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -257,7 +266,7 @@ index d0c9e43f1..e16da2ec5 100644
      }
  
      if (tid == 0) {
-@@ -882,7 +882,7 @@ static void dequantize_mul_mat_vec_q4_k_reorder(const void *__restrict__ vx,
+@@ -986,7 +986,7 @@ static void dequantize_mul_mat_vec_q4_k_reorder(const void *__restrict__ vx,
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -266,7 +275,7 @@ index d0c9e43f1..e16da2ec5 100644
      }
  
      if (tid == 0) {
-@@ -1011,7 +1011,7 @@ static void dequantize_mul_mat_vec_q5_k(const void *__restrict__ vx,
+@@ -1117,7 +1117,7 @@ static void dequantize_mul_mat_vec_q5_k(const void *__restrict__ vx,
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -275,7 +284,7 @@ index d0c9e43f1..e16da2ec5 100644
      }
  
      if (item_ct1.get_local_id(2) == 0) {
-@@ -1125,7 +1125,7 @@ static void dequantize_mul_mat_vec_q5_k_reorder(const void *__restrict__ vx,
+@@ -1235,7 +1235,7 @@ static void dequantize_mul_mat_vec_q5_k_reorder(const void *__restrict__ vx,
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -284,7 +293,7 @@ index d0c9e43f1..e16da2ec5 100644
      }
  
      if (item_ct1.get_local_id(2) == 0) {
-@@ -1242,7 +1242,7 @@ static void dequantize_mul_mat_vec_q6_k(const void * __restrict__ vx, const floa
+@@ -1352,7 +1352,7 @@ static void dequantize_mul_mat_vec_q6_k(const void * __restrict__ vx, const floa
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -293,7 +302,7 @@ index d0c9e43f1..e16da2ec5 100644
      }
  
      if (tid == 0) {
-@@ -1367,7 +1367,7 @@ static void dequantize_mul_mat_vec_q6_k_reorder(const void * __restrict__ vx, co
+@@ -1477,7 +1477,7 @@ static void dequantize_mul_mat_vec_q6_k_reorder(const void * __restrict__ vx, co
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -302,20 +311,11 @@ index d0c9e43f1..e16da2ec5 100644
      }
  
      if (tid == 0) {
-@@ -1595,7 +1595,7 @@ static void dequantize_mul_mat_vec_q8_0_sycl_reorder(const void *vx, const dfloa
-                 // reduce
-                 const int mask_start = ncols > GGML_SYCL_DMMV_X ? WARP_SIZE >> 1 : WARP_SIZE >> 2;
-                 for (int mask = mask_start; mask > 0; mask >>= 1) {
--                    tmp += dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
-+                    tmp += sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
-                 }
- 
-                 if (tid == 0) {
 diff --git a/ggml/src/ggml-sycl/fattn-common.hpp b/ggml/src/ggml-sycl/fattn-common.hpp
-index c011d53da..3f7731d09 100644
+index c83b36c6..a5d5c7d4 100644
 --- a/ggml/src/ggml-sycl/fattn-common.hpp
 +++ b/ggml/src/ggml-sycl/fattn-common.hpp
-@@ -317,8 +317,8 @@ static __dpct_inline__ void quantize_q8_1_to_shared(const float * __restrict__ x
+@@ -318,8 +318,8 @@ static __dpct_inline__ void quantize_q8_1_to_shared(const float * __restrict__ x
  #pragma unroll
      for (int mask = QI8_1/2; mask > 0; mask >>= 1) {
          amax = sycl::fmax(
@@ -327,10 +327,10 @@ index c011d53da..3f7731d09 100644
  
      const float d = amax / 127;
 diff --git a/ggml/src/ggml-sycl/fattn-vec.hpp b/ggml/src/ggml-sycl/fattn-vec.hpp
-index 8031acfdf..59f455a27 100644
+index 5e40c88f..57dfdc63 100644
 --- a/ggml/src/ggml-sycl/fattn-vec.hpp
 +++ b/ggml/src/ggml-sycl/fattn-vec.hpp
-@@ -340,13 +340,12 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
+@@ -339,13 +339,12 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
          for (int j = 0; j < ncols; ++j) {
  #pragma unroll
              for (int offset = nthreads_KQ; offset < warp_size; offset <<= 1) {
@@ -351,10 +351,10 @@ index 8031acfdf..59f455a27 100644
              const float KQ_max_scale = sycl::native::exp((float) (KQ_max[j] - KQ_max_new[j]));
              KQ_max[j] = KQ_max_new[j];
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 512622f0c..8930e9818 100644
+index f2a566fb..e1902424 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -1857,7 +1857,7 @@ static void mul_mat_p021_f16_f32(
+@@ -2357,7 +2357,7 @@ static void mul_mat_p021_f16_f32(
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -363,7 +363,7 @@ index 512622f0c..8930e9818 100644
      }
  
      if (item_ct1.get_local_id(2) == 0) {
-@@ -1909,7 +1909,7 @@ static void mul_mat_vec_nc_f16_f32( // nc == non-contiguous
+@@ -2409,7 +2409,7 @@ static void mul_mat_vec_nc_f16_f32( // nc == non-contiguous
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -373,10 +373,10 @@ index 512622f0c..8930e9818 100644
  
      if (item_ct1.get_local_id(2) == 0) {
 diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
-index 7b1b3d467..641804c08 100644
+index c3853814..c20ff946 100644
 --- a/ggml/src/ggml-sycl/mmvq.cpp
 +++ b/ggml/src/ggml-sycl/mmvq.cpp
-@@ -151,7 +151,7 @@ static void mul_mat_vec_q(const void * __restrict__ vx, const void * __restrict_
+@@ -297,7 +297,7 @@ static void mul_mat_vec_q(const void * __restrict__ vx, const void * __restrict_
      // sum up partial sums and write back result
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
@@ -385,7 +385,7 @@ index 7b1b3d467..641804c08 100644
      }
  
      if (item_ct1.get_local_id(2) == 0) {
-@@ -210,8 +210,7 @@ static void mul_mat_vec_q_ncols(
+@@ -356,8 +356,7 @@ static void mul_mat_vec_q_ncols(
      for (int j = 0; j < ncols_dst; ++j) {
  #pragma unroll
          for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
@@ -395,7 +395,7 @@ index 7b1b3d467..641804c08 100644
          }
      }
  
-@@ -264,7 +263,7 @@ static void mul_mat_vec_q_iq2_xxs_q8_1(const void *__restrict__ vx,
+@@ -449,7 +448,7 @@ static void mul_mat_vec_q_iq2_xxs_q8_1(const void *__restrict__ vx,
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -404,7 +404,7 @@ index 7b1b3d467..641804c08 100644
      }
  
      if (item_ct1.get_local_id(2) == 0) {
-@@ -312,7 +311,7 @@ static void mul_mat_vec_q_iq2_xs_q8_1(const void *__restrict__ vx,
+@@ -497,7 +496,7 @@ static void mul_mat_vec_q_iq2_xs_q8_1(const void *__restrict__ vx,
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -413,7 +413,7 @@ index 7b1b3d467..641804c08 100644
      }
  
      if (item_ct1.get_local_id(2) == 0) {
-@@ -360,7 +359,7 @@ static void mul_mat_vec_q_iq2_s_q8_1(const void *__restrict__ vx,
+@@ -545,7 +544,7 @@ static void mul_mat_vec_q_iq2_s_q8_1(const void *__restrict__ vx,
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -422,7 +422,7 @@ index 7b1b3d467..641804c08 100644
      }
  
      if (item_ct1.get_local_id(2) == 0) {
-@@ -408,7 +407,7 @@ static void mul_mat_vec_q_iq3_xxs_q8_1(const void *__restrict__ vx,
+@@ -593,7 +592,7 @@ static void mul_mat_vec_q_iq3_xxs_q8_1(const void *__restrict__ vx,
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -431,7 +431,7 @@ index 7b1b3d467..641804c08 100644
      }
  
      if (item_ct1.get_local_id(2) == 0) {
-@@ -456,7 +455,7 @@ static void mul_mat_vec_q_iq3_s_q8_1(const void *__restrict__ vx,
+@@ -646,7 +645,7 @@ static void mul_mat_vec_q_iq3_s_q8_1(const void *__restrict__ vx,
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -440,7 +440,7 @@ index 7b1b3d467..641804c08 100644
      }
  
      if (item_ct1.get_local_id(2) == 0) {
-@@ -504,7 +503,7 @@ static void mul_mat_vec_q_iq1_s_q8_1(const void *__restrict__ vx,
+@@ -694,7 +693,7 @@ static void mul_mat_vec_q_iq1_s_q8_1(const void *__restrict__ vx,
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -449,7 +449,7 @@ index 7b1b3d467..641804c08 100644
      }
  
      if (item_ct1.get_local_id(2) == 0) {
-@@ -552,7 +551,7 @@ static void mul_mat_vec_q_iq1_m_q8_1(const void *__restrict__ vx,
+@@ -742,7 +741,7 @@ static void mul_mat_vec_q_iq1_m_q8_1(const void *__restrict__ vx,
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -458,7 +458,7 @@ index 7b1b3d467..641804c08 100644
      }
  
      if (item_ct1.get_local_id(2) == 0) {
-@@ -600,7 +599,7 @@ static void mul_mat_vec_q_iq4_nl_q8_1(const void *__restrict__ vx,
+@@ -790,7 +789,7 @@ static void mul_mat_vec_q_iq4_nl_q8_1(const void *__restrict__ vx,
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -467,7 +467,7 @@ index 7b1b3d467..641804c08 100644
      }
  
      if (item_ct1.get_local_id(2) == 0) {
-@@ -649,7 +648,7 @@ static void mul_mat_vec_q_iq4_xs_q8_1(const void *__restrict__ vx,
+@@ -839,7 +838,7 @@ static void mul_mat_vec_q_iq4_xs_q8_1(const void *__restrict__ vx,
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -476,7 +476,7 @@ index 7b1b3d467..641804c08 100644
      }
  
      if (item_ct1.get_local_id(2) == 0) {
-@@ -2435,7 +2434,7 @@ static void mul_mat_vec_q_moe(
+@@ -2677,7 +2676,7 @@ static void mul_mat_vec_q_moe(
  
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {

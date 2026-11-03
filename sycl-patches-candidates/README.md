@@ -25,6 +25,10 @@ the main stack, re-running `apply.sh` on an applied tree is not supported.
 | C50 | Frostbite1536/A770 `0a31dc7`, p11c F | TILE FA flushes its FP16 V accumulator to FP32 once per KV tile | Probable long-context accuracy fix: NMSE up to 2.3 at 16k keys per block, CPU OpenCL device only | none |
 | C51 | Frostbite1536/A770, patch 0005 | 16 biased-V FA test cases with an FP32 CPU reference | Tests C50; CPU FA changes only under the test reference flag | none |
 | C60 | local port of upstream PR 31125 | Upstream's DPAS flash attention for q4_0 / q8_0 KV (1-31 query tokens), with the DPAS width as a template parameter: sub-group 16 as upstream, sub-group 8 for Xe-HPG, picked per device at run time | Upstream measured tg128 at 16K 31.3 -> 54.2 t/s on a B580 (q4_0 KV), but gates it to Xe2. On DG2 it replaces VEC for quantized-KV decode and small batches, and it is the only candidate that covers q4_0 KV. With C40 applied, C40 still takes q8_0 decode at 1-8 tokens and D 64/128/256 | `GGML_SYCL_FA_DPAS=0` |
+| C62 | PR 31574 (draft) | Lifts upstream's Alchemist (DG2) block on oneDNN fused SDPA at head_dim 64 | gpt-oss and other head-dim-64 models get oneDNN's fused attention for prompts. The author on Windows: Qwen2.5-0.5B pp2048 +49%, pp4096 +106%, `FLASH_ATTN_EXT hsk=64` 1818/1818. The block guarded against wrong results that the PR traces to a Linux IGC regression fixed in IGC 2.40, so older IGC still computes garbage here. The PR names its card `dg2_g11` (the ACM-G11 die of the A380/A310); an A770 is ACM-G10, so only your own run counts | `GGML_SYCL_FA_ONEDNN=0` (all oneDNN FA) |
+| C70 | PR 31379 (draft), re-anchored on carried PR 31355 and local 0015 | The gated delta net reads its recurrent state through the GET_ROWS ids instead of from a gathered copy | Qwen3.5 / Qwen3-Next decode: one state copy fewer per delta-net layer per token. Single-sequence batches only | `GGML_SYCL_GDN_STATE_GATHER=0` |
+| C75 | PR 31313 (draft, "WIP K1"), without its fused-gemm.cpp dedup | Vector and joint_matrix kernels for the lightning indexer | DeepSeek-V3.2-style sparse attention, decode (vector kernel) and batches of 8+ (XMX, sub-group-8 8x8x16 on DG2). Off by default | `GGML_SYCL_LIGHTNING_INDEXER=1` turns it on |
+| C76 | local, on C75 | 256 registers for C75's vector kernel on ACM-G10/G11/G12 | At 128 that kernel spills 1.6-1.8 KB per thread on DG2; at 256 it does not | none (only with C75 on) |
 | C90 | local | `GGML_SYCL_DG2_BMG_TUNING` bit mask that opens five Battlemage-only kernel choices to DG2 | Each choice is between kernels already built for every device, so only speed can change | `GGML_SYCL_DG2_BMG_TUNING=0` (default) |
 
 `GGML_SYCL_DG2_BMG_TUNING` bits:
@@ -90,6 +94,23 @@ GGML_SYCL_FA_GQA_DEC=1 ./build_sycl/bin/llama-bench -m MODEL -fa 1 -ctk q8_0 -ct
 
 The last line is C40 on q8_0 decode, to compare with the `dpas=1 q8_0` rows.
 
+C62, C70 and C75 / C76 (added 2026-11-03), correctness on the card:
+
+```bash
+ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build_sycl/bin/test-backend-ops -b SYCL0 -o FLASH_ATTN_EXT -p 'hsk=64'
+ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build_sycl/bin/test-backend-ops -b SYCL0 -o GATED_DELTA_NET_GATHER
+ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_LIGHTNING_INDEXER=1 ./build_sycl/bin/test-backend-ops -b SYCL0 -o LIGHTNING_INDEXER
+```
+
+On Linux, check the IGC version before trusting C62 (`GGML_SYCL_FA_ONEDNN=0` is the old
+behaviour). Then speed: C62 on prompts of a head-dim-64 model, C70 on decode of a Qwen3.5
+or Qwen3-Next model:
+
+```bash
+for o in 0 1; do GGML_SYCL_FA_ONEDNN=$o ./build_sycl/bin/llama-bench -m HD64_MODEL -fa 1 -p 2048,4096 -n 0 -r 3; done
+for g in 0 1; do GGML_SYCL_GDN_STATE_GATHER=$g ./build_sycl/bin/llama-bench -m QWEN35_MODEL -p 0 -n 128 -r 3; done
+```
+
 Promote a candidate when its tests pass and it wins at the depths you use. A tuning bit that
 wins can become a plain DG2 entry in that gate.
 
@@ -137,6 +158,13 @@ the A770 compiles at JIT time) and its DG2 assembly read from IGC dumps:
   DPAS: 112 cases pass at both widths (NMSE vs FP64 <= 4.8e-5, sub-group 8 vs 16 <=
   1.6e-11), and it fails on planted sub-group-8 layout bugs. Rerun it when C60 is
   re-anchored.
+
+Added 2026-11-03, `acm-g10` AOT with the real device flags (`-fsycl-device-code-split=per_kernel`):
+
+- C75 `lightning-indexer.cpp`: builds, 198 DPAS instructions in the XMX kernels, which do not spill. The
+  vector kernel spilled 1632-1760 B per thread at 128 registers; with C76 it gets 256 on ACM and does
+  not spill (`numGRF=256`).
+- C70 `gated_delta_net.cpp`: 20 kernels, none spill. C62 changes only a host-side gate.
 
 What was not checked: any number on real hardware. Apart from C60's emulation,
 no kernel here ran: the backend does not run on the CPU OpenCL device (see

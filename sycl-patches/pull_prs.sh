@@ -32,22 +32,24 @@ declare -A PINNED=(
     [29506]="re-anchored on upstream's sycl-f16-footnote anchor in docs/backend/SYCL.md; PR footnote 2 kept"
     [29672]="re-anchored next to upstream GGML_TYPE_F8_E4M3 (43): PTQ1_0 stays 143, both ftypes and gguf-py entries kept; x86 q2_0 generic alias dropped as upstream did"
     [30206]="re-anchored: test_rope_set_rows keeps upstream n_dims and the PR's yarn/truncate; the PR's yarn call site passes n_dims=128 explicitly so the bools do not bind to n_dims"
-    [31325]="re-anchored after fork patches 0002/0008: the dmmv launcher templates replace the capability-check-free launchers"
+    [31285]="re-anchored after PR-30606: the reworked PR now edits the docs/backend/SYCL.md env table, where 30606 adds GGML_SYCL_FA_TILE_DEBUG in its context"
     [31460]="re-anchored after PR-29672: the type whitelist replaces the per-op TQ1_0/TQ2_0/PTQ1_0 blocklists, and PTQ1_0 stays unsupported"
+    [31536]="re-anchored on fac3a894: its mask-broadcast test struct sits before upstream's new test_flash_attn_ext_kv_rows (#29510) and its test cases after PR-30606's GQA decode loop"
+    [31542]="re-anchored after PR-31536: its gpt-oss / Flint sink test cases follow 31536's, and its perf cases precede the q8_0 long-context block"
 )
 
 # Explicit exclusions are distinct from pinned carries and automatic draft or
 # merged/closed retirement. Keep the reason here so each open PR is auditable.
 declare -A SKIP_PRS=(
-    [29510]="llama + CUDA flash_attn_ext_rows across 49 files; SYCL only gains a supports_op line; not SYCL-primary"
     [29676]="CUDA support for PTQ1_0 on top of PR-29672; no SYCL kernel change; not SYCL-primary"
     [30559]="CUDA IQ4_NL GET_ROWS; SYCL only gains a supports_op line; not SYCL-primary"
     [30715]="new JQ*_K quantization types for CPU (2k lines); SYCL only gates the types out; not SYCL-primary"
     [30743]="cross-backend argsort/top-k stride fix (CPU, CUDA, Metal, OpenCL); SYCL only gates; not SYCL-primary"
     [30967]="docs only (README, build.md, SYCL.md); no SYCL backend change"
     [31066]="nix packaging only; no SYCL backend change"
-    [31139]="cross-backend max-allocation-size reporting and MoE cache groups across 25 files; not SYCL-primary"
+    [31139]="cross-backend max-allocation-size reporting and MoE cache groups across 25 files; the SYCL buffer types get a NULL get_max_alloc_size, so nothing changes on SYCL"
     [31236]="changes the CPU reference MXFP4/NVFP4 rounding and gguf-py quantizers; not SYCL-primary"
+    [31540]="CI, Dockerfile and a docs changelog only: oneAPI 2026.2, oneDNN 2026.1 and Level Zero 1.34.0 in the SYCL builds; no backend change"
     [21067]="cross-backend prefetch; not SYCL-primary"
     [21160]="cross-backend profiler; not SYCL-primary"
     [22098]="UMA-only allocation path; not applicable to the target dGPU"
