@@ -1,0 +1,109 @@
+From: local
+Subject: [PATCH] sycl: keep C62's Alchemist head_dim 64 oneDNN SDPA behind a switch outside Windows (on C62)
+
+C62 (PR 31574) removes upstream's dg2 + head_dim 64 block on the oneDNN fused
+SDPA because the wrong results behind it (uxlfoundation/oneDNN#5510) were a
+driver bug fixed in IGC 2.40. That issue reproduced the failure on an A770 and
+an A750 under Ubuntu 24.04 with Level Zero driver 1.15.38646 (libze-intel-gpu1
+26.22.38646.4): NMSE about 0.17, with head_dim 64 the only failing size. It
+passed on 1.14.37435 and on Windows. The PR's own check ran on Windows only.
+
+The IGC version cannot be read at run time, and the Level Zero driver version
+does not pin it because IGC is packaged separately. Without this patch, a
+Linux driver older than IGC 2.40 gives wrong attention output for every
+head_dim 64 model that takes the oneDNN path, silently, as soon as the
+candidates are applied.
+
+GGML_SYCL_FA_ONEDNN_DG2_HD64 (default 0 outside Windows, 1 on Windows) keeps
+the block until set to 1. Unlike GGML_SYCL_FA_ONEDNN=0, it leaves oneDNN
+SDPA on for every other head size. Check the driver with
+  GGML_SYCL_FA_ONEDNN_DG2_HD64=1 test-backend-ops -b SYCL0 -o FLASH_ATTN_EXT -p hsk=64
+before setting it.
+
+---
+ docs/backend/SYCL.md                |  1 +
+ ggml/src/ggml-sycl/common.hpp       |  1 +
+ ggml/src/ggml-sycl/fattn-onednn.cpp | 13 +++++++++++++
+ ggml/src/ggml-sycl/ggml-sycl.cpp    |  7 +++++++
+ 4 files changed, 22 insertions(+)
+
+diff --git a/docs/backend/SYCL.md b/docs/backend/SYCL.md
+index 26318c57..47fc9a61 100644
+--- a/docs/backend/SYCL.md
++++ b/docs/backend/SYCL.md
+@@ -851,6 +851,7 @@ User can use the device management in [docs/multi-gpu.md](https://github.com/ggm
+ | GGML_SYCL_USE_LEVEL_ZERO_API | 1 (default) or 0 | Use Level Zero API for device memory allocation instead of SYCL. Reduces system RAM usage on Intel dGPUs by avoiding DMA-buf/TTM host memory staging. Requires GGML_SYCL_SUPPORT_LEVEL_ZERO_API=ON at build time. SYCL backend always runs on Level Zero running time even if it's set as OFF (The SYCL api will be usage for memory allocation).|
+ | GGML_SYCL_ENABLE_DNN | 0 or 1 (default)| Enable running computations through oneDNN and always use oneMKL. |
+ | GGML_SYCL_FA_ONEDNN | 1 (default) or 0 | Enable the oneDNN fused SDPA (flash-attention) path on supported GPUs. Set to 0 to always use the native SYCL flash-attention kernel. |
++| GGML_SYCL_FA_ONEDNN_DG2_HD64 | 0 (default on Linux) or 1 (default on Windows) | Lets Arc A-series (Alchemist) GPUs run head_dim 64 attention, as in Llama-3.2-1B and Qwen2.5-0.5B, through the oneDNN fused SDPA path. Linux drivers whose IGC predates 2.40 (for example Level Zero 1.15.38646 on Ubuntu 24.04) compute that shape wrongly, so first check `GGML_SYCL_FA_ONEDNN_DG2_HD64=1 test-backend-ops -o FLASH_ATTN_EXT -p hsk=64` and set 1 only if it passes. Other head sizes and GPUs are unaffected. |
+ | GGML_SYCL_FA_ONEDNN_MAX_KV | 0 (default, disabled) or positive integer | By default (0), all sequences are handled by the oneDNN fused SDPA path, regardless of KV length; a positive value caps that length, past which sequences fall back to the native kernel. If GPU driver watchdog resets (DEVICE_LOST) occur during long-context inference, set this near the context depth where they start, e.g. 24576. |
+ | GGML_SYCL_FA_DPAS | 1 (default) or 0 | Enable the XMX flash-attention kernel for a q4_0 or q8_0 KV cache (`-ctk q4_0 -ctv q4_0` or `-ctk q8_0 -ctv q8_0`) on Xe2 or newer GPUs (Arc B-series, Lunar Lake, Panther Lake, Wildcat Lake). It reads the quantized cache directly for decode and batches of up to 31 tokens, head sizes 64, 96, 128, 256 and 512, up to 32 query heads per KV head. Set to 0 to use the native SYCL flash-attention kernels. |
+ | GGML_SYCL_ENABLE_VMM | 0 or 1 (default) | Enable the virtual-memory device pool. |
+diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
+index dd881fba..ce84d011 100644
+--- a/ggml/src/ggml-sycl/common.hpp
++++ b/ggml/src/ggml-sycl/common.hpp
+@@ -142,6 +142,7 @@ static inline bool ggml_sycl_src1_f16_ok(const ggml_tensor * dst) {
+ }
+ extern int g_ggml_sycl_enable_flash_attention;
+ extern int g_ggml_sycl_dev2dev_memcpy;
++extern int g_ggml_sycl_fa_onednn_dg2_hd64;
+ extern int g_ggml_sycl_fa_onednn;
+ extern int g_ggml_sycl_fa_onednn_max_kv;
+ extern int g_ggml_sycl_enable_mkl_fa;
+diff --git a/ggml/src/ggml-sycl/fattn-onednn.cpp b/ggml/src/ggml-sycl/fattn-onednn.cpp
+index 6bbe2fd6..f82e18e5 100644
+--- a/ggml/src/ggml-sycl/fattn-onednn.cpp
++++ b/ggml/src/ggml-sycl/fattn-onednn.cpp
+@@ -88,6 +88,19 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
+     // kernel defect. Re-validated on Arc A770 (dg2_g11): test-backend-ops FLASH_ATTN_EXT
+     // hsk=64 gives 1818/1818 OK, and llama-bench reports ~1.5x-2x faster prompt
+     // processing with the fused path. GGML_SYCL_FA_ONEDNN=0 remains the escape hatch.
++    // Alchemist (dg2) at head_dim == 64 depends on the driver: in oneDNN#5510 the fused SDPA was
++    // wrong across the whole output (NMSE ~0.17, head_dim 64 the only failing size) on Ubuntu 24.04
++    // with Level Zero driver 1.15.38646 (libze-intel-gpu1 26.22.38646.4), right on 1.14.37435 and on
++    // Windows, and the fix shipped in IGC 2.40. The IGC version is not visible at run time and the
++    // Level Zero version does not pin it (IGC is packaged separately), so outside Windows this shape
++    // stays on the native kernel until GGML_SYCL_FA_ONEDNN_DG2_HD64=1 says the driver is fixed.
++    if (K->ne[0] == 64 && !g_ggml_sycl_fa_onednn_dg2_hd64) {
++        const gpu_arch arch = ggml_sycl_info().devices[ggml_sycl_get_device()].hw_info.arch;
++        if (arch == gpu_arch::intel_gpu_dg2_g10 || arch == gpu_arch::intel_gpu_dg2_g11 ||
++            arch == gpu_arch::intel_gpu_dg2_g12) {
++            return false;
++        }
++    }
+     // Optional KV-length ceiling (GGML_SYCL_FA_ONEDNN_MAX_KV, 0 = unlimited). Escape hatch:
+     // very long sequences make the fused SDPA slow enough to risk the xe driver watchdog on
+     // some stacks; past the cap we fall back to the native FA kernel instead.
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index c42f9cec..731a72e2 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -108,6 +108,7 @@ int g_ggml_sycl_fa_tile_debug = 0;
+ int g_ggml_sycl_enable_optimize = 1;
+ int g_ggml_sycl_enable_graph = 0;
+ int g_ggml_sycl_enable_dnn = 1;
++int g_ggml_sycl_fa_onednn_dg2_hd64 = 0;
+ int g_ggml_sycl_fa_onednn = 1;
+ int g_ggml_sycl_fa_onednn_max_kv = 0;
+ int g_ggml_sycl_enable_mkl_fa = 1;
+@@ -443,6 +444,11 @@ static void ggml_check_sycl() try {
+         g_ggml_sycl_enable_optimize = ggml_sycl_get_env("GGML_SYCL_ENABLE_OPT", 1);
+         g_ggml_sycl_enable_graph = ggml_sycl_get_env("GGML_SYCL_ENABLE_GRAPH", 0);
+         g_ggml_sycl_enable_dnn = ggml_sycl_get_env("GGML_SYCL_ENABLE_DNN", 1);
++#ifdef _WIN32
++        g_ggml_sycl_fa_onednn_dg2_hd64 = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_DG2_HD64", 1);
++#else
++        g_ggml_sycl_fa_onednn_dg2_hd64 = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_DG2_HD64", 0);
++#endif
+         g_ggml_sycl_fa_onednn = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN", 1);
+         g_ggml_sycl_fa_onednn_max_kv = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_MAX_KV", 0);
+         g_ggml_sycl_enable_mkl_fa = ggml_sycl_get_env("GGML_SYCL_ENABLE_MKL_FA", 1);
+@@ -562,6 +568,7 @@ static void ggml_check_sycl() try {
+ #if GGML_SYCL_DNNL
+         GGML_LOG_INFO("  GGML_SYCL_ENABLE_DNN: %d\n", g_ggml_sycl_enable_dnn);
+         GGML_LOG_INFO("  GGML_SYCL_FA_ONEDNN: %d\n", g_ggml_sycl_fa_onednn);
++        GGML_LOG_INFO("  GGML_SYCL_FA_ONEDNN_DG2_HD64: %d\n", g_ggml_sycl_fa_onednn_dg2_hd64);
+ #else
+         GGML_LOG_INFO("  GGML_SYCL_ENABLE_DNN: DNN disabled by compile flag\n");
+         GGML_LOG_INFO("  GGML_SYCL_FA_ONEDNN: %d\n", g_ggml_sycl_fa_onednn);

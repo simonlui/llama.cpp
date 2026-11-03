@@ -203,12 +203,27 @@ Findings from the refresh:
 - **Draft check:** all four draft heads (31574, 31379, 31313, 31428) were re-fetched unchanged and still
   open drafts; a line-by-line comparison of each PR diff with its candidate found nothing missing beyond
   the documented C75 dedup (candidates README, "Draft PR check").
+- **Review comments on the drafts** (candidates README, same section). The only substantive one is arthw's
+  question on 31428 about `-ze-intel-greater-than-4GB-buffer-required` in AOT builds. An `acm-g10` test
+  settles it in C20's favour: the bare `-Xs` form fails the AOT link (`Invalid option`), the `-options` form
+  builds, and the flag changes the code (`getrows.cpp`: 673 `a32` bindless-surface accesses without it, 716
+  `a64` with it). Upstream AOT builds therefore address at most 4 GB from the start of each buffer; JIT
+  builds, like the ones in this log, get the flag through `-Xs`. The other comments are names and build
+  messages (not changed) or were already resolved in the carried commits. arthw measured 31379 on an A770:
+  tg128 +2.6% / +3.3% (FA off / on) on Qwen3.5-0.8B.
+- **C63 (new, local, on C62).** oneDNN#5510, the issue 31574 cites, reproduced the head_dim 64 failure on an
+  A770 and an A750 under Ubuntu 24.04 with Level Zero 1.15.38646 (NMSE 0.17, the only failing head size),
+  fixed in IGC 2.40. llama.cpp cannot read the IGC version, so C63 keeps the dg2 block outside Windows
+  until `GGML_SYCL_FA_ONEDNN_DG2_HD64=1`. Without it, applying the candidates on such a driver silently
+  breaks attention for every head-dim-64 model on the oneDNN path. Compiled (`fattn-onednn.cpp`,
+  `ggml-sycl.cpp`) with the whole stack and all candidates; not run, because the CPU test device never
+  takes the oneDNN SDPA path.
 
 Verification so far:
 
 - **Apply / unapply:** on a clean `fac3a894` worktree the stack (40 patches), the candidates and the
-  Vulkan stack apply in script order with plain `git apply`, no three-way fallback, 57 patches in all.
-  Vulkan, candidates and stack `unapply.sh` reverse all 57 and return the tracked and untracked tree to
+  Vulkan stack apply in script order with plain `git apply`, no three-way fallback, 58 patches in all
+  (re-run after adding C63). Vulkan, candidates and stack `unapply.sh` reverse all 58 and return the tracked and untracked tree to
   upstream (the build directory aside).
 - **Vulkan build:** GCC 13 build of the same applied tree with `GGML_VULKAN=ON` and tests: 792 targets, no
   warnings; `ctest -L main -LE model` 16/18, the two failures being `test-download-model` (no network)

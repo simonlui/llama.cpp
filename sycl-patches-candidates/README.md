@@ -25,8 +25,9 @@ the main stack, re-running `apply.sh` on an applied tree is not supported.
 | C50 | Frostbite1536/A770 `0a31dc7`, p11c F | TILE FA flushes its FP16 V accumulator to FP32 once per KV tile | Probable long-context accuracy fix: NMSE up to 2.3 at 16k keys per block, CPU OpenCL device only | none |
 | C51 | Frostbite1536/A770, patch 0005 | 16 biased-V FA test cases with an FP32 CPU reference | Tests C50; CPU FA changes only under the test reference flag | none |
 | C60 | local port of upstream PR 31125 | Upstream's DPAS flash attention for q4_0 / q8_0 KV (1-31 query tokens), with the DPAS width as a template parameter: sub-group 16 as upstream, sub-group 8 for Xe-HPG, picked per device at run time | Upstream measured tg128 at 16K 31.3 -> 54.2 t/s on a B580 (q4_0 KV), but gates it to Xe2. On DG2 it replaces VEC for quantized-KV decode and small batches, and it is the only candidate that covers q4_0 KV. With C40 applied, C40 still takes q8_0 decode at 1-8 tokens and D 64/128/256 | `GGML_SYCL_FA_DPAS=0` |
-| C62 | PR 31574 (draft) | Lifts upstream's Alchemist (DG2) block on oneDNN fused SDPA at head_dim 64 | gpt-oss and other head-dim-64 models get oneDNN's fused attention for prompts. The author on Windows: Qwen2.5-0.5B pp2048 +49%, pp4096 +106%, `FLASH_ATTN_EXT hsk=64` 1818/1818. The block guarded against wrong results that the PR traces to a Linux IGC regression fixed in IGC 2.40, so older IGC still computes garbage here. The PR's validation line reads "Arc A770 / dg2_g11", but `dg2_g11` is the ACM-G11 die of the A380/A310 and an A770 is ACM-G10, so the card name or the label is wrong; only your own run counts | `GGML_SYCL_FA_ONEDNN=0` (all oneDNN FA) |
-| C70 | PR 31379 (draft), re-anchored on carried PR 31355 and local 0015 | The gated delta net reads its recurrent state through the GET_ROWS ids instead of from a gathered copy | Qwen3.5 / Qwen3-Next decode: one state copy fewer per delta-net layer per token. Single-sequence batches only | `GGML_SYCL_GDN_STATE_GATHER=0` |
+| C62 | PR 31574 (draft) | Lifts upstream's Alchemist (DG2) block on oneDNN fused SDPA at head_dim 64 | Head-dim-64 models without attention sinks (Llama-3.2-1B, Qwen2.5-0.5B) get oneDNN's fused attention for prompts (gpt-oss has sinks, which this path declines). The author on Windows: Qwen2.5-0.5B pp2048 +49%, pp4096 +106%, `FLASH_ATTN_EXT hsk=64` 1818/1818. The block guarded against wrong results that the PR traces to a Linux IGC regression fixed in IGC 2.40, so older IGC still computes garbage here; C63 keeps the block on Linux until you opt in. The PR's validation line reads "Arc A770 / dg2_g11", but `dg2_g11` is the ACM-G11 die of the A380/A310 and an A770 is ACM-G10, so the card name or the label is wrong; only your own run counts | `GGML_SYCL_FA_ONEDNN=0` (all oneDNN FA); with C63, off on Linux unless `GGML_SYCL_FA_ONEDNN_DG2_HD64=1` |
+| C63 | local, on C62 | Keeps C62's head_dim 64 path behind `GGML_SYCL_FA_ONEDNN_DG2_HD64` outside Windows | oneDNN#5510 reproduced the wrong results on an A770 and an A750 under Ubuntu 24.04 with Level Zero 1.15.38646 (NMSE 0.17, head_dim 64 the only failing size); the fix is in IGC 2.40, which llama.cpp cannot detect. Without C63, applying the candidates on such a driver silently breaks attention for every head-dim-64 model that takes the oneDNN path | `GGML_SYCL_FA_ONEDNN_DG2_HD64=1` turns C62's path on |
+| C70 | PR 31379 (draft), re-anchored on carried PR 31355 and local 0015 | The gated delta net reads its recurrent state through the GET_ROWS ids instead of from a gathered copy | Qwen3.5 / Qwen3-Next decode: one state copy fewer per delta-net layer per token. Single-sequence batches only. arthw on an A770 (upstream + 31379, Qwen3.5-0.8B Q4_K_M): tg128 +2.6% with FA off, +3.3% with FA on, pp512 unchanged | `GGML_SYCL_GDN_STATE_GATHER=0` |
 | C75 | PR 31313 (draft, "WIP K1"), without its fused-gemm.cpp dedup | Vector and joint_matrix kernels for the lightning indexer | DeepSeek-V3.2-style sparse attention, decode (vector kernel) and batches of 8+ (XMX, sub-group-8 8x8x16 on DG2). Off by default | `GGML_SYCL_LIGHTNING_INDEXER=1` turns it on |
 | C76 | local, on C75 | 256 registers for C75's vector kernel on ACM-G10/G11/G12 | At 128 that kernel spills 1.6-1.8 KB per thread on DG2; at 256 it does not | none (only with C75 on) |
 | C90 | local | `GGML_SYCL_DG2_BMG_TUNING` bit mask that opens five Battlemage-only kernel choices to DG2 | Each choice is between kernels already built for every device, so only speed can change | `GGML_SYCL_DG2_BMG_TUNING=0` (default) |
@@ -97,19 +98,22 @@ The last line is C40 on q8_0 decode, to compare with the `dpas=1 q8_0` rows.
 C62, C70 and C75 / C76 (added 2026-11-03), correctness on the card:
 
 ```bash
-ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build_sycl/bin/test-backend-ops -b SYCL0 -o FLASH_ATTN_EXT -p 'hsk=64'
+ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_FA_ONEDNN_DG2_HD64=1 ./build_sycl/bin/test-backend-ops -b SYCL0 -o FLASH_ATTN_EXT -p 'hsk=64'
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build_sycl/bin/test-backend-ops -b SYCL0 -o GATED_DELTA_NET_GATHER
 ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_LIGHTNING_INDEXER=1 ./build_sycl/bin/test-backend-ops -b SYCL0 -o LIGHTNING_INDEXER
 ```
 
-On Linux, check the driver before trusting C62 (`GGML_SYCL_FA_ONEDNN=0` is the old behaviour).
-`sycl-ls` prints the Level Zero driver version in brackets; the PR calls 1.15.38646 bad and
-1.14.37435 good, with the fix in IGC 2.40 (`dpkg -l | grep -i igc` on Debian / Ubuntu). Then
-speed: C62 on prompts of a head-dim-64 model, C70 on decode of a Qwen3.5 or Qwen3-Next model:
+The first command sets `GGML_SYCL_FA_ONEDNN_DG2_HD64=1` because C63 keeps C62's path off on Linux.
+`ONEDNN_VERBOSE=1` shows `sdp_primitive_kernel_t` when a case takes the oneDNN path. If it fails,
+your IGC predates 2.40: leave the switch at 0. `sycl-ls` prints the Level Zero driver
+version in brackets (oneDNN#5510 failed on 1.15.38646 and passed on 1.14.37435), and
+`dpkg -l | grep -i igc` shows the IGC package on Debian / Ubuntu. Then speed: C62 on prompts of a
+head-dim-64 model, C70 on decode of a Qwen3.5 or Qwen3-Next model, C75 on its op:
 
 ```bash
-for o in 0 1; do GGML_SYCL_FA_ONEDNN=$o ./build_sycl/bin/llama-bench -m HD64_MODEL -fa 1 -p 2048,4096 -n 0 -r 3; done
+for o in 0 1; do GGML_SYCL_FA_ONEDNN_DG2_HD64=$o ./build_sycl/bin/llama-bench -m HD64_MODEL -fa 1 -p 2048,4096 -n 0 -r 3; done
 for g in 0 1; do GGML_SYCL_GDN_STATE_GATHER=$g ./build_sycl/bin/llama-bench -m QWEN35_MODEL -p 0 -n 128 -r 3; done
+for li in 0 1; do GGML_SYCL_LIGHTNING_INDEXER=$li ./build_sycl/bin/test-backend-ops perf -b SYCL0 -o LIGHTNING_INDEXER; done
 ```
 
 Promote a candidate when its tests pass and it wins at the depths you use. A tuning bit that
@@ -130,12 +134,16 @@ file (plus the carried PR it sits on):
 | 31313 | C75 | the `fused-gemm.cpp` dedup and its two doc lines, as the C75 header says |
 | 31428 | PR-30156 + C20 | none |
 
-From the PR threads: arthw, who reviews the SYCL backend, measured 31428 on an A770 with no gain,
-which is expected because C20 alone runs only the sub-group-16 shape; cwriter answered with the
-8x8 branch that C21 carries. arthw's A770 run of 31313 used a 27B model, which has no lightning
-indexer, so it measured nothing; cwriter suggests
-`test-backend-ops perf -o LIGHTNING_INDEXER -b SYCL0` with the switch at 0 and 1. 31574 has no
-review yet.
+Review comments on those PRs, and what was done here:
+
+| PR | Comment | Here |
+|----|---------|------|
+| 31428 | arthw: upstream drops `-ze-intel-greater-than-4GB-buffer-required` from AOT builds for a known issue; can it be used with AOT, and where is `-Xs`? | C20 is right as is. With oneAPI 2026.2 for `acm-g10`, the bare `-Xs` form fails the AOT link (`Invalid option`), which is why PR 22147 skipped the flag; inside `-options`, as C20 passes it, it builds. And it matters: without it `getrows.cpp` compiles to 32-bit offsets from bindless surfaces (673 `a32` accesses), with it to 64-bit addresses (716 `a64`). So an upstream AOT build addresses at most 4 GB from the start of each buffer; a JIT build gets the flag through `-Xs`. |
+| 31428 | arthw: keep an informational CMake message near `GGML_SYCL_WARP_SIZE=16` (most likely the "Skipping ..." line C20 removes, which C20 makes untrue); rename `_ggml_sycl_aot_backend`, `gg_*` / `GG_*`, `ggml_sycl_mul_mat_id_mmvq_ok`, `..._grouped_shape_ok`, `node_is_device_local` | Not changed: build messages and names only, no effect on the A770. cwriter agreed to the first rename; the next refresh picks up whatever lands. |
+| 31428 | arthw: no gain on an A770 | Expected: C20 alone runs only the sub-group-16 shape. cwriter answered with the 8x8 branch that C21 carries. |
+| 31379 | arthw: say in the docs which models gain; move the matcher out of `ggml-sycl.cpp` | Both done in the carried commit `7f72c2a5` (the row names Qwen3.5 / Qwen3-Next; the matcher is in `gated_delta_net.cpp`). arthw's A770 numbers are in the C70 row. |
+| 31313 | arthw: no gain on an A770 | The 27B model used has no lightning indexer, so nothing was measured; cwriter's perf command is in the test plan. |
+| 31574 | no review; a bot flags the PR template | The issue the PR cites, oneDNN#5510, shows the A770 itself computing head_dim 64 wrongly under Ubuntu 24.04 with Level Zero 1.15.38646: C63. |
 
 ## Build status of this group (2026-11-01)
 
