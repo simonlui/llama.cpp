@@ -1,0 +1,1046 @@
+{
+ "defaults": {
+  "bin": "${AB_BUILD}/bin/llama-bench",
+  "env": {
+   "ONEAPI_DEVICE_SELECTOR": "level_zero:0",
+   "SYCL_CACHE_PERSISTENT": "1"
+  },
+  "rounds": 4,
+  "reps": 3,
+  "cooldown": 5,
+  "guard_wait": 60,
+  "kld_args": "-c 512 --chunks 40 -fa on"
+ },
+ "experiments": [
+  {
+   "name": "stack-vs-upstream-dense",
+   "tier": 0,
+   "patch": "whole stack",
+   "model": "$AB_Q4_K",
+   "args": "-fa 1 -p 512 -n 128",
+   "a": {
+    "bin": "${AB_BUILD_UPSTREAM}/bin/llama-bench"
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "Does the stack as a whole beat upstream on a dense model? B is the stack, A pristine upstream."
+  },
+  {
+   "name": "stack-vs-upstream-moe",
+   "tier": 0,
+   "patch": "whole stack",
+   "model": "$AB_GPT_OSS",
+   "args": "-fa 1 -p 512 -n 128",
+   "a": {
+    "bin": "${AB_BUILD_UPSTREAM}/bin/llama-bench"
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "The same on a MoE model."
+  },
+  {
+   "name": "jit-vs-aot",
+   "tier": 0,
+   "patch": "build",
+   "model": "$AB_Q4_K",
+   "args": "-fa 1 -p 512 -n 128",
+   "a": {
+    "bin": "${AB_BUILD_AOT}/bin/llama-bench"
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "JIT (B) against an acm-g10 AOT build (A), which drops grf_size<256> from the ESIMD kernels. Pick the build for everything below."
+  },
+  {
+   "name": "jit-vs-aot-moe",
+   "tier": 0,
+   "patch": "build",
+   "model": "$AB_MOE_K",
+   "args": "-fa 1 -p 512 -n 128",
+   "a": {
+    "bin": "${AB_BUILD_AOT}/bin/llama-bench"
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "The same where C20/C21's ESIMD MoE GEMM runs."
+  },
+  {
+   "name": "graph-replay",
+   "tier": 0,
+   "patch": "runtime",
+   "model": "$AB_Q4_K",
+   "args": "-fa 1 -p 0 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_ENABLE_GRAPH": "0"
+    }
+   },
+   "b": {
+    "env": {
+     "GGML_SYCL_ENABLE_GRAPH": "1"
+    }
+   },
+   "decides": "SYCL graph replay for decode. Run everything below with the winner."
+  },
+  {
+   "name": "graph-replay-moe",
+   "tier": 0,
+   "patch": "runtime",
+   "model": "$AB_GPT_OSS",
+   "args": "-fa 1 -p 0 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_ENABLE_GRAPH": "0"
+    }
+   },
+   "b": {
+    "env": {
+     "GGML_SYCL_ENABLE_GRAPH": "1"
+    }
+   },
+   "decides": "The same on a MoE model (a MUL_MAT_ID that waits on the host turns graphs off)."
+  },
+  {
+   "name": "local-all-q4_k",
+   "tier": 0,
+   "patch": "ZZ-LOCAL-0003..0016",
+   "model": "$AB_Q4_K",
+   "args": "-fa 1 -p 512 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "all"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "All local patches together on a dense k-quant model. No effect here: skip their tier 1 rows on this model.",
+   "kld": {
+    "args": "-c 512 --chunks 40 -fa on"
+   }
+  },
+  {
+   "name": "local-all-q4_0",
+   "tier": 0,
+   "patch": "ZZ-LOCAL-0003..0016",
+   "model": "$AB_Q4_0",
+   "args": "-fa 1 -p 512 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "all"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "The same on dense q4_0."
+  },
+  {
+   "name": "local-all-qk-norm",
+   "tier": 0,
+   "patch": "ZZ-LOCAL-0003..0016",
+   "model": "$AB_QK_NORM",
+   "args": "-fa 1 -p 512 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "all"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "The same on a Q/K-norm model."
+  },
+  {
+   "name": "local-all-moe",
+   "tier": 0,
+   "patch": "ZZ-LOCAL-0003..0016",
+   "model": "$AB_GPT_OSS",
+   "args": "-fa 1 -p 512 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "all"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "The same on gpt-oss."
+  },
+  {
+   "name": "0013-mul-mat-add-q4_k",
+   "tier": 1,
+   "patch": "ZZ-LOCAL-0013",
+   "model": "$AB_Q4_K",
+   "args": "-fa 1 -p 0 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "mul_mat_add"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "MUL_MAT + ADD in the ESIMD DMMV store (q4_K / q5_K / q6_K / q8_0 decode on the A770)."
+  },
+  {
+   "name": "0013-mul-mat-add-q4_0",
+   "tier": 1,
+   "patch": "ZZ-LOCAL-0013 + 0016",
+   "model": "$AB_Q4_0",
+   "args": "-fa 1 -p 0 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "mul_mat_add"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "MUL_MAT + ADD with q4_0, which the A770 decodes through the reorder MMVQ: 0013 and 0016 together."
+  },
+  {
+   "name": "0016-mmvq-add",
+   "tier": 1,
+   "patch": "ZZ-LOCAL-0016",
+   "model": "$AB_Q4_0",
+   "args": "-fa 1 -p 0 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "mmvq_add"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "0016 alone: the MMVQ epilogue against 0013's in-place ADD."
+  },
+  {
+   "name": "0014-act-reuse-q4_k",
+   "tier": 1,
+   "patch": "ZZ-LOCAL-0014",
+   "model": "$AB_Q4_K",
+   "args": "-fa 1 -p 0 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "act_reuse"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "Q / K / V and gate / up share one converted activation."
+  },
+  {
+   "name": "0014-act-reuse-q4_0",
+   "tier": 1,
+   "patch": "ZZ-LOCAL-0014",
+   "model": "$AB_Q4_0",
+   "args": "-fa 1 -p 0 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "act_reuse"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "The same on q4_0 (q8_1 activation)."
+  },
+  {
+   "name": "0011-rope-set-rows",
+   "tier": 1,
+   "patch": "ZZ-LOCAL-0011",
+   "model": "$AB_Q4_K",
+   "args": "-fa 1 -p 0 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "rope_set_rows"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "K rope written straight into the KV cache."
+  },
+  {
+   "name": "0011-norm-rope",
+   "tier": 1,
+   "patch": "ZZ-LOCAL-0011",
+   "model": "$AB_QK_NORM",
+   "args": "-fa 1 -p 0 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "norm_rope"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "RMS_NORM + MUL + ROPE of the Q / K norms."
+  },
+  {
+   "name": "0011-moe-sum",
+   "tier": 1,
+   "patch": "ZZ-LOCAL-0011",
+   "model": "$AB_MOE_Q4_0",
+   "args": "-fa 1 -p 0 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "moe_sum"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "The MoE expert sum in one launch."
+  },
+  {
+   "name": "0011-moe-sum-gpt-oss",
+   "tier": 1,
+   "patch": "ZZ-LOCAL-0011",
+   "model": "$AB_GPT_OSS",
+   "args": "-fa 1 -p 0 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "moe_sum"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "The same on gpt-oss."
+  },
+  {
+   "name": "0012-moe-glu-fuse",
+   "tier": 1,
+   "patch": "ZZ-LOCAL-0012",
+   "model": "$AB_MOE_Q4_0",
+   "args": "-fa 1 -p 0 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "moe_mmvq_fuse"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "MUL_MAT_ID gate + up + GLU in one launch."
+  },
+  {
+   "name": "0012-moe-glu-fuse-gpt-oss",
+   "tier": 1,
+   "patch": "ZZ-LOCAL-0012",
+   "model": "$AB_GPT_OSS",
+   "args": "-fa 1 -p 0 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "moe_mmvq_fuse"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "The same with gpt-oss's SWIGLU_OAI and ADD_ID biases."
+  },
+  {
+   "name": "0012-moe-tokens",
+   "tier": 1,
+   "patch": "ZZ-LOCAL-0012",
+   "model": "$AB_MOE_Q4_0",
+   "args": "-fa 1 -p 2,4,8 -n 0",
+   "a": {
+    "env": {
+     "GGML_SYCL_MMID_MMVQ_MAX_TOKENS": "1"
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "2..8-token MoE batches (speculative-decoding verify) on the MoE MMVQ instead of the grouped GEMM.",
+   "rounds": 6
+  },
+  {
+   "name": "0012-moe-tokens-gpt-oss",
+   "tier": 1,
+   "patch": "ZZ-LOCAL-0012",
+   "model": "$AB_GPT_OSS",
+   "args": "-fa 1 -p 2,4,8 -n 0",
+   "a": {
+    "env": {
+     "GGML_SYCL_MMID_MMVQ_MAX_TOKENS": "1"
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "The same on gpt-oss (MXFP4 cap 8).",
+   "rounds": 6
+  },
+  {
+   "name": "0004-moe-reorder-q4_0",
+   "tier": 1,
+   "patch": "ZZ-LOCAL-0004",
+   "model": "$AB_MOE_Q4_0",
+   "args": "-fa 1 -p 512 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "moe_reorder"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "Per-expert reorder of q4_0 experts."
+  },
+  {
+   "name": "0004-moe-reorder-k",
+   "tier": 1,
+   "patch": "ZZ-LOCAL-0004",
+   "model": "$AB_MOE_K",
+   "args": "-fa 1 -p 512 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "moe_reorder"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "Per-expert reorder of q2_K / q3_K experts."
+  },
+  {
+   "name": "0008-moe-reorder-iq",
+   "tier": 1,
+   "patch": "ZZ-LOCAL-0007 + 0008",
+   "model": "$AB_MOE_IQ",
+   "args": "-fa 1 -p 512 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "moe_reorder"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "Per-expert reorder of iq3 / iq4_nl experts."
+  },
+  {
+   "name": "0007-iq4_nl-reorder",
+   "tier": 1,
+   "patch": "ZZ-LOCAL-0007",
+   "model": "$AB_IQ4_NL",
+   "args": "-fa 1 -p 512 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "iq4_nl_reorder"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "Dense iq4_nl reorder."
+  },
+  {
+   "name": "0003-iq-ncols",
+   "tier": 1,
+   "patch": "ZZ-LOCAL-0003",
+   "model": "$AB_IQ2",
+   "args": "-fa 1 -p 2,4,8 -n 0",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "iq_ncols"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "2..8-column MMVQ for IQ1 / IQ2 / IQ4_NL instead of one launch per column.",
+   "rounds": 6
+  },
+  {
+   "name": "0010-glu-one-row",
+   "tier": 1,
+   "patch": "ZZ-LOCAL-0010",
+   "model": "$AB_Q4_K",
+   "args": "-fa 1 -p 2,3,4 -n 0",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "dg2_glu_one_row"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "One row a sub-group in the q4_K gate + up MMVQ (no spills) against the paired, spilling variants.",
+   "rounds": 6
+  },
+  {
+   "name": "0017-grf256-moe",
+   "tier": 1,
+   "patch": "ZZ-LOCAL-0017 (opt-in)",
+   "model": "$AB_MOE_IQ",
+   "args": "-fa 1 -p 512 -n 0",
+   "a": {
+    "env": {
+     "GGML_SYCL_XMX_GRF256": "0"
+    }
+   },
+   "b": {
+    "env": {
+     "GGML_SYCL_XMX_GRF256": "1"
+    }
+   },
+   "decides": "B turns the 16-row 256-register XMX dequant GEMM tile on. WIN: make it the default.",
+   "kld": {
+    "args": "-c 512 --chunks 40 -fa on"
+   }
+  },
+  {
+   "name": "0017-grf256-dense",
+   "tier": 1,
+   "patch": "ZZ-LOCAL-0017 (opt-in)",
+   "model": "$AB_IQ4_XS",
+   "args": "-fa 1 -p 16,32,64 -n 0",
+   "a": {
+    "env": {
+     "GGML_SYCL_XMX_GRF256": "0"
+    }
+   },
+   "b": {
+    "env": {
+     "GGML_SYCL_XMX_GRF256": "1"
+    }
+   },
+   "decides": "The same on dense i-quant batches of up to 64 tokens."
+  },
+  {
+   "name": "C10-iq4_xs-reorder",
+   "tier": 1,
+   "patch": "C10",
+   "model": "$AB_IQ4_XS",
+   "args": "-fa 1 -p 2,4,8 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "iq4_xs_reorder"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "Reordered iq4_xs MMVQ, 1..8 columns."
+  },
+  {
+   "name": "C20-C21-esimd-moe-k",
+   "tier": 1,
+   "patch": "C20 + C21",
+   "model": "$AB_MOE_K",
+   "args": "-fa 1 -p 512 -n 0",
+   "a": {
+    "env": {
+     "GGML_SYCL_MMID_ESIMD": "0"
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "ESIMD grouped MoE GEMM (8-wide DPAS on DG2) against the joint_matrix one, k-quant experts.",
+   "kld": {
+    "args": "-c 512 --chunks 40 -fa on"
+   }
+  },
+  {
+   "name": "C20-C21-esimd-moe-iq",
+   "tier": 1,
+   "patch": "C20 + C21",
+   "model": "$AB_MOE_IQ",
+   "args": "-fa 1 -p 512 -n 0",
+   "a": {
+    "env": {
+     "GGML_SYCL_MMID_ESIMD": "0"
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "The same, i-quant experts."
+  },
+  {
+   "name": "C40-vs-vec",
+   "tier": 1,
+   "patch": "C40",
+   "model": "$AB_Q4_K",
+   "args": "-fa 1 -ctk q8_0 -ctv q8_0 -p 0 -n 128 -d 0,4096,16384",
+   "a": {
+    "env": {
+     "GGML_SYCL_FA_DPAS": "0",
+     "GGML_SYCL_FA_GQA_DEC": "0"
+    }
+   },
+   "b": {
+    "env": {
+     "GGML_SYCL_FA_DPAS": "0"
+    }
+   },
+   "decides": "GQA flash-decode against VEC, q8_0 KV.",
+   "kld": {
+    "args": "-c 8192 --chunks 3 -fa on -ctk q8_0 -ctv q8_0"
+   }
+  },
+  {
+   "name": "C40-vs-C60",
+   "tier": 1,
+   "patch": "C40 / C60",
+   "model": "$AB_Q4_K",
+   "args": "-fa 1 -ctk q8_0 -ctv q8_0 -p 0 -n 128 -d 0,4096,16384",
+   "a": {
+    "env": {
+     "GGML_SYCL_FA_GQA_DEC": "0"
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "Which of the two takes q8_0 decode: A is C60, B is C40."
+  },
+  {
+   "name": "C60-q4_0-kv",
+   "tier": 1,
+   "patch": "C60",
+   "model": "$AB_Q4_K",
+   "args": "-fa 1 -ctk q4_0 -ctv q4_0 -p 0 -n 128 -d 0,4096,16384",
+   "a": {
+    "env": {
+     "GGML_SYCL_FA_GQA_DEC": "0",
+     "GGML_SYCL_FA_DPAS": "0"
+    }
+   },
+   "b": {
+    "env": {
+     "GGML_SYCL_FA_GQA_DEC": "0"
+    }
+   },
+   "decides": "Sub-group-8 DPAS flash attention against VEC, q4_0 KV decode.",
+   "kld": {
+    "args": "-c 8192 --chunks 3 -fa on -ctk q4_0 -ctv q4_0"
+   }
+  },
+  {
+   "name": "C60-q4_0-verify",
+   "tier": 1,
+   "patch": "C60",
+   "model": "$AB_Q4_K",
+   "args": "-fa 1 -ctk q4_0 -ctv q4_0 -p 16 -ub 16 -n 0 -d 0,4096,16384",
+   "a": {
+    "env": {
+     "GGML_SYCL_FA_GQA_DEC": "0",
+     "GGML_SYCL_FA_DPAS": "0"
+    }
+   },
+   "b": {
+    "env": {
+     "GGML_SYCL_FA_GQA_DEC": "0"
+    }
+   },
+   "decides": "The same for 16-token batches (speculative verify)."
+  },
+  {
+   "name": "C60-q8_0-kv",
+   "tier": 1,
+   "patch": "C60",
+   "model": "$AB_Q4_K",
+   "args": "-fa 1 -ctk q8_0 -ctv q8_0 -p 0 -n 128 -d 0,4096,16384",
+   "a": {
+    "env": {
+     "GGML_SYCL_FA_GQA_DEC": "0",
+     "GGML_SYCL_FA_DPAS": "0"
+    }
+   },
+   "b": {
+    "env": {
+     "GGML_SYCL_FA_GQA_DEC": "0"
+    }
+   },
+   "decides": "The same, q8_0 KV."
+  },
+  {
+   "name": "C62-onednn-hd64",
+   "tier": 1,
+   "patch": "C62 + C63",
+   "model": "$AB_HD64",
+   "args": "-fa 1 -p 2048,4096 -n 0",
+   "a": {
+    "env": {
+     "GGML_SYCL_FA_ONEDNN_DG2_HD64": "0"
+    }
+   },
+   "b": {
+    "env": {
+     "GGML_SYCL_FA_ONEDNN_DG2_HD64": "1"
+    }
+   },
+   "decides": "oneDNN fused SDPA for head_dim 64 prompts. Only after its test-backend-ops case passes (IGC 2.40+).",
+   "kld": {
+    "args": "-c 2048 --chunks 10 -fa on"
+   }
+  },
+  {
+   "name": "C70-gdn-gather",
+   "tier": 1,
+   "patch": "C70",
+   "model": "$AB_QWEN35",
+   "args": "-fa 1 -p 0 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_GDN_STATE_GATHER": "0"
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "Delta-net state read through the GET_ROWS ids."
+  },
+  {
+   "name": "C80-woq-q8_0",
+   "tier": 1,
+   "patch": "C80",
+   "model": "$AB_Q8_0",
+   "args": "-fa 1 -p 512,2048 -n 0",
+   "a": {
+    "env": {
+     "GGML_SYCL_WOQ_Q8_0": "0"
+    }
+   },
+   "b": {
+    "env": {
+     "GGML_SYCL_WOQ_Q8_0": "1"
+    }
+   },
+   "decides": "oneDNN weight-only Q8_0 GEMM for prompt batches over 64 tokens. Run tools/woq-q8_0-probe first.",
+   "kld": {
+    "args": "-c 512 --chunks 40 -fa on"
+   }
+  },
+  {
+   "name": "C80-woq-q8_0-small",
+   "tier": 1,
+   "patch": "C80",
+   "model": "$AB_Q8_0",
+   "args": "-fa 1 -p 16,32,64 -n 0",
+   "a": {
+    "env": {
+     "GGML_SYCL_WOQ_Q8_0": "1"
+    }
+   },
+   "b": {
+    "env": {
+     "GGML_SYCL_WOQ_Q8_0": "2"
+    }
+   },
+   "decides": "Mode 2 against mode 1: the weight-only GEMM against the fused XMX GEMM for 9..64 tokens."
+  },
+  {
+   "name": "C90-bit1-qkv-tile",
+   "tier": 1,
+   "patch": "C90 bit 1",
+   "model": "$AB_Q4_K",
+   "args": "-fa 1 -ctk q8_0 -ctv q8_0 -p 0 -n 128 -d 0,4096,16384",
+   "a": {
+    "env": {
+     "GGML_SYCL_FA_DPAS": "0",
+     "GGML_SYCL_FA_GQA_DEC": "0",
+     "GGML_SYCL_DG2_BMG_TUNING": "0"
+    }
+   },
+   "b": {
+    "env": {
+     "GGML_SYCL_FA_DPAS": "0",
+     "GGML_SYCL_FA_GQA_DEC": "0",
+     "GGML_SYCL_DG2_BMG_TUNING": "1"
+    }
+   },
+   "decides": "Quantized-KV decode on TILE instead of VEC."
+  },
+  {
+   "name": "C90-bit2-vec-256",
+   "tier": 1,
+   "patch": "C90 bit 2",
+   "model": "$AB_Q4_K",
+   "args": "-fa 1 -p 0 -n 128 -d 0,4096,16384",
+   "a": {
+    "env": {
+     "GGML_SYCL_FA_GQA_DEC": "0",
+     "GGML_SYCL_DG2_BMG_TUNING": "0"
+    }
+   },
+   "b": {
+    "env": {
+     "GGML_SYCL_FA_GQA_DEC": "0",
+     "GGML_SYCL_DG2_BMG_TUNING": "2"
+    }
+   },
+   "decides": "FA VEC with 256-thread work-groups, f16 KV."
+  },
+  {
+   "name": "C90-bit4-q5_k",
+   "tier": 1,
+   "patch": "C90 bit 4",
+   "model": "$AB_Q5_K",
+   "args": "-fa 1 -p 2,4,8 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_DG2_BMG_TUNING": "0"
+    }
+   },
+   "b": {
+    "env": {
+     "GGML_SYCL_DG2_BMG_TUNING": "4"
+    }
+   },
+   "decides": "q5_K multi-column weight reuse."
+  },
+  {
+   "name": "C90-bit8-d256",
+   "tier": 1,
+   "patch": "C90 bit 8",
+   "model": "$AB_HD256",
+   "args": "-fa 1 -p 0 -n 128 -d 0,4096",
+   "a": {
+    "env": {
+     "GGML_SYCL_FA_DPAS": "0",
+     "GGML_SYCL_FA_GQA_DEC": "0",
+     "GGML_SYCL_DG2_BMG_TUNING": "0"
+    }
+   },
+   "b": {
+    "env": {
+     "GGML_SYCL_FA_DPAS": "0",
+     "GGML_SYCL_FA_GQA_DEC": "0",
+     "GGML_SYCL_DG2_BMG_TUNING": "8"
+    }
+   },
+   "decides": "D=256 single-query decode on VEC (PR 30606's route)."
+  },
+  {
+   "name": "C30-C90-bit16",
+   "tier": 1,
+   "patch": "C30 + C90 bit 16",
+   "model": "$AB_Q4_K",
+   "args": "-fa 1 -p 5,6,7,8 -n 0",
+   "a": {
+    "env": {
+     "GGML_SYCL_DG2_BMG_TUNING": "0"
+    }
+   },
+   "b": {
+    "env": {
+     "GGML_SYCL_DG2_BMG_TUNING": "16"
+    }
+   },
+   "decides": "q4_K MMVQ row pairing at 5..8 columns.",
+   "rounds": 6
+  },
+  {
+   "name": "PR-30156-mmid-sched",
+   "tier": 2,
+   "patch": "PR-30156",
+   "model": "$AB_MOE_Q4_0",
+   "args": "-fa 1 -p 512 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_MMID_SCHED": "0"
+    }
+   },
+   "b": {
+    "env": {
+     "GGML_SYCL_MMID_SCHED": "1"
+    }
+   },
+   "decides": "Device-side MoE scheduler against the host one."
+  },
+  {
+   "name": "PR-31536-31542-mkl-fa-gpt-oss",
+   "tier": 2,
+   "patch": "PR-31536 + PR-31542",
+   "model": "$AB_GPT_OSS",
+   "args": "-fa 1 -p 512 -n 128 -d 0,4096",
+   "a": {
+    "env": {
+     "GGML_SYCL_ENABLE_MKL_FA": "0"
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "oneMKL FA, which 31542 opens to attention sinks, against the next FA kernel."
+  },
+  {
+   "name": "PR-31536-mkl-fa-dense",
+   "tier": 2,
+   "patch": "PR-31536",
+   "model": "$AB_Q4_K",
+   "args": "-fa 1 -p 512 -n 128 -d 0,4096",
+   "a": {
+    "env": {
+     "GGML_SYCL_ENABLE_MKL_FA": "0"
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "oneMKL FA with a broadcast mask on a dense model."
+  },
+  {
+   "name": "0011-multi-add",
+   "tier": 2,
+   "patch": "ZZ-LOCAL-0011",
+   "model": "$AB_MOE_Q4_0",
+   "args": "-fa 1 -p 0 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "multi_add"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "Chains of 3..8 ADDs."
+  },
+  {
+   "name": "0011-topk-moe-ext",
+   "tier": 2,
+   "patch": "ZZ-LOCAL-0011 + 0015",
+   "model": "$AB_MOE_BIAS",
+   "args": "-fa 1 -p 0 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "topk_moe_ext"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "topk-moe with a routing bias / expert groups (DeepSeek-V3-style routers)."
+  },
+  {
+   "name": "0015-softcap",
+   "tier": 2,
+   "patch": "ZZ-LOCAL-0015",
+   "model": "$AB_GEMMA2",
+   "args": "-fa 1 -p 0 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "model_fusions"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "Logit softcap in one kernel."
+  },
+  {
+   "name": "0015-relu2",
+   "tier": 2,
+   "patch": "ZZ-LOCAL-0015",
+   "model": "$AB_RELU2",
+   "args": "-fa 1 -p 0 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "model_fusions"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "Squared ReLU in one kernel."
+  },
+  {
+   "name": "0015-ssm-cache",
+   "tier": 2,
+   "patch": "ZZ-LOCAL-0015",
+   "model": "$AB_MAMBA",
+   "args": "-fa 1 -p 0 -n 128",
+   "a": {
+    "env": {
+     "GGML_SYCL_LOCAL_OFF": [
+      "model_fusions"
+     ]
+    }
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "SSM_SCAN writing its state into the cache."
+  },
+  {
+   "name": "0016x-mmq-xmx",
+   "tier": 2,
+   "patch": "0016 (extracted)",
+   "model": "$AB_Q4_K",
+   "args": "-fa 1 -p 512 -n 0",
+   "a": {
+    "env": {}
+   },
+   "b": {
+    "bin": "${AB_BUILD_MMQ_XMX}/bin/llama-bench"
+   },
+   "decides": "The GGML_SYCL_MMQ_XMX=ON build (B) against the default build."
+  }
+ ]
+}

@@ -1,0 +1,331 @@
+Subject: [PATCH] sycl: GGML_SYCL_LOCAL_OFF, one off switch per local optimization
+
+Most local patches (ZZ-LOCAL-0003 to 0016) change a kernel choice or add a graph fusion with no way to
+turn it off but GGML_SYCL_ENABLE_FUSION=0 or GGML_SYCL_ENABLE_OPT=0, which also turn off upstream's
+fusions and reorders. They are stacked (0016 extends 0013's epilogue, 0012 and 0015 extend 0011's
+matchers), so a build without one of them would need regenerated patches, and a rebuild between the A and
+B runs of a benchmark adds build and thermal drift. GGML_SYCL_LOCAL_OFF=<decimal mask> turns them off one
+bit at a time in the same binary; a set bit restores the path the backend took before that patch:
+
+    1      0003  2..8-column MMVQ of IQ1 / IQ2 / IQ4_NL / IQ3_XXS in the block layout
+    2      0004, 0007, 0008  per-expert reorder of q4_0 / q2_K / q3_K / iq4_nl / iq3_xxs / iq3_s experts
+    4      0007  dense iq4_nl reorder
+    8      0010  gate + up MMVQ pairs rows on the A-series again (the spilling variants)
+    16     0011  ROPE + VIEW + SET_ROWS
+    32     0011  RMS_NORM + MUL + ROPE (+ VIEW + SET_ROWS)
+    64     0011  MoE weighted expert sum
+    128    0011  chains of 3..8 ADDs
+    256    0011, 0015  topk-moe with a routing bias, sqrt(softplus) gating or expert groups
+    512    0012  MUL_MAT_ID gate + up + GLU and the MUL_MAT_ID + ADD_ID epilogue
+    1024   0013  MUL_MAT + ADD (0016's MMVQ epilogue with it)
+    2048   0014  sibling mat-muls share the converted activation
+    4096   0015  softcap, relu^2, snake, the DSV4_HC_POST gate, SSM_SCAN writing the cache
+    8192   0016  the MMVQ add epilogue only (0013 then adds in place after the mat-vec)
+    16384  candidate C10's iq4_xs reorder (no effect without C10)
+
+0012's 2..8-token MoE MMVQ already has GGML_SYCL_MMID_MMVQ_MAX_TOKENS=1, 0017 is opt-in
+(GGML_SYCL_XMX_GRF256), and 0010's 8-row GEMM tile is a compile-time shape whose alternative is 0017's
+tile. The matchers that graph_optimize also calls (0012, 0013, 0011's expert sum) test their bit inside,
+so a disabled fusion also drops the allocation dependencies it adds. The default 0 changes nothing.
+
+diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
+index dd881fba..a8886ef5 100644
+--- a/ggml/src/ggml-sycl/common.hpp
++++ b/ggml/src/ggml-sycl/common.hpp
+@@ -78,6 +78,32 @@ extern int g_ggml_sycl_xmx_max_cols;
+ extern int g_ggml_sycl_xmx_glu_max_cols;
+ extern int g_ggml_sycl_prioritize_dmmv;
+ 
++// Off switches for the local patches (ZZ-LOCAL-*) that have none of their own, one bit each, so one build can
++// A/B every one of them: GGML_SYCL_LOCAL_OFF=<mask>, 0 (the default) keeps them all on. A set bit restores the
++// path the backend took before that patch.
++enum ggml_sycl_local_off_bit {
++    GGML_SYCL_LOCAL_OFF_IQ_NCOLS        = 1 << 0,   // 0003: 2..8-column MMVQ of IQ1 / IQ2 / IQ4_NL / IQ3_XXS (block layout)
++    GGML_SYCL_LOCAL_OFF_MOE_REORDER     = 1 << 1,   // 0004, 0007, 0008: per-expert reorder of q4_0 / q2_K / q3_K / iq4_nl / iq3
++    GGML_SYCL_LOCAL_OFF_IQ4_NL_REORDER  = 1 << 2,   // 0007: dense iq4_nl reorder
++    GGML_SYCL_LOCAL_OFF_DG2_GLU_ONE_ROW = 1 << 3,   // 0010: gate + up MMVQ pairs rows on the A-series again
++    GGML_SYCL_LOCAL_OFF_ROPE_SET_ROWS   = 1 << 4,   // 0011: ROPE + VIEW + SET_ROWS
++    GGML_SYCL_LOCAL_OFF_NORM_ROPE       = 1 << 5,   // 0011: RMS_NORM + MUL + ROPE (+ VIEW + SET_ROWS)
++    GGML_SYCL_LOCAL_OFF_MOE_SUM         = 1 << 6,   // 0011: MoE weighted expert sum
++    GGML_SYCL_LOCAL_OFF_MULTI_ADD       = 1 << 7,   // 0011: chains of 3..8 ADDs
++    GGML_SYCL_LOCAL_OFF_TOPK_MOE_EXT    = 1 << 8,   // 0011, 0015: topk-moe with a routing bias, sqrt(softplus) or groups
++    GGML_SYCL_LOCAL_OFF_MOE_MMVQ_FUSE   = 1 << 9,   // 0012: MUL_MAT_ID gate + up + GLU and the ADD_ID epilogue
++    GGML_SYCL_LOCAL_OFF_MUL_MAT_ADD     = 1 << 10,  // 0013 (and 0016): MUL_MAT + ADD
++    GGML_SYCL_LOCAL_OFF_ACT_REUSE       = 1 << 11,  // 0014: sibling mat-muls share the converted activation
++    GGML_SYCL_LOCAL_OFF_MODEL_FUSIONS   = 1 << 12,  // 0015: softcap, relu^2, snake, DSV4_HC_POST gate, SSM_SCAN cache
++    GGML_SYCL_LOCAL_OFF_MMVQ_ADD        = 1 << 13,  // 0016: the MMVQ add epilogue (0013's in-place ADD instead)
++    GGML_SYCL_LOCAL_OFF_IQ4_XS_REORDER  = 1 << 14,  // candidate C10: iq4_xs reorder
++};
++extern int g_ggml_sycl_local_off;
++
++static inline bool ggml_sycl_local_on(int bit) {
++    return (g_ggml_sycl_local_off & bit) == 0;
++}
++
+ // Which quantized weight formats may take the XMX dequant-GEMM paths. A bitmask rather than one
+ // flag per path, so a format can be enabled or measured on its own and adding a format is one bit.
+ enum ggml_sycl_xmx_gather_type {
+diff --git a/ggml/src/ggml-sycl/fusion.cpp b/ggml/src/ggml-sycl/fusion.cpp
+index 7e070f51..fd1913d7 100644
+--- a/ggml/src/ggml-sycl/fusion.cpp
++++ b/ggml/src/ggml-sycl/fusion.cpp
+@@ -196,7 +196,7 @@ static bool ggml_sycl_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
+ // MoE layer (ported from ggml_cuda_match_moe_weighted_reduction; the views and ADDs may interleave)
+ bool ggml_sycl_match_moe_weighted_reduction(const ggml_cgraph * cgraph, int node_idx,
+                                             ggml_sycl_moe_reduction_match & match) {
+-    if (!g_ggml_sycl_enable_fusion) {
++    if (!g_ggml_sycl_enable_fusion || !ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_MOE_SUM)) {
+         return false;
+     }
+     const ggml_tensor * first = cgraph->nodes[node_idx];
+@@ -397,7 +397,8 @@ static bool ggml_sycl_moe_glu_ok(const ggml_tensor * glu, const ggml_tensor * ga
+ 
+ bool ggml_sycl_match_moe_mmvq_fusion(const ggml_cgraph * cgraph, int i, ggml_sycl_moe_fusion_match & m) {
+     m = ggml_sycl_moe_fusion_match{};
+-    if (!g_ggml_sycl_enable_fusion || cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID) {
++    if (!g_ggml_sycl_enable_fusion || !ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_MOE_MMVQ_FUSE) ||
++        cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID) {
+         return false;
+     }
+     ggml_tensor ** nodes = cgraph->nodes;
+@@ -446,7 +447,8 @@ bool ggml_sycl_match_moe_mmvq_fusion(const ggml_cgraph * cgraph, int i, ggml_syc
+ // fold into their store (ported from the CUDA / Vulkan / Metal mul_mat + add fusions)
+ bool ggml_sycl_match_mul_mat_add(const ggml_cgraph * cgraph, int i) {
+     static const ggml_op ops[] = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+-    if (!g_ggml_sycl_enable_fusion || i + 1 >= cgraph->n_nodes || !ggml_can_fuse(cgraph, i, ops, 2)) {
++    if (!g_ggml_sycl_enable_fusion || !ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_MUL_MAT_ADD) || i + 1 >= cgraph->n_nodes ||
++        !ggml_can_fuse(cgraph, i, ops, 2)) {
+         return false;
+     }
+     const ggml_tensor * mm     = cgraph->nodes[i];
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index ebc00094..80fec5c4 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -123,6 +123,7 @@ int g_ggml_sycl_enable_xmx_esimd = 1;
+ int g_ggml_sycl_xmx_max_cols = GGML_SYCL_XMX_MAX_COLS_DEFAULT;
+ int g_ggml_sycl_xmx_glu_max_cols = GGML_SYCL_XMX_GLU_MAX_COLS;
+ int g_ggml_sycl_prioritize_dmmv = 0;
++int g_ggml_sycl_local_off = 0;
+ int g_ggml_sycl_xmx_gather_types = GGML_SYCL_XMX_GATHER_TYPES_DEFAULT;
+ int g_ggml_sycl_xmx_gather_shapes = GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT;
+ int g_ggml_sycl_mmid_sched = GGML_SYCL_MMID_SCHED_DEVICE;
+@@ -459,6 +460,7 @@ static void ggml_check_sycl() try {
+         g_ggml_sycl_xmx_glu_max_cols =
+             std::clamp(ggml_sycl_get_env("GGML_SYCL_XMX_GLU_MAX_COLS", GGML_SYCL_XMX_GLU_MAX_COLS), 0, GGML_SYCL_XMX_GLU_MAX_COLS);
+         g_ggml_sycl_prioritize_dmmv = ggml_sycl_get_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
++        g_ggml_sycl_local_off = ggml_sycl_get_env("GGML_SYCL_LOCAL_OFF", 0);
+         g_ggml_sycl_graph_eviction_timeout = ggml_sycl_get_env("GGML_SYCL_GRAPH_EVICTION_TIMEOUT", 10);
+         g_ggml_sycl_xmx_gather_types = ggml_sycl_get_env("GGML_SYCL_XMX_GATHER_TYPES", GGML_SYCL_XMX_GATHER_TYPES_DEFAULT);
+         g_ggml_sycl_mmid_sched = ggml_sycl_get_env("GGML_SYCL_MMID_SCHED", GGML_SYCL_MMID_SCHED_DEVICE) & 3;
+@@ -617,6 +619,7 @@ static void ggml_check_sycl() try {
+         GGML_LOG_INFO("  GGML_SYCL_XMX_GLU_MAX_COLS: %d\n", g_ggml_sycl_xmx_glu_max_cols);
+ 
+         GGML_LOG_INFO("  GGML_SYCL_PRIORITIZE_DMMV: %d\n", g_ggml_sycl_prioritize_dmmv);
++        GGML_LOG_INFO("  GGML_SYCL_LOCAL_OFF: %d\n", g_ggml_sycl_local_off);
+ 
+         g_ggml_sycl_use_async_mem_op_requested = ggml_sycl_get_env("GGML_SYCL_USE_ASYNC_MEM_OP", 1);
+         GGML_LOG_INFO("  GGML_SYCL_USE_ASYNC_MEM_OP: %d\n", g_ggml_sycl_use_async_mem_op_requested);
+@@ -5210,6 +5213,10 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
+     if (!extra || extra->optimized_feature.reorder) {
+         return;  // Skip permutations and already reordered tensors
+     }
++    if ((src0->type == GGML_TYPE_IQ4_NL && !ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_IQ4_NL_REORDER)) ||
++        (src0->type == GGML_TYPE_IQ4_XS && !ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_IQ4_XS_REORDER))) {
++        return;
++    }
+ 
+     switch (mm_algorithm) {
+         case mul_mat_algo::DMMV:
+@@ -5245,6 +5252,11 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
+         src0->type != GGML_TYPE_IQ4_NL && src0->type != GGML_TYPE_IQ3_XXS && src0->type != GGML_TYPE_IQ3_S) {
+         return;
+     }
++    if ((src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q3_K ||
++         src0->type == GGML_TYPE_IQ4_NL || src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ3_S) &&
++        !ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_MOE_REORDER)) {
++        return;
++    }
+     // Q4_0 / Q2_K / Q3_K / IQ4_NL / IQ3 experts take the 2D readers per slice, some with vector loads sized for a
+     // 2D tensor's aligned start: keep every slice 16-byte aligned, else stay in the block layout
+     if ((src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q3_K ||
+@@ -7105,7 +7117,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+         // the nodes run since the last check may have written the cached activation
+         ggml_sycl_src1_cache_check(sycl_ctx, cgraph, src1_cache_checked, i);
+         src1_cache_checked        = i;
+-        sycl_ctx->src1_cache_node = node;
++        sycl_ctx->src1_cache_node = ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_ACT_REUSE) ? node : nullptr;
+         if (ggml_sycl_is_view_or_noop(node)) {
+             continue;
+         }
+@@ -7145,7 +7157,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+         }
+ #endif
+         // ssm_scan -> cpy: the scan writes its state snapshots into the cache
+-        if (node->op == GGML_OP_SSM_SCAN) {
++        if (node->op == GGML_OP_SSM_SCAN && ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_MODEL_FUSIONS)) {
+             ggml_sycl_ssm_scan_fused_cache fused_state_cpy;
+             const int ssm_nodes_to_skip = ggml_sycl_try_ssm_scan_cache_fusion(cgraph, i, fused_state_cpy);
+             if (ssm_nodes_to_skip > 0) {
+@@ -7178,7 +7190,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+             }
+         }
+         // MUL -> SIN -> SQR -> MUL -> ADD: the snake activation
+-        if (node->op == GGML_OP_MUL) {
++        if (node->op == GGML_OP_MUL && ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_MODEL_FUSIONS)) {
+             const ggml_tensor * sx;
+             const ggml_tensor * sa;
+             const ggml_tensor * sb;
+@@ -7189,7 +7201,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+             }
+         }
+         // SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST: the gated post weights of qwen4exp's hc_combine
+-        if (node->op == GGML_OP_SCALE && i + 3 < cgraph->n_nodes &&
++        if (node->op == GGML_OP_SCALE && i + 3 < cgraph->n_nodes && ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_MODEL_FUSIONS) &&
+             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST },
+                                { GGML_UNARY_OP_SIGMOID })) {
+             ggml_sycl_op_dsv4_hc_post_gated(*sycl_ctx, cgraph->nodes[i + 3], node, cgraph->nodes[i + 2]);
+@@ -7197,21 +7209,21 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+             continue;
+         }
+         // SCALE -> TANH -> SCALE: the logit softcap
+-        if (node->op == GGML_OP_SCALE && i + 2 < cgraph->n_nodes &&
++        if (node->op == GGML_OP_SCALE && i + 2 < cgraph->n_nodes && ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_MODEL_FUSIONS) &&
+             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
+             ggml_sycl_op_softcap(*sycl_ctx, cgraph->nodes[i + 2], node);
+             i += 2;
+             continue;
+         }
+         // RELU -> SQR
+-        if (node->op == GGML_OP_UNARY && i + 1 < cgraph->n_nodes &&
++        if (node->op == GGML_OP_UNARY && i + 1 < cgraph->n_nodes && ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_MODEL_FUSIONS) &&
+             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_SQR }, { GGML_UNARY_OP_RELU })) {
+             ggml_sycl_op_relu_sqr(*sycl_ctx, node, cgraph->nodes[i + 1]);
+             i += 1;
+             continue;
+         }
+         // a chain of 3..8 ADDs (pairs keep the broadcasting ADD + ADD kernel below)
+-        if (node->op == GGML_OP_ADD) {
++        if (node->op == GGML_OP_ADD && ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_MULTI_ADD)) {
+             const int n_adds = ggml_sycl_match_multi_add(cgraph, i);
+             if (n_adds > 0) {
+                 ggml_sycl_op_multi_add(*sycl_ctx, cgraph->nodes + i, n_adds);
+@@ -7221,7 +7233,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+         }
+         // RMS_NORM + MUL + ROPE (+ VIEW + SET_ROWS): the Q / K norms of Qwen3, Gemma 3 and OLMo 2, K written
+         // straight into the KV cache
+-        if (node->op == GGML_OP_RMS_NORM && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 2]->op == GGML_OP_ROPE) {
++        if (node->op == GGML_OP_RMS_NORM && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 2]->op == GGML_OP_ROPE &&
++            ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_NORM_ROPE)) {
+             if (i + 4 < cgraph->n_nodes &&
+                 ggml_sycl_can_fuse(cgraph, i,
+                                    { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
+@@ -7238,7 +7251,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+             }
+         }
+         // ROPE + VIEW + SET_ROWS: rope K straight into the KV cache
+-        if (node->op == GGML_OP_ROPE && i + 2 < cgraph->n_nodes &&
++        if (node->op == GGML_OP_ROPE && i + 2 < cgraph->n_nodes && ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_ROPE_SET_ROWS) &&
+             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
+             ggml_sycl_rope_fused(*sycl_ctx, node, cgraph->nodes[i + 2]);
+             i += 2;
+diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+index 381ce9b2..0c54facf 100644
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -2382,7 +2382,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
+ #endif // GGML_SYCL_MMVQ_HAS_XMX
+ 
+     // a fused ADD (ggml_sycl_mul_mat_add_fused) on one column: the generic kernels add it in their store
+-    if (ctx.mmv_add != nullptr && src1_ncols == 1) {
++    if (ctx.mmv_add != nullptr && src1_ncols == 1 && ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_MMVQ_ADD)) {
+         const auto * extra     = (const ggml_tensor_extra_gpu *) dst->src[0]->extra;
+         const bool   reordered = extra && extra->optimized_feature.reorder;
+         if (ggml_sycl_mul_mat_vec_q_one_col_add(src0->type, reordered, src0_dd_i, src1_ddq_i, dst_dd_i,
+@@ -2668,7 +2668,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
+                 }
+                 break;
+             case GGML_TYPE_IQ1_S:
+-                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
++                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8 && ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_IQ_NCOLS)) {
+                     GGML_SYCL_DEBUG("Calling IQ1_S multi-col MMVQ ncols=%d\n", (int) src1_ncols);
+                     mul_mat_vec_iq_q8_1_sycl_multi_col<QK_K, QI1_S, block_iq1_s, 1, vec_dot_iq1_s_q8_1_moe>(
+                         src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_col_size / QK8_1,
+@@ -2678,7 +2678,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
+                 mul_mat_vec_iq1_s_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                 break;
+             case GGML_TYPE_IQ1_M:
+-                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
++                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8 && ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_IQ_NCOLS)) {
+                     GGML_SYCL_DEBUG("Calling IQ1_M multi-col MMVQ ncols=%d\n", (int) src1_ncols);
+                     mul_mat_vec_iq_q8_1_sycl_multi_col<QK_K, QI1_S, block_iq1_m, 1, vec_dot_iq1_m_q8_1>(
+                         src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_col_size / QK8_1,
+@@ -2688,7 +2688,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
+                 mul_mat_vec_iq1_m_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                 break;
+             case GGML_TYPE_IQ2_XXS:
+-                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
++                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8 && ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_IQ_NCOLS)) {
+                     GGML_SYCL_DEBUG("Calling IQ2_XXS multi-col MMVQ ncols=%d\n", (int) src1_ncols);
+                     mul_mat_vec_iq_q8_1_sycl_multi_col<QK_K, QI2_XXS / 2, block_iq2_xxs, 1, vec_dot_iq2_xxs_q8_1_moe>(
+                         src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_col_size / QK8_1,
+@@ -2698,7 +2698,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
+                 mul_mat_vec_iq2_xxs_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                 break;
+             case GGML_TYPE_IQ2_XS:
+-                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
++                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8 && ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_IQ_NCOLS)) {
+                     GGML_SYCL_DEBUG("Calling IQ2_XS multi-col MMVQ ncols=%d\n", (int) src1_ncols);
+                     mul_mat_vec_iq_q8_1_sycl_multi_col<QK_K, QI2_XS / 2, block_iq2_xs, 1, vec_dot_iq2_xs_q8_1_moe>(
+                         src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_col_size / QK8_1,
+@@ -2708,7 +2708,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
+                 mul_mat_vec_iq2_xs_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                 break;
+             case GGML_TYPE_IQ2_S:
+-                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
++                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8 && ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_IQ_NCOLS)) {
+                     GGML_SYCL_DEBUG("Calling IQ2_S multi-col MMVQ ncols=%d\n", (int) src1_ncols);
+                     mul_mat_vec_iq_q8_1_sycl_multi_col<QK_K, QI2_S / 2, block_iq2_s, 1, vec_dot_iq2_s_q8_1>(
+                         src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_col_size / QK8_1,
+@@ -2734,7 +2734,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
+                             src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                     }
+                 } else {
+-                    if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
++                    if (i == 0 && src1_ncols > 1 && src1_ncols <= 8 && ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_IQ_NCOLS)) {
+                         GGML_SYCL_DEBUG("Calling IQ3_XXS multi-col MMVQ ncols=%d\n", (int) src1_ncols);
+                         mul_mat_vec_iq_q8_1_sycl_multi_col<QK_K, QI3_XXS / 2, block_iq3_xxs, 1, vec_dot_iq3_xxs_q8_1_moe>(
+                             src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_col_size / QK8_1,
+@@ -2788,7 +2788,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
+                                                                        row_diff, stream);
+                     break;
+                 }
+-                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
++                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8 && ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_IQ_NCOLS)) {
+                     GGML_SYCL_DEBUG("Calling IQ4_NL multi-col MMVQ ncols=%d\n", (int) src1_ncols);
+                     mul_mat_vec_iq_q8_1_sycl_multi_col<QK4_NL, QI4_NL, block_iq4_nl, 2, vec_dot_iq4_nl_q8_1>(
+                         src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_col_size / QK8_1,
+@@ -3695,7 +3695,7 @@ bool ggml_sycl_mul_mat_vec_q_glu_plain(enum ggml_type gate_type, enum ggml_type
+ // The plain MMVQ's row pairing, one weight matrix, does not spill there and is left alone.
+ static bool ggml_sycl_glu_row_pair(int device) {
+     const gpu_arch arch = ggml_sycl_info().devices[device].hw_info.arch;
+-    return arch != gpu_arch::intel_gpu_acm_g10 && arch != gpu_arch::intel_gpu_acm_g11 &&
++    return !ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_DG2_GLU_ONE_ROW) || arch != gpu_arch::intel_gpu_acm_g10 && arch != gpu_arch::intel_gpu_acm_g11 &&
+            arch != gpu_arch::intel_gpu_acm_g12;
+ }
+ 
+diff --git a/ggml/src/ggml-sycl/topk-moe.cpp b/ggml/src/ggml-sycl/topk-moe.cpp
+index b8f50a41..24bf54bf 100644
+--- a/ggml/src/ggml-sycl/topk-moe.cpp
++++ b/ggml/src/ggml-sycl/topk-moe.cpp
+@@ -818,6 +818,10 @@ int ggml_sycl_fuse_topk_moe(ggml_backend_sycl_context & ctx, ggml_cgraph * cgrap
+     if (!ggml_sycl_topk_moe_fusion(cgraph, i, args)) {
+         return 0;
+     }
++    if ((args.prob_bias || args.sqrt_softplus || args.n_groups > 0) &&
++        !ggml_sycl_local_on(GGML_SYCL_LOCAL_OFF_TOPK_MOE_EXT)) {
++        return 0;
++    }
+ 
+     const ggml_tensor * logits  = node->src[0];
+     ggml_tensor *       weights = nullptr;

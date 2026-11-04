@@ -17,9 +17,10 @@ extractable as idiomatic backend code and is intentionally excluded — see
 Local work on top of the stack goes in the separate `ZZ-LOCAL-*` group in this
 directory: repairs the current upstream tree needs, and gap fills for quant types
 the carried PRs leave out. They are not folded into the numbered extracted
-history and remain independently reversible. Fifteen are active, `ZZ-LOCAL-0003` to
-`ZZ-LOCAL-0017` (see the patch index); 0011 to 0016 port graph fusions from the CUDA, Vulkan and Metal
-backends, and 0017 adds an opt-in 256-register GEMM tile for DG2. They apply in number order, and every candidate in
+history and remain independently reversible. Sixteen are active, `ZZ-LOCAL-0003` to
+`ZZ-LOCAL-0018` (see the patch index); 0011 to 0016 port graph fusions from the CUDA, Vulkan and Metal
+backends, 0017 adds an opt-in 256-register GEMM tile for DG2, and 0018 gives the others off switches for the
+A770 A/B runs in `../sycl-patches/ab/`. They apply in number order, and every candidate in
 `../sycl-patches-candidates/` applies on top of them with plain `git apply`.
 
 ## Patch index
@@ -43,6 +44,7 @@ backends, and 0017 adds an opt-in 256-register GEMM tile for DG2. They apply in 
 | ZZ-LOCAL-0015 | `ZZ-LOCAL-0015-sycl-fuse-model-specific.patch` | The rest of CUDA's model-specific fusions: logit softcap (SCALE + TANH + SCALE) and squared ReLU as one kernel each, the snake activation of the TTS audio decoders (MUL, SIN, SQR, MUL, ADD), SCALE + SIGMOID + SCALE folded into DSV4_HC_POST's post weights, SSM_SCAN writing its state snapshots straight into the cache (skipping the CPY), and topk-moe with sqrt(softplus) gating and DeepSeek-V3 expert-group masking (up to `WARP_SIZE` groups). Shared-expert fusion and multi-stream concurrency are not ported (see `SYCL_DEV_LOG.md`). | perf (port) |
 | ZZ-LOCAL-0016 | `ZZ-LOCAL-0016-sycl-mmvq-add-epilogue.patch` | 0013's MUL_MAT + ADD epilogue in the one-column MMVQ store: the generic plain kernel (q4_0 .. q6_K, q8_0, mxfp4, IQ1 / IQ2 / IQ3 / IQ4) and the generic reorder kernel (q4_0, q8_0, mxfp4, q2_K, q3_K, q6_K, IQ3, IQ4_NL) take the addend. The tuned reorder q4_K / q5_K launchers, the q8_0 wide dot product, the XMX MMVQ and 2..8 columns keep the in-place ADD. | perf (port) |
 | ZZ-LOCAL-0017 | `ZZ-LOCAL-0017-sycl-dg2-gemm-grf256-opt-in.patch` | `GGML_SYCL_XMX_GRF256=1` runs the sub-group-8 XMX dequant GEMM (f16 and bf16 8x8x16) with the 16-row, unrolled tile and `grf_size<256>` instead of 0010's 8-row tile at 128 registers: 4 threads per EU and twice the B reuse against 8 threads and twice the B loads. Same shape bit and B packing. An `acm-g10` AOT build gives all 72 kernels 256 registers and none spills. Off by default, for an A770 A/B. | perf (DG2, opt-in) |
+| ZZ-LOCAL-0018 | `ZZ-LOCAL-0018-sycl-local-off-switches.patch` | `GGML_SYCL_LOCAL_OFF=<decimal mask>`: one bit per local optimization above that had no off switch (0003, 0004/0007/0008's MoE reorder, 0007's dense reorder, 0010's one-row gate + up, 0011's five fusions, 0012's MoE fusion, 0013, 0014, 0015, 0016) plus candidate C10's reorder. A set bit restores the path before that patch, so `../sycl-patches/ab/` measures each one in a single build. The bit table is in the patch header and `ab.py mask` prints values. Default 0 changes nothing. | A/B switches |
 
 The former `ZZ-LOCAL-0001` made direct SYCL `CONV_2D` index input, kernel, and
 output by their real strides. It was retired on 2026-11-01 as superseded by
@@ -103,11 +105,11 @@ is gone, so runtime behavior/perf differs from the research tree.
 
 ## Status / verification
 
-- **Apply / unapply:** on 2026-11-03, the current stack (7 fork patches, 16
-  upstream PR patches, 2 numbered extracted patches and 15 local patches)
+- **Apply / unapply:** on 2026-11-04, the current stack (7 fork patches, 16
+  upstream PR patches, 2 numbered extracted patches and 16 local patches)
   applied with plain `git apply` in a clean worktree at upstream `fac3a894`,
-  with no three-way fallback, followed by the 14 candidates and the 4 Vulkan
-  patches (58 in all). The three `unapply.sh` scripts, Vulkan first, returned
+  with no three-way fallback, followed by the 15 candidates and the 4 Vulkan
+  patches (60 in all). The three `unapply.sh` scripts, Vulkan first, returned
   the tracked and untracked tree to upstream. (On 2026-11-01 the same held at
   `dde879bc1` without the local patches.)
 - **Build:** no SYCL compiler was available for this refresh, so the SYCL
@@ -158,6 +160,10 @@ is gone, so runtime behavior/perf differs from the research tree.
   with the Vulkan stack is clean. Not verified: speed on the A770, and the 256-register kernels at run time.
   Details and the register-file audit in `SYCL_DEV_LOG.md` ("Remaining fusions, MMVQ add epilogue and the
   register-file audit").
+- **`ZZ-LOCAL-0018` (2026-11-04):** the four translation units it touches (`ggml-sycl.cpp`, `mmvq.cpp`,
+  `fusion.cpp`, `topk-moe.cpp`) build with `icpx` 2026.2, JIT, with all candidates on top; every candidate still
+  applies with plain `git apply`. Each bit only adds a test in front of an existing branch, and the default 0
+  leaves every test true. Not run on hardware.
 - The scripts snapshot pre-existing untracked paths in the worktree's Git
   administrative directory. Files introduced by an apply are removed on
   unapply, while paths present before apply are protected. The state file is
@@ -230,18 +236,20 @@ non-idiomatic and not extracted:
 - **Research/profiling scaffolding** — `gpu-sampler`, probes, `ab-validation`,
   `e2e-profile`, `sycl-timeline`. Belongs in tooling/tests, not the backend.
 
-### Deferred (real features, but multi-session ports)
+### Deferred features, and what became of them
 
-Named, not numbered, so this index cannot drift from the files again:
+Named, not numbered, so this index cannot drift from the files again. Rechecked on 2026-11-04 against
+kainlan/llama.cpp-intel-optimizations, the same lineage:
 
-- **fattn-onednn** — oneDNN-graph SDPA path; needs new `sdpa_cache` infra on
-  `ggml_backend_sycl_context` and a mainline-shaped `fattn-common.hpp` extension.
-- **fattn-xmx** — `joint_matrix` flash-attention; shares fattn params with
-  fattn-onednn, extends the FA kernel switch. The fork's fp16 tile shape is
-  rejected by oneAPI 2025.3's JIT on A770 (Alchemist); revisit on Battlemage.
-- **moe-xmx** — XMX MoE path; clean kernels but ~600 lines of dispatch glue
-  referencing a `MoEContext` that does not exist in mainline. Unmeasurable on
-  A770 (no MoE model fits 16 GB).
+- **fattn-onednn** — superseded. Upstream has its own oneDNN SDPA path (`fattn-onednn.cpp`), which
+  candidates C62 / C63 open to head_dim 64 on DG2. The fork's version now depends on its unified cache.
+- **fattn-xmx** — superseded by candidate C60 (upstream's DPAS flash attention at sub-group 8). The fork
+  records its own v1 as wrong at D=128, and its v2 runs at sub-group 16 only, so neither runs on DG2.
+- **moe-xmx** — still not extracted, because its kernels are 16-wide DPAS only. The earlier reason was
+  wrong: MoE models do fit 16 GB (gpt-oss-20b MXFP4 is about 12 GiB). C20 / C21 and upstream's grouped
+  GEMM cover the path.
+- **WOQ Q8_0 GEMM** (not reviewed before) — taken as candidate C80, without the fork's primitive cache
+  and layout tiers.
 
 ## Why the small patches behave the way they do on A770
 

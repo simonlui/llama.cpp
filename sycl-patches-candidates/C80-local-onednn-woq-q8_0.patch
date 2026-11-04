@@ -1,0 +1,289 @@
+Subject: [PATCH] sycl: oneDNN weight-only-quantized GEMM for Q8_0 prompt batches (opt-in)
+
+Q8_0 prompt batches wider than the fused XMX dequant GEMM takes (64 tokens) dequantize the whole weight to f16,
+then run oneDNN's f16 matmul: a 4096 x 4096 weight writes and rereads 32 MB per batch. GGML_SYCL_WOQ_Q8_0
+hands oneDNN the int8 weights instead, as stored in the reorder layout, with the block scales as grouped weight
+scales (32 x 1 groups, f16 fpmath applied to the integer weights), so oneDNN widens and scales them inside the
+GEMM. The only per-call staging is the scale transpose, [rows][k / 32] -> [k / 32][rows]: 2 bytes per 32 weights.
+
+Ported from kainlan/llama.cpp-intel-optimizations (DnnlGemmWrapper::woq_gemm_q8_0, its V4 probe descriptors),
+without its primitive cache, layout tiers and scratch allocator: the descriptors are built per call as in
+DnnlGemmWrapper::gemm, oneDNN caching the primitive. The fork measured Mistral 7B Q8_0 pp512 2304 -> 4866 t/s
+on an Arc Pro B70 and 1125 -> 2006 on a B50, against its own MMQ, not against this path.
+
+  0  off (default)
+  1  the batches the fused XMX GEMM declines (wider than 64 tokens)
+  2  every Q8_0 batch that reaches ggml_sycl_op_mul_mat_sycl (more than 8 tokens), ahead of the fused GEMM
+
+The layout exists once a weight has been reordered, which upstream does on its first call of at most 8 tokens.
+With the switch on, a prompt batch installs it too (every Q8_0 reader already handles it), so a prompt-only run
+reaches the path. It declines into the existing paths, and turns itself off for the run after the first decline:
+oneDNN rejects the descriptor, offers only a reference implementation, or throws. The first call logs the
+implementation oneDNN picked.
+
+Checked: tools/woq-q8_0-probe runs these descriptors against a double-precision reference (the CPU engine,
+with f32 activations since the f16 ones need AVX512-FP16, matches to NMSE 1.6e-13); the backend builds with icpx
+2026.2. Not checked: whether Xe-HPG has a non-reference kernel for it, its f16 accuracy, and its speed; the
+probe answers all three on the card in a minute.
+
+diff --git a/docs/backend/SYCL.md b/docs/backend/SYCL.md
+index 596e70df..daa4c1b6 100644
+--- a/docs/backend/SYCL.md
++++ b/docs/backend/SYCL.md
+@@ -852,6 +852,7 @@ User can use the device management in [docs/multi-gpu.md](https://github.com/ggm
+ | GGML_SYCL_ENABLE_DNN | 0 or 1 (default)| Enable running computations through oneDNN and always use oneMKL. |
+ | GGML_SYCL_FA_ONEDNN | 1 (default) or 0 | Enable the oneDNN fused SDPA (flash-attention) path on supported GPUs. Set to 0 to always use the native SYCL flash-attention kernel. |
+ | GGML_SYCL_FA_ONEDNN_DG2_HD64 | 0 (default on Linux) or 1 (default on Windows) | Lets Arc A-series (Alchemist) GPUs run head_dim 64 attention, as in Llama-3.2-1B and Qwen2.5-0.5B, through the oneDNN fused SDPA path. Linux drivers whose IGC predates 2.40 (for example Level Zero 1.15.38646 on Ubuntu 24.04) compute that shape wrongly, so first check `GGML_SYCL_FA_ONEDNN_DG2_HD64=1 test-backend-ops -o FLASH_ATTN_EXT -p hsk=64` and set 1 only if it passes. Other head sizes and GPUs are unaffected. |
++| GGML_SYCL_WOQ_Q8_0 | 0 (default), 1 or 2 | Q8_0 prompt batches through oneDNN's weight-only-quantized matmul, which reads the int8 weights in the reorder layout and applies their scales inside the GEMM instead of first writing an f16 copy. 1 takes the batches wider than the fused XMX dequant GEMM handles (64 tokens), 2 every Q8_0 batch of more than 8 tokens. It installs the weight reorder on the first prompt batch, stays off for the run after oneDNN declines once (logged), and needs `GGML_SYCL_DNN=ON` and `GGML_SYCL_F16=ON`. |
+ | GGML_SYCL_FA_ONEDNN_MAX_KV | 0 (default, disabled) or positive integer | By default (0), all sequences are handled by the oneDNN fused SDPA path, regardless of KV length; a positive value caps that length, past which sequences fall back to the native kernel. If GPU driver watchdog resets (DEVICE_LOST) occur during long-context inference, set this near the context depth where they start, e.g. 24576. |
+ | GGML_SYCL_FA_DPAS | 1 (default) or 0 | Enable the XMX flash-attention kernel for a q4_0 or q8_0 KV cache (`-ctk q4_0 -ctv q4_0` or `-ctk q8_0 -ctv q8_0`) on Xe2 or newer GPUs (Arc B-series, Lunar Lake, Panther Lake, Wildcat Lake). It reads the quantized cache directly for decode and batches of up to 31 tokens, head sizes 64, 96, 128, 256 and 512, up to 32 query heads per KV head. Set to 0 to use the native SYCL flash-attention kernels. |
+ | GGML_SYCL_ENABLE_VMM | 0 or 1 (default) | Enable the virtual-memory device pool. |
+diff --git a/ggml/src/ggml-sycl/gemm.hpp b/ggml/src/ggml-sycl/gemm.hpp
+index 81bc5c2e..24eb2174 100644
+--- a/ggml/src/ggml-sycl/gemm.hpp
++++ b/ggml/src/ggml-sycl/gemm.hpp
+@@ -20,6 +20,8 @@
+ #include "dnnl.hpp"
+ #include "dnnl_sycl.hpp"
+ 
++#include <cstring>
++
+ class DnnlGemmWrapper {
+ public:
+     using dt = dnnl::memory::data_type;
+@@ -88,6 +90,59 @@ public:
+ 
+         gemm(ctx, m, n, k, a, at, 1, k, k * m, b, bt, 1, k, n * k, c, ct, q, 1, 1);
+     }
++
++    // Weight-only-quantized GEMM on the Q8_0 reorder layout: c[n][m] (row stride ldc) = b[n][k] x a[m][k]^T,
++    // with a the int8 qs plane read as stored and a_scales the [k / 32][m] f16 transpose of its d plane. oneDNN
++    // widens the int8 weights to f16 and applies the group scales inside the GEMM (f16 fpmath applied to integer
++    // weights), so the f16 copy of the weights that row_gemm needs is never written. The quantized operand has to
++    // be oneDNN's weights, so the activations are its source here, the other way round from row_gemm.
++    // Returns false, having submitted nothing, when oneDNN rejects the descriptor or only has its reference
++    // implementation, which would be far slower than dequantizing for row_gemm. *impl gets the implementation.
++    static bool woq_q8_0_gemm(ggml_backend_sycl_context & ctx, int m, int n, int k, const int8_t * a,
++                              const sycl::half * a_scales, const sycl::half * b, float * c, int ldc,
++                              const queue_ptr & q, const char ** impl) {
++        constexpr dnnl_dim_t group = 32;  // QK8_0
++        if (k % group != 0) {
++            return false;
++        }
++        auto stream = ctx.stream_dnnl(q);
++        auto eng    = ctx.engine_dnnl(q);
++
++        const auto src_md = dnnl::memory::desc({ n, k }, dt::f16, { k, 1 });
++        const auto wei_md = dnnl::memory::desc({ k, m }, dt::s8, { 1, k });
++        const auto dst_md = dnnl::memory::desc({ n, m }, dt::f32, { ldc, 1 });
++        const auto scl_md = dnnl::memory::desc({ k / group, m }, dt::f16, { m, 1 });
++
++        dnnl::primitive_attr attr;
++        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
++        attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1), { group, 1 }, dt::f16);
++        attr.set_fpmath_mode(dnnl::fpmath_mode::f16, /*apply_to_int=*/true);
++
++        dnnl::matmul::primitive_desc pd;
++        try {
++            pd = dnnl::matmul::primitive_desc(eng, src_md, wei_md, dst_md, attr);
++        } catch (const dnnl::error &) {
++            return false;
++        }
++        *impl = pd.impl_info_str();
++        if (std::strncmp(*impl, "ref", 3) == 0) {
++            return false;
++        }
++
++        const auto scratchpad_md = pd.scratchpad_desc();
++        ggml_sycl_pool_alloc<uint8_t> scratchpad(ctx.pool());
++        void * scratchpad_ptr = scratchpad_md.get_size() > 0 ? scratchpad.alloc(scratchpad_md.get_size()) : nullptr;
++
++        std::unordered_map<int, dnnl::memory> args;
++        args.insert({ DNNL_ARG_SRC, dnnl::memory(src_md, eng, const_cast<sycl::half *>(b)) });
++        args.insert({ DNNL_ARG_WEIGHTS, dnnl::memory(wei_md, eng, const_cast<int8_t *>(a)) });
++        args.insert({ DNNL_ARG_DST, dnnl::memory(dst_md, eng, c) });
++        args.insert({ DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, dnnl::memory(scl_md, eng, const_cast<sycl::half *>(a_scales)) });
++        args.insert({ DNNL_ARG_SCRATCHPAD, dnnl::memory(scratchpad_md, eng, scratchpad_ptr) });
++
++        dnnl::matmul(pd).execute(stream, args);
++        return true;
++    }
+ };
+ 
+ #endif
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 85306056..b10a139b 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -129,6 +129,7 @@ int g_ggml_sycl_xmx_max_cols = GGML_SYCL_XMX_MAX_COLS_DEFAULT;
+ int g_ggml_sycl_xmx_glu_max_cols = GGML_SYCL_XMX_GLU_MAX_COLS;
+ int g_ggml_sycl_prioritize_dmmv = 0;
+ int g_ggml_sycl_local_off = 0;
++static int g_ggml_sycl_woq_q8_0 = 0;
+ int g_ggml_sycl_xmx_gather_types = GGML_SYCL_XMX_GATHER_TYPES_DEFAULT;
+ int g_ggml_sycl_xmx_gather_shapes = GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT;
+ int g_ggml_sycl_mmid_sched = GGML_SYCL_MMID_SCHED_DEVICE;
+@@ -475,6 +476,7 @@ static void ggml_check_sycl() try {
+             std::clamp(ggml_sycl_get_env("GGML_SYCL_XMX_GLU_MAX_COLS", GGML_SYCL_XMX_GLU_MAX_COLS), 0, GGML_SYCL_XMX_GLU_MAX_COLS);
+         g_ggml_sycl_prioritize_dmmv = ggml_sycl_get_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
+         g_ggml_sycl_local_off = ggml_sycl_get_env("GGML_SYCL_LOCAL_OFF", 0);
++        g_ggml_sycl_woq_q8_0 = ggml_sycl_get_env("GGML_SYCL_WOQ_Q8_0", 0);
+         g_ggml_sycl_graph_eviction_timeout = ggml_sycl_get_env("GGML_SYCL_GRAPH_EVICTION_TIMEOUT", 10);
+         g_ggml_sycl_xmx_gather_types = ggml_sycl_get_env("GGML_SYCL_XMX_GATHER_TYPES", GGML_SYCL_XMX_GATHER_TYPES_DEFAULT);
+         g_ggml_sycl_mmid_sched = ggml_sycl_get_env("GGML_SYCL_MMID_SCHED", GGML_SYCL_MMID_SCHED_DEVICE) & 3;
+@@ -577,6 +579,7 @@ static void ggml_check_sycl() try {
+ 
+ #if GGML_SYCL_DNNL
+         GGML_LOG_INFO("  GGML_SYCL_ENABLE_DNN: %d\n", g_ggml_sycl_enable_dnn);
++        GGML_LOG_INFO("  GGML_SYCL_WOQ_Q8_0: %d\n", g_ggml_sycl_woq_q8_0);
+         GGML_LOG_INFO("  GGML_SYCL_FA_ONEDNN: %d\n", g_ggml_sycl_fa_onednn);
+         GGML_LOG_INFO("  GGML_SYCL_FA_ONEDNN_DG2_HD64: %d\n", g_ggml_sycl_fa_onednn_dg2_hd64);
+ #else
+@@ -3268,6 +3271,80 @@ catch (sycl::exception const &exc) {
+ static constexpr int64_t SYCL_F32_DNNL_MIN_GEMM_FLOPS = 256 * 256 * 256;
+ #endif
+ 
++#if GGML_SYCL_DNNL && defined(GGML_SYCL_F16)
++// [rows][k / 32] -> [k / 32][rows]: the d plane of the Q8_0 reorder layout in the order oneDNN takes grouped
++// weight scales. 2 bytes per 32 weights, 1/32 of what dequantizing the weights to f16 writes.
++static void q8_0_reorder_scales_to_kn(const sycl::half * d, sycl::half * out, int64_t rows, int64_t groups,
++                                      const queue_ptr & stream) {
++    stream->parallel_for(sycl::range<2>(groups, rows), [=](sycl::id<2> id) {
++        out[id[0] * rows + id[1]] = d[id[1] * groups + id[0]];
++    });
++}
++
++// GGML_SYCL_WOQ_Q8_0 (candidate C80): Q8_0 prompt batches through oneDNN's weight-only-quantized matmul on the
++// reorder layout instead of dequantize + GEMM. 1 = the batches the fused XMX dequant GEMM declines (wider than
++// GGML_SYCL_FG_MAX_N), 2 = ahead of that GEMM too. Declines into the existing paths; after one decline (oneDNN
++// rejects the descriptor or offers only its reference implementation) it stays off for the process.
++static std::atomic<bool> g_ggml_sycl_woq_q8_0_declined{ false };
++
++static bool ggml_sycl_woq_q8_0_possible(int device) {
++    return g_ggml_sycl_woq_q8_0 != 0 && !g_ggml_sycl_woq_q8_0_declined.load(std::memory_order_relaxed) &&
++           g_ggml_sycl_enable_dnn && ggml_sycl_dnnl_has_optimized_gemm(device);
++}
++
++static bool ggml_sycl_woq_q8_0(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++                               ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
++                               float * dst_dd_i, int64_t row_diff, int64_t src1_ncols, int ldc,
++                               const queue_ptr & stream) {
++    const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
++    const int64_t ne00 = src0->ne[0];
++    if (!ggml_sycl_woq_q8_0_possible(ggml_sycl_get_device()) || src0->type != GGML_TYPE_Q8_0 || !extra ||
++        !extra->optimized_feature.reorder || !ggml_is_contiguous(src0) || src0->ne[2] != 1 || src0->ne[3] != 1 ||
++        row_diff != src0->ne[1] || ne00 % QK8_0 != 0 || dst->op_params[0] != GGML_PREC_DEFAULT ||
++        !ggml_sycl_src1_f16_ok(dst) || (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16)) {
++        return false;
++    }
++
++    ggml_sycl_pool_alloc<sycl::half> src1_as_f16(ctx.pool());
++    const sycl::half * src1_ptr = (const sycl::half *) src1_ddf_i;
++    if (src1->type != GGML_TYPE_F16) {
++        const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src1->type, dst);
++        GGML_ASSERT(to_fp16_sycl != nullptr);
++        src1_as_f16.alloc(src1_ncols * ne00);
++        to_fp16_sycl(src1_ddf_i, src1_as_f16.get(), src1_ncols * ne00, stream);
++        src1_ptr = src1_as_f16.get();
++    }
++
++    // reorder layout: [row_diff * ne00 int8 qs][row_diff * ne00 / 32 f16 d]
++    const int64_t groups = ne00 / QK8_0;
++    const auto *  qs     = (const int8_t *) src0_dd_i;
++    const auto *  d      = (const sycl::half *) (src0_dd_i + row_diff * ne00);
++    ggml_sycl_pool_alloc<sycl::half> scales(ctx.pool(), row_diff * groups);
++    q8_0_reorder_scales_to_kn(d, scales.get(), row_diff, groups, stream);
++
++    const char * impl = "";
++    bool         ok   = false;
++    try {
++        ok = DnnlGemmWrapper::woq_q8_0_gemm(ctx, (int) row_diff, (int) src1_ncols, (int) ne00, qs, scales.get(),
++                                            src1_ptr, dst_dd_i, ldc, stream, &impl);
++    } catch (const dnnl::error & e) {
++        GGML_LOG_WARN("%s: oneDNN failed (%s), back to dequantize + GEMM\n", __func__, e.what());
++    }
++    static std::atomic<bool> reported{ false };
++    if (!reported.exchange(true)) {
++        GGML_LOG_INFO("%s: oneDNN weight-only Q8_0 matmul %s (%s)\n", __func__, ok ? "used" : "declined",
++                      impl[0] ? impl : "no implementation");
++    }
++    if (!ok) {
++        g_ggml_sycl_woq_q8_0_declined.store(true, std::memory_order_relaxed);
++        return false;
++    }
++    GGML_SYCL_DEBUG("[SYCL] %s: m=%lld n=%lld k=%lld (%s)\n", __func__, (long long) row_diff,
++                    (long long) src1_ncols, (long long) ne00, impl);
++    return true;
++}
++#endif
++
+ inline void ggml_sycl_op_mul_mat_sycl(
+     ggml_backend_sycl_context & ctx,
+     const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
+@@ -3335,12 +3412,25 @@ inline void ggml_sycl_op_mul_mat_sycl(
+     if (const auto * src0_extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra)) {
+         src0_reordered = src0_extra->optimized_feature.reorder;
+     }
++#if GGML_SYCL_DNNL && defined(GGML_SYCL_F16)
++    if (g_ggml_sycl_woq_q8_0 >= 2 && ggml_sycl_woq_q8_0(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, dst_dd_i,
++                                                        row_diff, src1_ncols, ldc, stream)) {
++        return;
++    }
++#endif
+     if (ggml_is_quantized(src0->type) && ggml_is_contiguous(src0) && row_diff == src0->ne[1] &&
+         ggml_sycl_fused_dequant_gemm(src0->type, src0_reordered, src0_dd_i, src1_ddf_i, src1->type, ggml_sycl_src1_prec(dst), dst_dd_i,
+                                      row_diff, src1_ncols, ne10, ldc, ctx.pool(), stream)) {
+         return;
+     }
+ 
++#if GGML_SYCL_DNNL && defined(GGML_SYCL_F16)
++    if (g_ggml_sycl_woq_q8_0 == 1 && ggml_sycl_woq_q8_0(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, dst_dd_i,
++                                                        row_diff, src1_ncols, ldc, stream)) {
++        return;
++    }
++#endif
++
+     // the f16 route converts src1 to f16 [TAG_GGML_PREC]
+     use_fp16 = use_fp16 && ggml_sycl_src1_f16_ok(dst);
+     // F8_E4M3 widens to f16 exactly
+@@ -5276,6 +5366,30 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
+     }
+ }
+ 
++// GGML_SYCL_WOQ_Q8_0 reads the reorder layout, which a weight otherwise gets on its first call of at most 8
++// tokens: install it on a prompt batch too, so a run that starts with (or only has) prompts reaches that path.
++// Every Q8_0 reader handles the layout (decode installs it anyway); this only changes when it happens.
++static void opt_for_reorder_woq_q8_0(ggml_backend_sycl_context * ctx, const ggml_tensor * src0,
++                                     const ggml_tensor * src1) {
++#if GGML_SYCL_DNNL && defined(GGML_SYCL_F16)
++    if (!ggml_sycl_woq_q8_0_possible(ctx->device) || src0->type != GGML_TYPE_Q8_0 || !g_ggml_sycl_enable_optimize ||
++        !ctx->opt_feature.reorder || src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
++        return;
++    }
++    ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
++    if (!extra || extra->optimized_feature.reorder) {
++        return;
++    }
++    if (reorder_qw(src0, ctx->stream())) {
++        extra->optimized_feature.reorder = true;
++    }
++#else
++    GGML_UNUSED(ctx);
++    GGML_UNUSED(src0);
++    GGML_UNUSED(src1);
++#endif
++}
++
+ // Lazily reorder supported MoE expert weights once their fused path is used.
+ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tensor * src0) {
+     if (!g_ggml_sycl_enable_optimize || !ctx->opt_feature.reorder) {
+@@ -5462,6 +5576,9 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
+             ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_q);
+         }
+     } else {
++        if (!split) {
++            opt_for_reorder_woq_q8_0(&ctx, src0, src1);
++        }
+         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl);
+     }
+ }

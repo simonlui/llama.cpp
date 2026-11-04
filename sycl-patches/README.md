@@ -178,20 +178,30 @@ re-downloaded.
 
 ```bash
 source /opt/intel/oneapi/setvars_fixed.sh
+bash sycl-patches-extracted/apply.sh .
+bash sycl-patches-candidates/apply.sh .   # optional
+OAPI_BIN="$(dirname "$(command -v icpx)")/compiler"
 cmake -B build_sycl -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
-    -DGGML_SYCL=ON \
-    -DCMAKE_C_COMPILER=icx \
-    -DCMAKE_CXX_COMPILER=icpx \
-    -DGGML_SYCL_F16=ON \
-    -DGGML_LTO=ON \
-    -DGGML_NATIVE=ON \
+    -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
+    -DCMAKE_C_COMPILER_AR="$OAPI_BIN/llvm-ar" -DCMAKE_CXX_COMPILER_AR="$OAPI_BIN/llvm-ar" \
+    -DCMAKE_C_COMPILER_RANLIB="$OAPI_BIN/llvm-ranlib" -DCMAKE_CXX_COMPILER_RANLIB="$OAPI_BIN/llvm-ranlib" \
+    -DGGML_SYCL=ON -DGGML_SYCL_F16=ON -DGGML_SYCL_DNN=ON -DGGML_SYCL_GRAPH=ON -DGGML_SYCL_SUPPORT_XMX=ON \
+    -DGGML_NATIVE=ON -DGGML_LTO=ON \
     -DCMAKE_C_FLAGS="-ffunction-sections -fdata-sections" \
     -DCMAKE_CXX_FLAGS="-ffunction-sections -fdata-sections" \
     -DCMAKE_EXE_LINKER_FLAGS="-Wl,--gc-sections,--as-needed,-z,noexecstack,-z,relro,-z,now,--strip-all"
-
 cmake --build build_sycl -j$(nproc)
 ```
+
+The `llvm-ar` / `llvm-ranlib` overrides keep `GGML_LTO` on. CMake 3.30 and older do not look in
+oneAPI's `bin/compiler` for them and take the system's, which may not read icx's bitcode (llvm-ar 18 on
+icx 2026.2: `Unknown attribute kind (106)`). `check_ipo_supported` then fails and the build goes on
+without LTO after one "IPO is not supported" warning. CMake 3.31 and newer find oneAPI's without the
+overrides. This line is a JIT build: `GGML_SYCL_DEVICE_ARCH=acm-g10` (AOT) drops
+the ESIMD kernels' 256-register request; `ab/` measures which build is faster on the card.
+
+Which patches make the A770 faster is decided on the card, with the A/B plan in `ab/README.md`.
 
 ## Requirements
 

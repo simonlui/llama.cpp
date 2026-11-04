@@ -155,6 +155,43 @@ oneAPI came from conda-forge into `/opt/oneapi` on a GPU-less cloud box:
   floating point exception, likely from GPU-only device properties. The only
   numeric test of SYCL kernels here is C60's standalone emulation above.
 
+## A/B plan, off switches and the weight-only Q8_0 GEMM (2026-11-04, `ZZ-LOCAL-0018`, C80)
+
+Compile tests cannot say which patch makes the A770 faster, so this round builds what the card needs to
+decide it, in `sycl-patches/ab/`.
+
+- **Off switches (`ZZ-LOCAL-0018`).** The local perf patches had no off switch except
+  `GGML_SYCL_ENABLE_FUSION=0` / `GGML_SYCL_ENABLE_OPT=0`, which also turn off upstream's fusions and
+  reorders. They are also stacked (0016 on 0013, 0012 and 0015 on 0011), so leaving one out meant
+  regenerating patches and rebuilding between the arms of a benchmark. `GGML_SYCL_LOCAL_OFF` has 15 bits.
+  Each one adds a test in front of an existing branch: the seven 0003 call sites, the two reorder entry
+  points, 0010's row-pair predicate, the graph-loop fusion sites, the 0012 / 0013 / 0011 expert-sum
+  matchers (which `graph_optimize` also calls, so a disabled fusion drops its allocation dependency too),
+  0014's cache node, 0016's epilogue entry and the topk-moe extensions. The four touched TUs build (icpx
+  2026.2, JIT) with all candidates on top, and every candidate still applies with plain `git apply`.
+- **C80, weight-only Q8_0 GEMM.** From the fork's `woq_gemm_q8_0`, without its cache and layout tiers.
+  oneDNN gets the reorder layout's int8 plane as weights `{k, m}` with strides `{1, k}`, and the d plane
+  transposed to `{k / 32, m}` as grouped f16 scales (mask 3, groups `{32, 1}`), with f16 fpmath applied to
+  the integer weights. `tools/woq-q8_0-probe` checked these descriptors on oneDNN 3.14.1's CPU engine
+  against a double-precision reference: NMSE 1.6e-13 with f32 activations. With f16 activations, the form
+  C80 runs, the CPU engine declines: brgemm reports the data types unsupported on this ISA (AVX-512 with
+  DL Boost, no FP16), and the f32 / bf16 / int8 GEMMs and the reference reject the combination. So whether DG2 has a non-reference kernel is the first thing the
+  probe answers on the card. C80 declines into the old paths and stays off after one decline. Upstream
+  installs the reorder only on calls of at most 8 tokens. With the switch on, C80 also installs it on a
+  prompt batch, so `llama-bench -p 512 -n 0` reaches the path.
+- **Runner, plan and guard.** `ab.py` runs `plan.json`'s 57 experiments in alternating ABBA rounds. Its
+  verdict is the per-round paired gain with a t-interval, checked against fake `llama-bench` /
+  `llama-perplexity` binaries that emit the real output formats. `ab.py kld` scores both arms against
+  CPU-backend logits (`-dev none`). `guard.sh` reads i915 and xe sysfs.
+- **Not ported:** the fork's FA masked-cell fix (f8561ec88). It rewrites the fork's ESIMD / XMX kernels,
+  and upstream's TILE / VEC add the mask as CUDA does over a cache that `llama_kv_cache` clears at
+  allocation.
+- **Corrected:** the "Deferred" list in `sycl-patches-extracted/README.md`. fattn-onednn and fattn-xmx
+  are superseded (upstream oneDNN SDPA with C62 / C63, and C60). moe-xmx's "no MoE model fits 16 GB" was
+  wrong (gpt-oss-20b MXFP4 is about 12 GiB), though it stays out because its kernels are 16-wide only.
+  Also corrected: the build block in `sycl-patches/README.md`, which lacked the oneAPI `llvm-ar` override
+  that keeps `GGML_LTO` on.
+
 ## Upstream refresh to `fac3a894`, new upstream PRs and draft candidates (2026-11-03)
 
 Moves the stack from `dde879bc1` to `fac3a894` (43 upstream commits, merged into this branch as

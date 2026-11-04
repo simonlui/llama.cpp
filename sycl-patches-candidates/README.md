@@ -30,6 +30,7 @@ the main stack, re-running `apply.sh` on an applied tree is not supported.
 | C70 | PR 31379 (draft), re-anchored on carried PR 31355 and local 0015 | The gated delta net reads its recurrent state through the GET_ROWS ids instead of from a gathered copy | Qwen3.5 / Qwen3-Next decode: one state copy fewer per delta-net layer per token. Single-sequence batches only. arthw on an A770 (upstream + 31379, Qwen3.5-0.8B Q4_K_M): tg128 +2.6% with FA off, +3.3% with FA on, pp512 unchanged | `GGML_SYCL_GDN_STATE_GATHER=0` |
 | C75 | PR 31313 (draft, "WIP K1"), without its fused-gemm.cpp dedup | Vector and joint_matrix kernels for the lightning indexer | DeepSeek-V3.2-style sparse attention, decode (vector kernel) and batches of 8+ (XMX, sub-group-8 8x8x16 on DG2). Off by default | `GGML_SYCL_LIGHTNING_INDEXER=1` turns it on |
 | C76 | local, on C75 | 256 registers for C75's vector kernel on ACM-G10/G11/G12 | At 128 that kernel spills 1.6-1.8 KB per thread on DG2; at 256 it does not | none (only with C75 on) |
+| C80 | local port of kainlan/llama.cpp-intel-optimizations `woq_gemm_q8_0` | Q8_0 prompt batches through oneDNN's weight-only-quantized matmul: the int8 weights in the reorder layout and their block scales go to oneDNN as stored (grouped scales, f16 fpmath on integer weights) instead of a full f16 copy of the weight per batch | Skips writing and rereading 32 MB of f16 weights per 4096 x 4096 matmul in prompt processing. The fork: Mistral 7B Q8_0 pp512 2304 -> 4866 t/s on a B70, against its own MMQ. Whether Xe-HPG has a real oneDNN kernel for it is unknown: `tools/woq-q8_0-probe` checks that, its accuracy and its speed in a minute | `GGML_SYCL_WOQ_Q8_0=1` turns it on (2 also ahead of the fused XMX GEMM) |
 | C90 | local | `GGML_SYCL_DG2_BMG_TUNING` bit mask that opens five Battlemage-only kernel choices to DG2 | Each choice is between kernels already built for every device, so only speed can change | `GGML_SYCL_DG2_BMG_TUNING=0` (default) |
 
 `GGML_SYCL_DG2_BMG_TUNING` bits:
@@ -119,6 +120,22 @@ for li in 0 1; do GGML_SYCL_LIGHTNING_INDEXER=$li ./build_sycl/bin/test-backend-
 Promote a candidate when its tests pass and it wins at the depths you use. A tuning bit that
 wins can become a plain DG2 entry in that gate.
 
+C80 (added 2026-11-04): run the probe first. It needs oneAPI only, no backend build, and if it prints
+`DECLINED`, `impl=ref...` or `FAIL`, drop C80:
+
+```bash
+icpx -fsycl -O2 sycl-patches-candidates/tools/woq-q8_0-probe/probe.cpp -o woq-probe -ldnnl
+```
+```bash
+ONEAPI_DEVICE_SELECTOR=level_zero:0 ./woq-probe
+```
+
+Then `GGML_SYCL_WOQ_Q8_0=2 test-backend-ops -o MUL_MAT -p type_a=q8_0`, and speed on a Q8_0 model with
+`GGML_SYCL_WOQ_Q8_0=0` and `=1` at `-p 512,2048 -n 0`. The first call logs the oneDNN implementation.
+
+`../sycl-patches/ab/` turns every command above into interleaved A/B runs with verdicts, together with the
+local patches and the carried PRs (`plan.json` has a row for each switch here).
+
 ## Draft PR check (2026-11-03)
 
 The four draft PRs behind C20, C62, C70 and C75 are still open drafts and their heads have not moved
@@ -199,6 +216,14 @@ Added 2026-11-03, `acm-g10` AOT with the real device flags (`-fsycl-device-code-
 - On the CPU OpenCL device (`../sycl-patches-extracted/tools/cpu-device-test/`, every candidate but
   C20 / C21): `GATED_DELTA_NET_GATHER` 19/19 with C70's gather on and off, and C75's vector kernel
   70/70 on f32 / f16 keys. C75's XMX kernels and C62's oneDNN path cannot run there.
+
+Added 2026-11-04:
+
+- C80 `ggml-sycl.cpp` / `gemm.hpp`: builds with `icpx` 2026.2 (JIT) on the full stack and candidates; C80 applies
+  before C90 with plain `git apply`. `tools/woq-q8_0-probe` runs its oneDNN descriptors (int8 weights
+  `{k, m}` with strides `{1, k}`, f16 scales `{k / 32, m}`, mask 3, groups `{32, 1}`) on the CPU engine against
+  a double-precision reference: NMSE 1.6e-13 with f32 activations. The f16-activation form, the one C80
+  uses, is declined by oneDNN on a CPU without AVX512-FP16, so its kernel and accuracy are A770-only checks.
 
 What was not checked: any number on real hardware. Apart from C60's emulation,
 no kernel here ran: the backend does not run on the CPU OpenCL device (see
