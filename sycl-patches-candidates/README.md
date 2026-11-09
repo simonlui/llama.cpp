@@ -198,14 +198,22 @@ the A770 compiles at JIT time) and its DG2 assembly read from IGC dumps:
   (AOT honours the request for SPMD kernels); the ESIMD ones still lose it in
   AOT (see below), so measure C40's ESIMD path with a JIT build.
 - C50 TILE FA instance: builds.
-- C60 `fattn-dpas.cpp`: builds for `acm-g10` (42 kernels, all 782 DPAS `dpas.8x8 (8|M0)`,
-  none spill) and `bmg-g21` (the same 604 DPAS as upstream, instruction counts within 1%,
-  none spill). The sub-group-8 kernels that spilled at 128 GRF (32 rows from D=128, staged
-  D=256 decode) always use 256. In a JIT build each device image holds one DPAS width.
+- C60 `fattn-dpas.cpp`: builds for `acm-g10` (42 kernels, 560 `dpas.8x8 (8|M0)`: 473 DPAS and
+  87 workaround dummies, none spill) and `bmg-g21` (the same 604 DPAS as upstream, instruction
+  counts within 1%, none spill). The sub-group-8 kernels that spilled at 128 GRF (32 rows from
+  D=128, staged D=256 decode) always use 256. In a JIT build each device image holds one DPAS width.
   `tools/fattn-dpas-emu/run.sh` runs the kernels on the CPU OpenCL device with emulated
   DPAS: 112 cases pass at both widths (NMSE vs FP64 <= 4.8e-5, sub-group 8 vs 16 <=
   1.6e-11), and it fails on planted sub-group-8 layout bugs. Rerun it when C60 is
   re-anchored.
+- C60's Q.K guard (2026-11-09). The 782 DPAS above were 490 real and 292 dummies from IGC's
+  `Wa_18023229625`: a `t < RT` test around each Q.K DPAS put every one in its own basic block, and
+  IGC adds a dummy DPAS before the first DPAS of a block (8 + 8 per job in the D=128 32-row kernels).
+  At sub-group 8 the test is now dropped where it always holds or only discards scores, except in the
+  128-register two-tile kernels (head size 96 spills without it): 473 + 87, no spills, bmg-g21
+  instruction streams identical in all 83 kernels, emulator 112/112.
+  `-DGGML_SYCL_FA_DPAS_QK_GUARD=1` restores the test for the `C60-qk-guard*` A/B rows.
+  `../sycl-patches/aot/isa_check.py` gives these counts from any configured build.
 
 Added 2026-11-03, `acm-g10` AOT with the real device flags (`-fsycl-device-code-split=per_kernel`):
 

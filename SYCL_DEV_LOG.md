@@ -155,6 +155,42 @@ oneAPI came from conda-forge into `/opt/oneapi` on a GPU-less cloud box:
   floating point exception, likely from GPU-only device properties. The only
   numeric test of SYCL kernels here is C60's standalone emulation above.
 
+## DG2 hardware notes applied: C60's Q.K guard, an ISA check, a stricter A/B protocol (2026-11-09)
+
+Input: three notes from an A770 flash-attention project (DG2 hardware facts, measured evidence, Xe
+target guidance). Most of what they say confirms the stack's kernels: at least 4 independent DPAS
+accumulators per thread (fused-gemm 4 or 8, C21, C40), DPAS operands ordered so consecutive DPAS share
+src2 and vary src1, no 2D block loads on DG2 (C21 uses 1D). One finding needed code: IGC's
+`Wa_18023229625` (every ACM-G10 stepping) inserts a dummy 8x8 DPAS before the first DPAS of each basic
+block and before a back-to-back DPAS that would reuse src1.
+
+Dummy DPAS counted in `acm-g10` AOT shader dumps (real + dummy per loop body):
+
+| Kernel | Before | After |
+|--------|--------|-------|
+| C60 Q.K, 256-register kernels (D=128 32 rows, D=256 decode, D=512) | 8+8, 8+8, 32+32 | 8+1, 8+0 (q8_0) / 8+1, 32+1 |
+| C60, all 42 sub-group-8 kernels | 490 + 292 | 473 + 87 |
+| C60 P.V | 2+1 (16 rows), 4+1 (32 rows) | unchanged: `#pragma unroll 2` gave 4+2, no gain |
+| fused-gemm sub-group 8, 128 GRF (0010) / 0017's 256 GRF | 4+1 / 16+2 | unchanged |
+| C21 ESIMD MoE GEMM / C40 XMX decode | 16+1 / 40+2 | unchanged |
+| 0016 MMQ-XMX | 1+0 or 1+1 per k-block | unchanged (one DPAS between SLM barriers; its build A/B decides) |
+
+The C60 cause was a `t < RT` test around each Q.K DPAS. At sub-group 8 it is now dropped where it always
+holds (one row tile per job) or only guards scores the store discards, and kept for 128-register two-tile
+jobs, where dropping it spilled 2.4 KB at head size 96. Checks: no spills, `bmg-g21` instruction streams
+identical in all 83 kernels, CPU emulator 112/112, apply / unapply round trip clean.
+`-DGGML_SYCL_FA_DPAS_QK_GUARD=1` restores the test; `C60-qk-guard*` in `sycl-patches/ab/plan.json`
+measures it. Speed on the card: not measured. The evidence note puts a DG2 flash kernel's time in P.V's
+value loads more than in Q.K, so expect the gain, if any, in 32-row batches at depth.
+
+Tools: `sycl-patches/aot/isa_check.py` prints register file, spill bytes, DPAS and dummy DPAS per kernel
+for one file, from any configured build's `compile_commands.json`. `sycl-patches/ab/`: A/A rows run first
+(`aa-dense`, `aa-deep`). The report adds a Hodges-Lehmann estimate with its exact interval and flags rounds
+far from the median. `run` appends rounds to an existing results file and runs a `-d` list one depth per
+process. `guard.sh` gates on GPU temperature (start below 60 C, stop at 80 C) and on other processes' DRM
+engine use (5%), and stamps the loaded oneDNN. New plan rows for oneDNN 3.14+ (`onednn-314-*`: the
+xe_hpg SDPA retunes ship there) and a per-token runtime-call count (`SYCL_UR_TRACE=2`) in the run order.
+
 ## A/B plan, off switches and the weight-only Q8_0 GEMM (2026-11-04, `ZZ-LOCAL-0018`, C80)
 
 Compile tests cannot say which patch makes the A770 faster, so this round builds what the card needs to

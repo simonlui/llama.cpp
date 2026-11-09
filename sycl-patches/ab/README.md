@@ -15,27 +15,46 @@ Three gates, in this order. A patch has to pass each one before the next counts:
 
 | File | What |
 |------|------|
-| `plan.json` | 57 experiments: arms, model, `llama-bench` arguments, tier, and what each decides |
+| `plan.json` | 63 experiments: arms, model, `llama-bench` arguments, tier, and what each decides |
 | `ab.py` | Runs them (`run`, `kld`), prints verdicts (`report`), lists what is runnable (`list`), turns `GGML_SYCL_LOCAL_OFF` names into the mask (`mask`) |
-| `guard.sh` | Records the driver stack with the results (`--stamp`), waits for an idle, unthrottled GPU (`--wait`), counts GPU hangs in the kernel log (`--faults`). Reads i915 or xe sysfs |
+| `guard.sh` | Records the driver stack, oneDNN, GPU temperature and other GPU clients with the results (`--stamp`). Before each run it waits for a card below 60 C with no other process above 5% of an engine, then for an idle, unthrottled GPU (`--wait`). Also `--temp`, `--clients`, and GPU hangs in the kernel log (`--faults`). Reads i915 or xe sysfs |
+| `drm_clients.py` | Other processes' engine use of the card from DRM fdinfo (i915 and xe), for `guard.sh` |
 
 ## How a speed verdict is made
 
 Each experiment runs `rounds` rounds (4 by default, 6 for small-batch rows). The arm order alternates
 (A B, B A, A B, B A), so clock, temperature and background drift hit both arms alike. Each invocation is
-`llama-bench -r 3`. A round's gain is B / A - 1 for each test (`pp512`, `tg128@d4096`, ...). The verdict
-is computed from the mean of those gains and its 95% confidence interval (Student t across rounds), with
-1% as the smallest gain that counts (`--min-gain`). The pairing is what makes 1% usable on this card:
-an earlier serial A770 run drifted ±3% between steps (`SYCL_DEV_LOG.md`, "Per-step bench noise"), while
-repeats inside one `llama-bench` call varied by 0.1-0.2% (pp512 1377.5 ± 2.4, tg128 29.63 ± 0.03 t/s).
+`llama-bench -r 3`. A row with a `-d` list runs one process per depth, A and B for the same depth back to
+back, each after the cooldown (`"chunk_depths": false` in a row keeps one process). A round's gain is
+B / A - 1 for each test (`pp512`, `tg128@d4096`, ...), with 1% as the smallest gain that counts
+(`--min-gain`). The pairing is what makes 1% usable on this card: an earlier serial A770 run drifted ±3%
+between steps (`SYCL_DEV_LOG.md`, "Per-step bench noise"), while repeats inside one `llama-bench` call
+varied by 0.1-0.2% (pp512 1377.5 ± 2.4, tg128 29.63 ± 0.03 t/s).
+
+A single process can still land in a slow state. An A770 flash-attention study measured sustained slow
+states of 18-20% at the same reported 2000 MHz, which no sysfs file showed (84.0 against 99.1 ms on one
+head size-128 shape), and about 10% from another job on the render engine. So the report gives two
+estimates per test:
+
+- **mean** of the round gains with its Student t 95% interval;
+- **Hodges-Lehmann** (HL): the median of all pairwise round averages, with its exact Wilcoxon interval.
+  That interval reaches 95% from 6 rounds (it reads 88% at 4: the coverage is printed next to it).
+
+**far rounds** lists rounds more than max(2%, 3 scaled MADs) from the median round. They are kept, never
+dropped: the answer to one is more rounds.
 
 | Verdict | Condition | Action |
 |---------|-----------|--------|
-| WIN | interval above 0 and mean at least +1% | keep the patch (for an opt-in: make it the default) |
-| LOSS | interval below 0 and mean at most -1% | drop it (for an opt-in: leave it off) |
-| no effect | whole interval inside -1%..+1% | drop it if it is a local perf patch or a candidate: it costs a refresh every time upstream moves |
-| inconclusive | anything else | rerun with `--rounds 8`; still inconclusive within ±2%: treat it as no effect |
+| WIN | 3-5 rounds: t interval above 0, mean and HL at least +1%, no far round. 6+ rounds: HL interval above 0 and HL at least +1% | keep the patch (for an opt-in: make it the default) |
+| LOSS | the same, below 0 and at most -1% | drop it (for an opt-in: leave it off) |
+| no effect | 3-5 rounds: t interval inside -1%..+1%, HL estimate inside too, no far round. 6+ rounds: HL interval inside -1%..+1% | drop it if it is a local perf patch or a candidate: it costs a refresh every time upstream moves |
+| inconclusive | anything else, including a WIN / LOSS / no effect that a far round or the HL estimate contradicts | append rounds: `ab.py run --only NAME --rounds 4 --out SAME.jsonl` (rounds are numbered on, the order keeps alternating). Still inconclusive within ±2% at 12 rounds: treat it as no effect |
 | more rounds | fewer than 3 paired rounds | a run failed; see the `.log` next to the results |
+| A/A OK / A/A NOISY | `aa-*` rows: same binary and settings on both sides | NOISY: stop and find the cause before reading any other row |
+
+With `--guard`, `ab.py` also stops when the card reaches 80 C after a run, or when `guard.sh` cannot get it
+below 60 C and free of other clients within 15 minutes. Rerunning the same command appends the missing
+rounds. `temp_start`, `temp_abort`, `busy_max` and `cool_wait` in the plan's `defaults` set the limits.
 
 A patch is kept on a WIN in at least one row it targets and no LOSS in any of its rows. An accuracy
 loss (below) overrides a WIN.
@@ -79,7 +98,9 @@ that one patch, so the local patches can be measured one at a time without regen
 `ab.py mask moe_sum,act_reuse` prints the number for a manual run.
 
 **Speed, second build.** The whole stack against upstream (`stack-vs-upstream-*`), JIT against
-`acm-g10` AOT (`jit-vs-aot*`), and extracted 0016 (`0016x-mmq-xmx`, the `GGML_SYCL_MMQ_XMX=ON` build).
+`acm-g10` AOT (`jit-vs-aot*`), extracted 0016 (`0016x-mmq-xmx`, the `GGML_SYCL_MMQ_XMX=ON` build), C60's
+Q.K guard (`C60-qk-guard*`: the build with `-DGGML_SYCL_FA_DPAS_QK_GUARD=1` is A), and oneDNN 3.14 or
+later against the oneDNN `AB_BUILD` loads (`onednn-314-*`, only when that one is older).
 0016 is 4,300 lines that an earlier A770 run showed no effect from on Q4_0, because the A770 rarely
 reaches MMQ. No effect on q4_K as well means drop it. Extracted 0015 (softmax `reduce_over_group`) is a
 cleanup. Compare `test-backend-ops perf -o SOFT_MAX` between `AB_BUILD` and `AB_BUILD_UPSTREAM`, and
@@ -110,6 +131,8 @@ step):
 | `AB_BUILD_UPSTREAM` | same flags, no patches (a `git worktree` of `master`) | `stack-vs-upstream-*`, the SOFT_MAX check |
 | `AB_BUILD_AOT` | `AB_BUILD` plus `-DGGML_SYCL_DEVICE_ARCH=acm-g10` | `jit-vs-aot*` |
 | `AB_BUILD_MMQ_XMX` | `AB_BUILD` plus `-DGGML_SYCL_MMQ_XMX=ON` | `0016x-mmq-xmx` |
+| `AB_BUILD_QK_GUARD` | `AB_BUILD` with `-DGGML_SYCL_FA_DPAS_QK_GUARD=1` added to `CMAKE_CXX_FLAGS` | `C60-qk-guard*` (arm A) |
+| `AB_BUILD_ONEDNN314` | `AB_BUILD` configured with `-DDNNL_DIR=<oneDNN 3.14+>/lib/cmake/dnnl`; set `AB_ONEDNN314_LIB` to that oneDNN's `lib` | `onednn-314-*` (arm B) |
 
 Models. Set the variables for the ones you have; `ab.py list` shows what runs and what is skipped:
 
@@ -137,7 +160,8 @@ Models. Set the variables for the ones you have; `ab.py list` shows what runs an
 ## Run order
 
 **1. Stamp and correctness.** Keep the stamp with every result. The fork's B70 decode moved 18% with a
-compute-runtime update and nothing else.
+compute-runtime update and nothing else. The stamp also lists the GPU temperature, the other processes
+using the card (run it as root to see a display server's) and the oneDNN version `AB_BUILD` loads.
 
 ```bash
 bash sycl-patches/ab/guard.sh --stamp | tee ab-stamp.txt
@@ -169,6 +193,10 @@ GGML_SYCL_ENABLE_GRAPH=1 $AB_BUILD/bin/test-llama-archs -b SYCL0 -a '^(llama|qwe
 
 Each `ab.py` row whose path failed here is out: do not run it.
 
+The head_dim 64 line decides C62. oneDNN#5510's wrong results came from a Linux IGC regression fixed in
+IGC 2.40. Another A770 project reports PyTorch's fused head_dim-64 SDPA correct on Linux with the `xe`
+driver, compute-runtime 26.35.39758 and IGC 2.41.5. If the line passes on your stack, run `C62-onednn-hd64`.
+
 **2. The C80 probe.** One minute, no backend build. It answers C80's three unknowns: whether Xe-HPG
 has a real oneDNN kernel for the weight-only Q8_0 matmul, whether it is right in f16, and whether it
 beats dequantize + f16 GEMM on Llama-3-8B projection shapes:
@@ -183,7 +211,9 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./woq-probe
 C80 is dead if any of these happens: `DECLINED`, `impl=ref...`, `FAIL`, or every shape at 1.0x or below.
 Drop it and skip its rows. Otherwise its `ab.py` rows measure the end-to-end effect.
 
-**3. Tier 0, then fix the setup.** Tier 0 picks the build (JIT or AOT) and graph replay. It also shows
+**3. Tier 0, then fix the setup.** Tier 0 starts with two A/A rows (`aa-dense`, `aa-deep`). If either
+reads NOISY, nothing else in the run can be trusted at 1%: stop and look at `guard.sh --clients`,
+`--temp`, and the display session before going on. Tier 0 picks the build (JIT or AOT) and graph replay. It also shows
 whether the stack beats upstream at all, and whether the local patches pay together on each model
 family. Edit `defaults` in `plan.json` to the winners before tier 1 (for example, add
 `"GGML_SYCL_ENABLE_GRAPH": "1"` to its `env`). A `local-all-*` row with no effect means the per-patch
@@ -222,11 +252,27 @@ python3 sycl-patches/ab/ab.py kld --out ab-kld.jsonl
 
 The FA rows use 8192-token windows. Their CPU reference takes the longest of anything here.
 
-**6. After a GPU hang.** `guard.sh --faults "2 hours ago"` counts GPU hangs and resets in the kernel
+**6. Host overhead, once.** Count the runtime calls per decoded token. Two runs that differ only in
+`-n` give it by subtraction:
+
+```bash
+for n in 16 48; do SYCL_UR_TRACE=2 $AB_BUILD/bin/llama-bench -m $AB_Q4_K -fa 1 -p 0 -n $n -r 1 2> ur-n$n.log >/dev/null; done
+```
+```bash
+for c in urDeviceGetInfo urKernelCreate urProgramCreate urProgramBuild urEnqueueKernelLaunch urQueueFinish; do echo "$c $(( ($(grep -c "$c" ur-n48.log) - $(grep -c "$c" ur-n16.log)) / 32 ))"; done
+```
+
+`urEnqueueKernelLaunch` per token is the kernel count; with graph replay it should fall to near zero.
+Any per-token `urDeviceGetInfo`, `urKernelCreate` or `urProgram*` is host work a cache can remove. The
+same A770 project removed 8 `urDeviceGetInfo` calls per forward that way. Report the numbers with the
+results.
+
+**7. After a GPU hang.** `guard.sh --faults "2 hours ago"` counts GPU hangs and resets in the kernel
 log. A row that ran during one is not evidence. Rerun it.
 
-Expect roughly an hour for tier 0 and 6 to 8 hours for tiers 1 and 2 with every model set, most of it
-in the `-d 0,4096,16384` FA rows. So run them overnight; `--only` reruns single rows.
+Expect roughly an hour and a half for tier 0 and 7 to 9 hours for tiers 1 and 2 with every model set,
+most of it in the `-d 0,4096,16384` FA rows, which now load the model once per depth. So run them
+overnight; `--only` reruns single rows and appends rounds.
 
 ## Turning results into changes
 

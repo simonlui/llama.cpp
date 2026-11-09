@@ -9,9 +9,44 @@
   "reps": 3,
   "cooldown": 5,
   "guard_wait": 60,
-  "kld_args": "-c 512 --chunks 40 -fa on"
+  "kld_args": "-c 512 --chunks 40 -fa on",
+  "temp_start": 60,
+  "temp_abort": 80,
+  "busy_max": 5,
+  "cool_wait": 900,
+  "chunk_depths": true
  },
  "experiments": [
+  {
+   "name": "aa-dense",
+   "tier": 0,
+   "control": "aa",
+   "patch": "none (A/A)",
+   "model": "$AB_Q4_K",
+   "args": "-fa 1 -p 512 -n 128",
+   "a": {
+    "env": {}
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "Run first. Same binary and settings on both sides, so the true gain is 0. A/A NOISY means the card or the host is not quiet enough for 1% verdicts: find the cause (guard.sh --clients, --temp, a display session on the card) before any other row counts."
+  },
+  {
+   "name": "aa-deep",
+   "tier": 0,
+   "control": "aa",
+   "patch": "none (A/A)",
+   "model": "$AB_Q4_K",
+   "args": "-fa 1 -ctk q8_0 -ctv q8_0 -p 0 -n 128 -d 16384",
+   "a": {
+    "env": {}
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "The same at 16K depth, the shape where an A770 flash-attention study measured 2.9% pair spread without cooldowns and 0.15% with them."
+  },
   {
    "name": "stack-vs-upstream-dense",
    "tier": 0,
@@ -712,6 +747,40 @@
    "decides": "The same, q8_0 KV."
   },
   {
+   "name": "C60-qk-guard",
+   "tier": 1,
+   "patch": "C60 (Q.K guard)",
+   "model": "$AB_Q4_K",
+   "args": "-fa 1 -ctk q4_0 -ctv q4_0 -p 16 -ub 16 -n 0 -d 4096,16384",
+   "env": {
+    "GGML_SYCL_FA_GQA_DEC": "0"
+   },
+   "a": {
+    "bin": "${AB_BUILD_QK_GUARD}/bin/llama-bench"
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "C60 with the per-DPAS Q.K guard (A: built with -DGGML_SYCL_FA_DPAS_QK_GUARD=1) against without (B). 16-token batches at GQA 4 run the 32-row 256-register kernels, where the guard cost one dummy DPAS per DPAS on acm-g10. WIN or no effect: keep the fix. LOSS: restore the guard."
+  },
+  {
+   "name": "C60-qk-guard-hd256",
+   "tier": 1,
+   "patch": "C60 (Q.K guard)",
+   "model": "$AB_HD256",
+   "args": "-fa 1 -ctk q8_0 -ctv q8_0 -p 0 -n 128 -d 4096,16384",
+   "env": {
+    "GGML_SYCL_FA_GQA_DEC": "0"
+   },
+   "a": {
+    "bin": "${AB_BUILD_QK_GUARD}/bin/llama-bench"
+   },
+   "b": {
+    "env": {}
+   },
+   "decides": "The same for the staged head-size-256 decode kernel (8 + 8 dummy DPAS per job before, 8 + 0 after)."
+  },
+  {
    "name": "C62-onednn-hd64",
    "tier": 1,
    "patch": "C62 + C63",
@@ -1041,6 +1110,43 @@
     "bin": "${AB_BUILD_MMQ_XMX}/bin/llama-bench"
    },
    "decides": "The GGML_SYCL_MMQ_XMX=ON build (B) against the default build."
+  },
+  {
+   "name": "onednn-314-sdpa",
+   "tier": 2,
+   "patch": "build (oneDNN >= 3.14)",
+   "model": "$AB_HD64",
+   "args": "-fa 1 -p 2048,4096 -n 0",
+   "env": {
+    "GGML_SYCL_FA_ONEDNN_DG2_HD64": "1"
+   },
+   "a": {
+    "env": {}
+   },
+   "b": {
+    "bin": "${AB_BUILD_ONEDNN314}/bin/llama-bench",
+    "env": {
+     "LD_LIBRARY_PATH": "${AB_ONEDNN314_LIB}:${LD_LIBRARY_PATH}"
+    }
+   },
+   "decides": "oneDNN's xe_hpg SDPA retunes (b3225e00f4, 264fa75ace) first ship in 3.14. The same tree built against oneDNN 3.14 or later (B) against AB_BUILD (A) on C62's head_dim 64 path. Only when guard.sh --stamp shows AB_BUILD loading an older libdnnl, and after C62's test-backend-ops case passes. B puts the newer libdnnl first on LD_LIBRARY_PATH, which oneAPI's setvars.sh would otherwise win over the build's RUNPATH."
+  },
+  {
+   "name": "onednn-314-dense",
+   "tier": 2,
+   "patch": "build (oneDNN >= 3.14)",
+   "model": "$AB_Q4_K",
+   "args": "-fa 1 -p 512 -n 0",
+   "a": {
+    "env": {}
+   },
+   "b": {
+    "bin": "${AB_BUILD_ONEDNN314}/bin/llama-bench",
+    "env": {
+     "LD_LIBRARY_PATH": "${AB_ONEDNN314_LIB}:${LD_LIBRARY_PATH}"
+    }
+   },
+   "decides": "The same for prompt GEMMs: quantized weights the dequant GEMM does not take are converted to f16 and multiplied by oneDNN's GEMM (GGML_SYCL_DNNL builds)."
   }
  ]
 }

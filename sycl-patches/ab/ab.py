@@ -10,9 +10,16 @@
 Each experiment has two arms, A (the baseline: the patch off) and B (the patch on). An arm is an environment
 and optionally another binary (for build-flag A/Bs). Rounds alternate the order, A B, B A, A B, ..., so slow drift
 (clocks, temperature, background load) hits both arms alike, and the report pairs the two arms within each round:
-the gain of a round is B / A - 1, and the verdict comes from the mean of those ratios and its 95% confidence
-interval across rounds. Model paths come from environment variables named in the plan (AB_DENSE_Q4_K, ...);
-an experiment whose variable is unset is skipped, not failed.
+the gain of a round is B / A - 1. Up to 5 rounds the verdict comes from the mean gain and its Student t 95%
+interval, and stands only if the Hodges-Lehmann estimate (median of the pairwise round averages) agrees and no
+round sits far from the others; from 6 rounds it comes from the Hodges-Lehmann estimate and its exact
+(Wilcoxon) interval of at least 95%, which a slow round shifts far less than the mean (one extreme round
+still widens it up to about 12 rounds). `run` appends rounds to an existing results file, so an inconclusive
+row gets more rounds with `--only NAME --rounds 4`. A `-d` list runs as one
+process per depth, A and B back to back, each after a cooldown. Rows marked "control": "aa" run the same
+binary and environment on both sides: their verdict says whether the setup is quiet enough to trust the rest.
+Model paths come from environment variables named in the plan (AB_DENSE_Q4_K, ...); an experiment whose
+variable is unset is skipped, not failed.
 """
 
 import argparse
@@ -57,6 +64,49 @@ def t95(df):
         if df <= k:
             return T95[k]
     return 1.96
+
+
+def median(xs):
+    s = sorted(xs)
+    n = len(s)
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+
+def signed_rank_cdf(n):
+    """P(T <= t) for t = 0 .. n(n+1)/2, T the Wilcoxon signed-rank statistic of n pairs with no effect."""
+    m = n * (n + 1) // 2
+    counts = [1] + [0] * m
+    for k in range(1, n + 1):
+        for t in range(m, k - 1, -1):
+            counts[t] += counts[t - k]
+    cdf, acc = [], 0
+    for c in counts:
+        acc += c
+        cdf.append(acc / 2 ** n)
+    return cdf
+
+
+def hodges_lehmann(gains, alpha=0.05):
+    """Median of the Walsh averages and its exact interval: (estimate, low, high, coverage)."""
+    n = len(gains)
+    walsh = sorted((gains[i] + gains[j]) / 2 for i in range(n) for j in range(i, n))
+    m = len(walsh)
+    cdf = signed_rank_cdf(n)
+    c = 1  # widest choice, min and max, when n is too small for the asked level
+    while c < m and cdf[c] <= alpha / 2:
+        c += 1
+    return median(walsh), walsh[c - 1], walsh[m - c], 1 - 2 * cdf[c - 1]
+
+
+def outlier_rounds(by_gain):
+    """Rounds whose gain sits more than max(2%, 3 scaled MADs) from the median of all rounds."""
+    if len(by_gain) < 3:
+        return []
+    gains = list(by_gain.values())
+    m = median(gains)
+    mad = median([abs(g - m) for g in gains]) * 1.4826
+    lim = max(0.02, 3 * mad)
+    return sorted(r for r, g in by_gain.items() if abs(g - m) > lim)
 
 
 def local_off_mask(names):
@@ -104,7 +154,8 @@ def missing_inputs(defaults, exp):
     """Unset model variables and missing binaries, as a list of reasons (empty: runnable)."""
     reasons = []
     text = " ".join([exp.get("args", ""), exp.get("model", ""), exp.get("bin", defaults.get("bin", "${AB_BUILD}")),
-                     exp["a"].get("bin", ""), exp["b"].get("bin", "")])
+                     exp["a"].get("bin", ""), exp["b"].get("bin", "")] +
+                    [str(v) for arm in ("a", "b") for v in exp[arm].get("env", {}).values()])
     for var in sorted(set(re.findall(r"\$\{?([A-Z_][A-Z0-9_]*)\}?", text))):
         if not os.environ.get(var):
             reasons.append(f"${var} unset")
@@ -167,9 +218,50 @@ def test_key(row):
     return key
 
 
-def guard(wait):
+def guard_env(defaults):
+    env = dict(os.environ)
+    for key, var in (("temp_start", "AB_TEMP_START"), ("busy_max", "AB_BUSY_MAX"), ("cool_wait", "AB_COOL_WAIT")):
+        if key in defaults and var not in os.environ:
+            env[var] = str(defaults[key])
+    return env
+
+
+def guard(defaults):
     g = os.path.join(HERE, "guard.sh")
-    return subprocess.run(["bash", g, "--wait", str(wait)], capture_output=True, text=True)
+    return subprocess.run(["bash", g, "--wait", str(defaults.get("guard_wait", 60))], capture_output=True, text=True,
+                          env=guard_env(defaults))
+
+
+def gpu_temp():
+    p = subprocess.run(["bash", os.path.join(HERE, "guard.sh"), "--temp"], capture_output=True, text=True)
+    try:
+        return int(p.stdout.strip())
+    except ValueError:
+        return None
+
+
+def depth_chunks(args, enabled):
+    """One argument string per depth of a `-d a,b,c` list (llama-bench runs a list in one process)."""
+    toks = shlex.split(args)
+    for i, t in enumerate(toks[:-1]):
+        if t in ("-d", "--n-depth") and "," in toks[i + 1] and enabled:
+            return [shlex.join(toks[:i + 1] + [v] + toks[i + 2:]) for v in toks[i + 1].split(",")]
+    return [args]
+
+
+def last_rounds(path):
+    """Highest round number per experiment already in a results file, so a rerun appends."""
+    last = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("type") == "run":
+                    last[rec["exp"]] = max(last.get(rec["exp"], -1), rec["round"])
+    return last
 
 
 def cmd_list(a):
@@ -184,6 +276,8 @@ def cmd_run(a):
     defaults, experiments = load_plan(a.plan)
     rounds = a.rounds or defaults.get("rounds", 4)
     log_path = os.path.splitext(a.out)[0] + ".log"
+    done = last_rounds(a.out)
+    temp_abort = defaults.get("temp_abort", 80)
     with open(a.out, "a") as out:
         if a.guard:
             st = subprocess.run(["bash", os.path.join(HERE, "guard.sh"), "--stamp"], capture_output=True, text=True)
@@ -200,28 +294,80 @@ def cmd_run(a):
             if "-r " not in f" {args} ":
                 args = f"{args} -r {reps}"
             r_exp = exp.get("rounds", rounds)
-            for r in range(r_exp):
+            first = done.get(exp["name"], -1) + 1
+            chunks = depth_chunks(args, exp.get("chunk_depths", defaults.get("chunk_depths", True)))
+            for r in range(first, first + r_exp):
                 order = ("a", "b") if r % 2 == 0 else ("b", "a")
-                for arm in order:
-                    if a.guard:
-                        g = guard(defaults.get("guard_wait", 60))
-                        if g.returncode != 0:
-                            print(f"guard: {g.stderr.strip()}", file=sys.stderr)
-                    cd = exp.get("cooldown", defaults.get("cooldown", 5))
-                    if cd:
-                        time.sleep(cd)
-                    env = arm_env(defaults, exp, exp[arm])
-                    rc, rows, seen, secs = run_bench(arm_bin(defaults, exp, exp[arm]), model, args, env, log_path)
-                    rec = {"type": "run", "exp": exp["name"], "patch": exp.get("patch", ""), "round": r, "arm": arm,
-                           "env": env, "rc": rc, "secs": round(secs, 1), "sycl_env": seen,
-                           "tests": [{"test": test_key(x), "avg_ts": x.get("avg_ts"),
-                                      "samples_ts": x.get("samples_ts", [])} for x in rows]}
-                    out.write(json.dumps(rec) + "\n")
-                    out.flush()
-                    summary = ", ".join(f"{t['test']} {t['avg_ts']:.2f}" for t in rec["tests"] if t["avg_ts"])
-                    print(f"{exp['name']} r{r} {arm}: rc={rc} {summary} ({secs:.0f}s)", file=sys.stderr)
-                    if rc != 0:
-                        print(f"  failed, see {log_path}", file=sys.stderr)
+                for chunk in chunks:
+                    for arm in order:
+                        if a.guard:
+                            g = guard(defaults)
+                            if g.returncode == 3:
+                                sys.exit(f"{g.stderr.strip()}\nab.py: stopped; rerun to append rounds once the "
+                                         f"card is cool and idle")
+                            if g.returncode != 0:
+                                print(g.stderr.strip(), file=sys.stderr)
+                        cd = exp.get("cooldown", defaults.get("cooldown", 5))
+                        if cd:
+                            time.sleep(cd)
+                        env = arm_env(defaults, exp, exp[arm])
+                        rc, rows, seen, secs = run_bench(arm_bin(defaults, exp, exp[arm]), model, chunk, env, log_path)
+                        temp = gpu_temp() if a.guard else None
+                        rec = {"type": "run", "exp": exp["name"], "patch": exp.get("patch", ""), "round": r,
+                               "arm": arm, "control": exp.get("control") == "aa", "args": chunk, "env": env, "rc": rc,
+                               "secs": round(secs, 1), "temp_c": temp, "sycl_env": seen,
+                               "tests": [{"test": test_key(x), "avg_ts": x.get("avg_ts"),
+                                          "samples_ts": x.get("samples_ts", [])} for x in rows]}
+                        out.write(json.dumps(rec) + "\n")
+                        out.flush()
+                        summary = ", ".join(f"{t['test']} {t['avg_ts']:.2f}" for t in rec["tests"] if t["avg_ts"])
+                        print(f"{exp['name']} r{r} {arm}: rc={rc} {summary} ({secs:.0f}s"
+                              f"{f', {temp} C' if temp is not None else ''})", file=sys.stderr)
+                        if rc != 0:
+                            print(f"  failed, see {log_path}", file=sys.stderr)
+                        if temp is not None and temp >= temp_abort:
+                            sys.exit(f"ab.py: GPU at {temp} C after {exp['name']} r{r} {arm} (abort at {temp_abort} C); "
+                                     f"this round is incomplete, rerun to append rounds once it has cooled")
+
+
+def interval_verdict(est, lo, hi, thr):
+    if lo > 0 and est >= thr:
+        return "WIN"
+    if hi < 0 and est <= -thr:
+        return "LOSS"
+    if lo > -thr and hi < thr:
+        return "no effect"
+    return "inconclusive"
+
+
+def verdict_for(gains_by_round, thr, control):
+    """(verdict, numbers) for one experiment and test; see the module docstring and README.md."""
+    rounds = sorted(gains_by_round)
+    gains = [gains_by_round[r] for r in rounds]
+    n = len(gains)
+    mean = sum(gains) / n
+    if n > 1:
+        sd = math.sqrt(sum((g - mean) ** 2 for g in gains) / (n - 1))
+        half = t95(n - 1) * sd / math.sqrt(n)
+    else:
+        half = float("inf")
+    lo, hi = mean - half, mean + half
+    hl, hlo, hhi, cov = hodges_lehmann(gains)
+    out = outlier_rounds(gains_by_round)
+    nums = {"n": n, "mean": mean, "lo": lo, "hi": hi, "hl": hl, "hlo": hlo, "hhi": hhi, "cov": cov, "out": out}
+    if n < 3:
+        return "more rounds", nums
+    robust = n >= 6 and cov >= 0.95
+    if control:
+        quiet = lo <= 0 <= hi and abs(hl) < thr and (not robust or hlo <= 0 <= hhi)
+        return ("A/A OK" if quiet else "A/A NOISY: fix the setup before trusting other rows"), nums
+    if robust:
+        return interval_verdict(hl, hlo, hhi, thr), nums
+    v = interval_verdict(mean, lo, hi, thr)
+    agrees = {"WIN": hl >= thr, "LOSS": hl <= -thr, "no effect": abs(hl) < thr}.get(v, True)
+    if v != "inconclusive" and (out or not agrees):
+        v = "inconclusive (outlier round)" if out else "inconclusive (median disagrees)"
+    return v, nums
 
 
 def cmd_report(a):
@@ -232,40 +378,26 @@ def cmd_report(a):
             rec = json.loads(line)
             if rec.get("type") != "run" or rec["rc"] != 0:
                 continue
-            meta[rec["exp"]] = rec.get("patch", "")
+            meta[rec["exp"]] = (rec.get("patch", ""), rec.get("control", False))
             for t in rec["tests"]:
                 if t["avg_ts"]:
                     runs.setdefault((rec["exp"], t["test"]), {}).setdefault(rec["round"], {})[rec["arm"]] = t["avg_ts"]
     thr = a.min_gain / 100.0
-    print("| experiment | patch | test | A t/s | B t/s | gain | 95% CI | rounds | verdict |")
-    print("|---|---|---|---|---|---|---|---|---|")
-    for (exp, test), by_round in sorted(runs.items()):
-        pairs = [(v["a"], v["b"]) for v in by_round.values() if "a" in v and "b" in v]
+    print("| experiment | patch | test | A t/s | B t/s | mean gain | t 95% CI | HL gain | HL CI | rounds | far rounds | verdict |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+    for (exp, test), by_round in sorted(runs.items(), key=lambda kv: (not meta[kv[0][0]][1], kv[0])):
+        pairs = {r: (v["a"], v["b"]) for r, v in by_round.items() if "a" in v and "b" in v}
         if not pairs:
             continue
-        gains = [b / x - 1.0 for x, b in pairs]
-        n = len(gains)
-        mean = sum(gains) / n
-        if n > 1:
-            sd = math.sqrt(sum((g - mean) ** 2 for g in gains) / (n - 1))
-            half = t95(n - 1) * sd / math.sqrt(n)
-        else:
-            half = float("inf")
-        lo, hi = mean - half, mean + half
-        if n < 3:
-            verdict = "more rounds"
-        elif lo > 0 and mean >= thr:
-            verdict = "WIN"
-        elif hi < 0 and mean <= -thr:
-            verdict = "LOSS"
-        elif lo > -thr and hi < thr:
-            verdict = "no effect"
-        else:
-            verdict = "inconclusive"
-        ma = sum(x for x, _ in pairs) / n
-        mb = sum(b for _, b in pairs) / n
-        ci = f"{lo * 100:+.2f}..{hi * 100:+.2f}%" if math.isfinite(half) else "n/a"
-        print(f"| {exp} | {meta.get(exp, '')} | {test} | {ma:.2f} | {mb:.2f} | {mean * 100:+.2f}% | {ci} | {n} | {verdict} |")
+        verdict, x = verdict_for({r: b / av - 1.0 for r, (av, b) in pairs.items()}, thr, meta[exp][1])
+        n = x["n"]
+        ma = sum(av for av, _ in pairs.values()) / n
+        mb = sum(b for _, b in pairs.values()) / n
+        ci = f"{x['lo'] * 100:+.2f}..{x['hi'] * 100:+.2f}%" if math.isfinite(x["hi"]) else "n/a"
+        hci = f"{x['hlo'] * 100:+.2f}..{x['hhi'] * 100:+.2f}% ({x['cov'] * 100:.0f}%)"
+        far = ",".join(f"r{r}" for r in x["out"]) or "-"
+        print(f"| {exp} | {meta[exp][0]} | {test} | {ma:.2f} | {mb:.2f} | {x['mean'] * 100:+.2f}% | {ci} | "
+              f"{x['hl'] * 100:+.2f}% | {hci} | {n} | {far} | {verdict} |")
 
 
 KLD_LINES = {

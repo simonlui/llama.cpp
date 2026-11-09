@@ -202,6 +202,7 @@ overrides. This line is a JIT build: `GGML_SYCL_DEVICE_ARCH=acm-g10` (AOT) drops
 the ESIMD kernels' 256-register request; `ab/` measures which build is faster on the card.
 
 Which patches make the A770 faster is decided on the card, with the A/B plan in `ab/README.md`.
+Register files, spills and DPAS counts per kernel need no card: `aot/README.md`.
 
 ## Requirements
 

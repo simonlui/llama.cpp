@@ -17,11 +17,20 @@ At sub-group 8 the 32-row kernels from head size 128 and the staged D=256 decode
 in 128 registers on acm-g10 (IGC 2.43), so they always use the 256-register file.
 GGML_SYCL_FA_DPAS=0 turns the kernel off, as upstream.
 
+At sub-group 8, Q.K drops the t < RT guard around each s8 / s4 DPAS where the guard is not needed:
+with one row tile per job it always holds, and a tile past RT reads in-bounds SLM whose scores the
+store discards. On acm-g10 the guard put every Q.K DPAS in its own basic block, and IGC's
+Wa_18023229625 issues a dummy DPAS before the first DPAS of each block: the file's 42 sub-group-8
+kernels held 490 DPAS and 292 dummies, now 473 and 87 (D = 128, 32 rows: 8 + 8 per job -> 8 + 1;
+D = 256 decode: 8 + 8 -> 8 + 0 for q8_0, 8 + 1 for q4_0), with no spills. The guard stays at sub-group 16 (bmg-g21
+instruction streams unchanged) and for two-tile jobs at 128 registers, where head size 96 spills
+without it. -DGGML_SYCL_FA_DPAS_QK_GUARD=1 keeps it everywhere, the baseline for an A770 A/B.
+
 diff --git a/ggml/src/ggml-sycl/fattn-dpas.cpp b/ggml/src/ggml-sycl/fattn-dpas.cpp
-index fb0b3a81..a776f9c2 100644
+index fb0b3a81..a0d7ef6c 100644
 --- a/ggml/src/ggml-sycl/fattn-dpas.cpp
 +++ b/ggml/src/ggml-sycl/fattn-dpas.cpp
-@@ -5,26 +5,99 @@
+@@ -5,26 +5,103 @@
  #include "fattn-common.hpp"
  #include "fattn-dpas.hpp"
  
@@ -43,7 +52,7 @@ index fb0b3a81..a776f9c2 100644
  #else
 -#define GGML_SYCL_FA_DPAS_BUILD 1
 +#define GGML_SYCL_FA_DPAS_SG16 0
- #endif
++#endif
 +#if defined(GGML_SYCL_SUPPORT_XMX) && (!defined(GGML_SYCL_XMX_AOT_SG) || GGML_SYCL_XMX_AOT_SG == 8)
 +#define GGML_SYCL_FA_DPAS_SG8 1
 +#include <sycl/ext/oneapi/matrix/matrix.hpp>
@@ -51,6 +60,10 @@ index fb0b3a81..a776f9c2 100644
 +#define GGML_SYCL_FA_DPAS_SG8 0
 +#endif
 +#define GGML_SYCL_FA_DPAS_BUILD (GGML_SYCL_FA_DPAS_SG16 || GGML_SYCL_FA_DPAS_SG8)
++// 1 keeps the per-DPAS row-tile guard in every Q.K loop (the A/B baseline for the sub-group-8 Q.K fix below)
++#ifndef GGML_SYCL_FA_DPAS_QK_GUARD
++#define GGML_SYCL_FA_DPAS_QK_GUARD 0
+ #endif
  
  #if GGML_SYCL_FA_DPAS_BUILD
  static constexpr int   FA_DPAS_WG    = 256;      // work-group size
@@ -127,7 +140,7 @@ index fb0b3a81..a776f9c2 100644
  
  // head sizes with a compiled kernel (multiples of the 32-dim q4_0 / q8_0 block)
  static bool fattn_dpas_head_ok(int64_t d) {
-@@ -38,7 +111,7 @@ bool ggml_sycl_flash_attn_ext_dpas_supported(int device, const ggml_tensor * dst
+@@ -38,7 +115,7 @@ bool ggml_sycl_flash_attn_ext_dpas_supported(int device, const ggml_tensor * dst
      GGML_UNUSED(dst);
      return false;
  #else
@@ -136,7 +149,7 @@ index fb0b3a81..a776f9c2 100644
          return false;
      }
  
-@@ -103,17 +176,32 @@ typedef int   fa_dpas_int4   __attribute__((ext_vector_type(4)));
+@@ -103,17 +180,32 @@ typedef int   fa_dpas_int4   __attribute__((ext_vector_type(4)));
  typedef int   fa_dpas_int8   __attribute__((ext_vector_type(8)));
  typedef float fa_dpas_float8 __attribute__((ext_vector_type(8)));
  
@@ -179,7 +192,7 @@ index fb0b3a81..a776f9c2 100644
  #else
      d = 0;
      GGML_UNUSED(a);
-@@ -121,16 +209,26 @@ static inline void fa_dpas_s8_s4(const fa_dpas_short8 & a, const fa_dpas_int4 &
+@@ -121,16 +213,26 @@ static inline void fa_dpas_s8_s4(const fa_dpas_short8 & a, const fa_dpas_int4 &
  #endif
  }
  
@@ -215,7 +228,7 @@ index fb0b3a81..a776f9c2 100644
  #else
      d = 0;
      GGML_UNUSED(a);
-@@ -138,16 +236,26 @@ static inline void fa_dpas_s8_s8(const fa_dpas_short8 & a, const fa_dpas_int8 &
+@@ -138,16 +240,26 @@ static inline void fa_dpas_s8_s8(const fa_dpas_short8 & a, const fa_dpas_int8 &
  #endif
  }
  
@@ -251,7 +264,7 @@ index fb0b3a81..a776f9c2 100644
  #else
      GGML_UNUSED(a);
      GGML_UNUSED(b);
-@@ -200,29 +308,35 @@ struct fa_dpas_params {
+@@ -200,29 +312,40 @@ struct fa_dpas_params {
  
  // One work-group = one KV head x nq query tokens x one slice of the keys: S = Q K^T by s8 x s4 / s8 x s8 DPAS on the
  // raw K blocks, online softmax, O^T += V^T P^T by f16 DPAS. ST: stage K/V tiles in SLM (1: 16-byte, 2: dword loads).
@@ -284,6 +297,11 @@ index fb0b3a81..a776f9c2 100644
      constexpr bool ODD  = (NB * BB) % 4 != 0;               // odd block count: rows may start 2 bytes into a dword
      constexpr int SW    = RW + 1;                           // odd SLM row stride: no bank conflicts for lane = key
 -    static_assert(D % QK4_0 == 0 && D % DPS == 0 && NPV <= FA_DPAS_NSG && QK4_0 % DPS == 0, "unsupported head size");
++    // Q.K guards each DPAS with t < RT only where it must. With one row tile per job t < RT always holds, and a
++    // tile past RT reads in-bounds SLM (t < RTMAX) whose scores the store drops. On acm-g10 the guard puts every
++    // DPAS in its own basic block and IGC's Wa_18023229625 issues a dummy DPAS before each one (8 + 8 at D = 128,
++    // 32 rows; 8 + 1 without). Kept at sub-group 16 and for 128-register two-tile jobs (head size 96 spills there).
++    constexpr bool QK_GUARD = GGML_SYCL_FA_DPAS_QK_GUARD || SG == 16 || (TC > 1 && !LG);
 +    static_assert(D % QK4_0 == 0 && D % DPS == 0 && NPV <= NSG && QK4_0 % DPS == 0, "unsupported head size");
      static_assert(ST != 1 || RW % 4 == 0, "16-byte staging needs rows of 16-byte multiples");
  
@@ -293,7 +311,7 @@ index fb0b3a81..a776f9c2 100644
          sycl::local_accessor<fa_dpas_float8, 1> sDQ(sycl::range<1>(RTMAX * NB), cgh);      // Q scales [tile][block]
          sycl::local_accessor<float, 1>          sS(sycl::range<1>(RMAX * TK), cgh);        // S [row][key]
          sycl::local_accessor<fa_dpas_int8, 1>   sP(sycl::range<1>(RMAX * PS / 16), cgh);   // P f16 [row][key]
-@@ -232,7 +346,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+@@ -232,7 +355,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
          sycl::local_accessor<uint32_t, 1>       sKV(sycl::range<1>(ST ? TK * SW : 1), cgh);
          const sycl::nd_range<3> ndr(sycl::range<3>((size_t) ne03 * p.nqc, nkvh, (size_t) p.nsplit * FA_DPAS_WG),
                                      sycl::range<3>(1, 1, FA_DPAS_WG));
@@ -302,7 +320,7 @@ index fb0b3a81..a776f9c2 100644
                  const int tid   = it.get_local_id(2);
                  const int split = it.get_group(2);
                  const int kvh   = it.get_group(1);
-@@ -242,13 +356,13 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+@@ -242,13 +365,13 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
                  const int R     = p.nq * G;
                  const int RT    = (R + 7) / 8;
                  auto      sg    = it.get_sub_group();
@@ -321,7 +339,7 @@ index fb0b3a81..a776f9c2 100644
                  for (int e = tid; e < RT * 8 * NB; e += FA_DPAS_WG) {
                      const int  r    = e / NB;
                      const int  b    = e % NB;
-@@ -269,10 +383,15 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+@@ -269,10 +392,15 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
                      const int   m  = r % 8;
                      ((float *) &sDQ[0])[(t * NB + b) * 8 + m] = dq;
  #pragma unroll
@@ -341,7 +359,7 @@ index fb0b3a81..a776f9c2 100644
                      }
                  }
                  // rows without a query keep P = 0
-@@ -295,9 +414,9 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+@@ -295,9 +423,9 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
                  const sycl::half * mrow = p.mask ? (const sycl::half *) (p.mask + (seq % p.ne33) * p.nb33) : nullptr;
  
                  // O^T: lane = query row, element m = head dim
@@ -353,7 +371,7 @@ index fb0b3a81..a776f9c2 100644
  #pragma unroll
                      for (int x = 0; x < XT; ++x) {
                          o[t][x] = 0.0f;
-@@ -386,10 +505,10 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+@@ -386,10 +514,10 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
  
                      // S = Q K^T, job = (key group, TC row tiles)
                      const int nch = (RT + TC - 1) / TC;
@@ -368,7 +386,7 @@ index fb0b3a81..a776f9c2 100644
                          const bool jv = j < k_end;
                          const char *     kb = Kh + (int64_t) (jv ? j : k_begin) * p.nb11;
                          const int        kp = (ST || !ODD) ? 0 : (int) (((uintptr_t) kb >> 1) & 1); // row starts 2 bytes into a dword
-@@ -404,7 +523,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+@@ -404,23 +532,23 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
                              uint32_t wv[NQ + 1];
                              uint32_t sc;
                              uint32_t q[NQ];
@@ -377,7 +395,11 @@ index fb0b3a81..a776f9c2 100644
                              fa_dpas_split_block<NQ>(wv, (b + kp) % 2 != 0, sc, q);
                              const float dk = static_cast<float>(sycl::bit_cast<sycl::half>((uint16_t) sc));
  #pragma unroll
-@@ -415,12 +534,12 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+                             for (int tt = 0; tt < TC; ++tt) {
+                                 const int t = ch * TC + tt;
+-                                if (t < RT) {
++                                if (!QK_GUARD || t < RT) {
+                                     fa_dpas_int8 ia;
                                      if constexpr (Q8) {
                                          const fa_dpas_int8 bv = { (int) q[0], (int) q[1], (int) q[2], (int) q[3],
                                                                    (int) q[4], (int) q[5], (int) q[6], (int) q[7] };
@@ -392,7 +414,7 @@ index fb0b3a81..a776f9c2 100644
                                      }
                                      const fa_dpas_float8 ds = sDQ[t * NB + b] * dk;
                                      s[tt] += __builtin_convertvector(ia, fa_dpas_float8) * ds;
-@@ -438,7 +557,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+@@ -438,7 +566,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
                                      if (r < R) {
                                          const bool  ok = jv && c < p.ne01;
                                          const float mv = (ok && mrow) ? static_cast<float>(mrow[((int64_t) c * p.nb31) / (int64_t) sizeof(sycl::half) + j]) : 0.0f;
@@ -401,7 +423,7 @@ index fb0b3a81..a776f9c2 100644
                                      }
                                  }
                              }
-@@ -450,12 +569,12 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+@@ -450,12 +578,12 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
                      }
  
                      // online softmax per row -> P
@@ -418,7 +440,7 @@ index fb0b3a81..a776f9c2 100644
                              mt    = sycl::fmax(mt, sv[i]);
                          }
                          mt = sycl::reduce_over_group(sg, mt, sycl::maximum<float>());
-@@ -463,9 +582,9 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+@@ -463,9 +591,9 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
                          const float m_new = sycl::fmax(m_old, mt);
                          float       lt    = 0.0f;
  #pragma unroll
@@ -430,7 +452,7 @@ index fb0b3a81..a776f9c2 100644
                              lt += pv;
                          }
                          lt = sycl::reduce_over_group(sg, lt, sycl::plus<float>());
-@@ -480,10 +599,10 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+@@ -480,10 +608,10 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
  
                      prefetch_rows(Kh, p.nb11, t0 + TK);
  
@@ -444,7 +466,7 @@ index fb0b3a81..a776f9c2 100644
  #pragma unroll
                          for (int x = 0; x < XT; ++x) {
                              o[t][x] *= a;
-@@ -491,39 +610,52 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+@@ -491,39 +619,52 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
                      }
  #pragma unroll 1
                      for (int kg = 0; kg < ((ALLPV || w < NPV) ? KG : 0); ++kg) {
@@ -521,7 +543,7 @@ index fb0b3a81..a776f9c2 100644
                              }
                          }
                      }
-@@ -531,8 +663,8 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+@@ -531,8 +672,8 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
                  }
  
  #pragma unroll
@@ -532,7 +554,7 @@ index fb0b3a81..a776f9c2 100644
                      const int c = c0 + r / G;
                      if ((ALLPV || w < NPV) && r < R && c < p.ne01) {
                          const int64_t jdu = ((int64_t) seq * p.ne01 + c) * p.ne02 + kvh * G + r % G;
-@@ -564,7 +696,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
+@@ -564,7 +705,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int
      });
  }
  
@@ -541,7 +563,7 @@ index fb0b3a81..a776f9c2 100644
  static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
      constexpr int TK = 16 * KG;
  
-@@ -605,10 +737,17 @@ static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
+@@ -605,10 +746,17 @@ static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
      p.nb31 = mask ? mask->nb[1] : 0;
      p.nb33 = mask ? mask->nb[3] : 0;
  
@@ -561,7 +583,7 @@ index fb0b3a81..a776f9c2 100644
      const int ntiles   = (ne11 + TK - 1) / TK;
      int nsplit = std::max(1, std::min(wave / (nkvh * ne03 * p.nqc), ntiles));
      p.chunk    = ((ntiles + nsplit - 1) / nsplit) * TK;
-@@ -625,11 +764,12 @@ static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
+@@ -625,11 +773,12 @@ static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
      p.meta  = meta.get();
  
      dpct::queue_ptr stream = ctx.stream();
@@ -578,7 +600,7 @@ index fb0b3a81..a776f9c2 100644
      }
  
      if (nsplit > 1) {
-@@ -640,7 +780,8 @@ static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
+@@ -640,7 +789,8 @@ static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
              sycl::local_accessor<uint8_t, 1> lm(sycl::range<1>(nsplit * sizeof(sycl::float2)), cgh);
              cgh.parallel_for(
                  sycl::nd_range<3>(sycl::range<3>(Q->ne[3], Q->ne[2], (size_t) ne01 * D), sycl::range<3>(1, 1, D)),
@@ -588,7 +610,7 @@ index fb0b3a81..a776f9c2 100644
                      flash_attn_combine_results<D>(parts_p, meta_p, dst_p, nsplit,
                                                    lm.get_multi_ptr<sycl::access::decorated::no>().get());
                  });
-@@ -648,7 +789,7 @@ static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
+@@ -648,7 +798,7 @@ static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
      }
  }
  
@@ -597,7 +619,7 @@ index fb0b3a81..a776f9c2 100644
      const ggml_tensor * Q = dst->src[0];
      const ggml_tensor * K = dst->src[1];
      const ggml_tensor * V = dst->src[2];
-@@ -665,7 +806,7 @@ template <bool Q8> static void fattn_dpas_dispatch(ggml_backend_sycl_context & c
+@@ -665,7 +815,7 @@ template <bool Q8> static void fattn_dpas_dispatch(ggml_backend_sycl_context & c
  
      // single token decode: staged K/V tiles are faster at long context
      if (D == 256 && ne01 == 1 && G <= 16 && aligned16) {
@@ -606,7 +628,7 @@ index fb0b3a81..a776f9c2 100644
          return;
      }
      const bool rows16 = ne01 * G <= 16;
-@@ -673,9 +814,9 @@ template <bool Q8> static void fattn_dpas_dispatch(ggml_backend_sycl_context & c
+@@ -673,9 +823,9 @@ template <bool Q8> static void fattn_dpas_dispatch(ggml_backend_sycl_context & c
  #define FATTN_DPAS_D(D_, KG16_)                                                                        \
      case D_:                                                                                           \
          if (rows16) {                                                                                  \
@@ -618,7 +640,7 @@ index fb0b3a81..a776f9c2 100644
          }                                                                                              \
          break;
      // q8_0 at head size 128: its 136-byte rows gather poorly per lane, stage them in SLM by coalesced dword loads
-@@ -685,9 +826,9 @@ template <bool Q8> static void fattn_dpas_dispatch(ggml_backend_sycl_context & c
+@@ -685,9 +835,9 @@ template <bool Q8> static void fattn_dpas_dispatch(ggml_backend_sycl_context & c
      }
      if (Q8 && D == 128 && aligned4) {
          if (rows16) {
@@ -630,7 +652,7 @@ index fb0b3a81..a776f9c2 100644
          }
          return;
      }
-@@ -704,10 +845,28 @@ template <bool Q8> static void fattn_dpas_dispatch(ggml_backend_sycl_context & c
+@@ -704,10 +854,28 @@ template <bool Q8> static void fattn_dpas_dispatch(ggml_backend_sycl_context & c
  }
  
  void ggml_sycl_flash_attn_ext_dpas(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
